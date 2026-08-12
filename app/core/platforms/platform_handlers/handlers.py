@@ -1,5 +1,6 @@
 import json
 import time
+from typing import ClassVar
 
 import streamget
 from deprecated import deprecated
@@ -60,8 +61,16 @@ class DouyinHandler(PlatformHandler):
         return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
 
 
-class TikTokHandler(PlatformHandler):
-    platform = "tiktok"
+class _TemplateHandler(PlatformHandler):
+    """流程完全一致的平台的共享实现。
+
+    这些平台的差异只有两点：streamget 解析类是哪一个、取流走 web 还是 app
+    接口。子类用两个类属性声明差异即可；流程有任何偏差（额外凭证、多通道、
+    URL 分支）的平台不要继承它，保持独立实现。
+    """
+
+    stream_class_name: ClassVar[str]
+    fetch_method: ClassVar[str] = "fetch_web_stream_data"
 
     def __init__(
         self,
@@ -71,14 +80,21 @@ class TikTokHandler(PlatformHandler):
         platform: str | None = None,
     ) -> None:
         super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.TikTokLiveStream | None = None
+        self.live_stream = None
 
     @trace_error_decorator
     async def get_stream_info(self, live_url: str) -> StreamData:
         if not self.live_stream:
-            self.live_stream = streamget.TikTokLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_web_stream_data(url=live_url)
+            stream_class = getattr(streamget, self.stream_class_name)
+            self.live_stream = stream_class(proxy_addr=self.proxy, cookies=self.cookies)
+        fetch_stream_data = getattr(self.live_stream, self.fetch_method)
+        json_data = await fetch_stream_data(url=live_url)
         return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+
+
+class TikTokHandler(_TemplateHandler):
+    platform = "tiktok"
+    stream_class_name = "TikTokLiveStream"
 
 
 class _KwaiLiveStreamHardened(streamget.KwaiLiveStream):
@@ -238,151 +254,41 @@ class KuaishouHandler(PlatformHandler):
         return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
 
 
-class HuyaHandler(PlatformHandler):
+class HuyaHandler(_TemplateHandler):
     platform = "huya"
-
-    def __init__(
-        self,
-        proxy: str | None = None,
-        cookies: str | None = None,
-        record_quality: str | None = None,
-        platform: str | None = None,
-    ) -> None:
-        super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.HuyaLiveStream | None = None
-
-    @trace_error_decorator
-    async def get_stream_info(self, live_url: str) -> StreamData:
-        if not self.live_stream:
-            self.live_stream = streamget.HuyaLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_app_stream_data(url=live_url)
-        return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+    stream_class_name = "HuyaLiveStream"
+    fetch_method = "fetch_app_stream_data"
 
 
-class DouyuHandler(PlatformHandler):
+class DouyuHandler(_TemplateHandler):
     platform = "douyu"
-
-    def __init__(
-        self,
-        proxy: str | None = None,
-        cookies: str | None = None,
-        record_quality: str | None = None,
-        platform: str | None = None,
-    ) -> None:
-        super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.DouyuLiveStream | None = None
-
-    @trace_error_decorator
-    async def get_stream_info(self, live_url: str) -> StreamData:
-        if not self.live_stream:
-            self.live_stream = streamget.DouyuLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_web_stream_data(url=live_url)
-        return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+    stream_class_name = "DouyuLiveStream"
 
 
-class YYHandler(PlatformHandler):
+class YYHandler(_TemplateHandler):
     platform = "YY"
-
-    def __init__(
-        self,
-        proxy: str | None = None,
-        cookies: str | None = None,
-        record_quality: str | None = None,
-        platform: str | None = None,
-    ) -> None:
-        super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.YYLiveStream | None = None
-
-    @trace_error_decorator
-    async def get_stream_info(self, live_url: str) -> StreamData:
-        if not self.live_stream:
-            self.live_stream = streamget.YYLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_web_stream_data(url=live_url)
-        return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+    stream_class_name = "YYLiveStream"
 
 
-class BilibiliHandler(PlatformHandler):
+class BilibiliHandler(_TemplateHandler):
     platform = "bilibili"
-
-    def __init__(
-        self,
-        proxy: str | None = None,
-        cookies: str | None = None,
-        record_quality: str | None = None,
-        platform: str | None = None,
-    ) -> None:
-        super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.BilibiliLiveStream | None = None
-
-    @trace_error_decorator
-    async def get_stream_info(self, live_url: str) -> StreamData:
-        if not self.live_stream:
-            self.live_stream = streamget.BilibiliLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_web_stream_data(url=live_url)
-        return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+    stream_class_name = "BilibiliLiveStream"
 
 
-class RedNoteHandler(PlatformHandler):
+class RedNoteHandler(_TemplateHandler):
     platform = "rednote"
-
-    def __init__(
-        self,
-        proxy: str | None = None,
-        cookies: str | None = None,
-        record_quality: str | None = None,
-        platform: str | None = None,
-    ) -> None:
-        super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.RedNoteLiveStream | None = None
-
-    @trace_error_decorator
-    async def get_stream_info(self, live_url: str) -> StreamData:
-        if not self.live_stream:
-            self.live_stream = streamget.RedNoteLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_app_stream_data(url=live_url)
-        return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+    stream_class_name = "RedNoteLiveStream"
+    fetch_method = "fetch_app_stream_data"
 
 
-class BigoHandler(PlatformHandler):
+class BigoHandler(_TemplateHandler):
     platform = "bigo"
-
-    def __init__(
-        self,
-        proxy: str | None = None,
-        cookies: str | None = None,
-        record_quality: str | None = None,
-        platform: str | None = None,
-    ) -> None:
-        super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.BigoLiveStream | None = None
-
-    @trace_error_decorator
-    async def get_stream_info(self, live_url: str) -> StreamData:
-        if not self.live_stream:
-            self.live_stream = streamget.BigoLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_web_stream_data(url=live_url)
-        return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+    stream_class_name = "BigoLiveStream"
 
 
-class BluedHandler(PlatformHandler):
+class BluedHandler(_TemplateHandler):
     platform = "blued"
-
-    def __init__(
-        self,
-        proxy: str | None = None,
-        cookies: str | None = None,
-        record_quality: str | None = None,
-        platform: str | None = None,
-    ) -> None:
-        super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.BluedLiveStream | None = None
-
-    @trace_error_decorator
-    async def get_stream_info(self, live_url: str) -> StreamData:
-        if not self.live_stream:
-            self.live_stream = streamget.BluedLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_web_stream_data(url=live_url)
-        return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+    stream_class_name = "BluedLiveStream"
 
 
 class SoopHandler(PlatformHandler):
@@ -410,132 +316,36 @@ class SoopHandler(PlatformHandler):
         return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
 
 
-class NeteaseHandler(PlatformHandler):
+class NeteaseHandler(_TemplateHandler):
     platform = "netease"
-
-    def __init__(
-        self,
-        proxy: str | None = None,
-        cookies: str | None = None,
-        record_quality: str | None = None,
-        platform: str | None = None,
-    ) -> None:
-        super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.NeteaseLiveStream | None = None
-
-    @trace_error_decorator
-    async def get_stream_info(self, live_url: str) -> StreamData:
-        if not self.live_stream:
-            self.live_stream = streamget.NeteaseLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_web_stream_data(url=live_url)
-        return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+    stream_class_name = "NeteaseLiveStream"
 
 
 @deprecated(reason="Live platform has been shut down")
-class QiandureboHandler(PlatformHandler):
+class QiandureboHandler(_TemplateHandler):
     platform = "qiandurebo"
-
-    def __init__(
-        self,
-        proxy: str | None = None,
-        cookies: str | None = None,
-        record_quality: str | None = None,
-        platform: str | None = None,
-    ) -> None:
-        super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.QiandureboLiveStream | None = None
-
-    @trace_error_decorator
-    async def get_stream_info(self, live_url: str) -> StreamData:
-        if not self.live_stream:
-            self.live_stream = streamget.QiandureboLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_web_stream_data(url=live_url)
-        return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+    stream_class_name = "QiandureboLiveStream"
 
 
-class PamdaTVHandler(PlatformHandler):
+class PamdaTVHandler(_TemplateHandler):
     platform = "pandatv"
-
-    def __init__(
-        self,
-        proxy: str | None = None,
-        cookies: str | None = None,
-        record_quality: str | None = None,
-        platform: str | None = None,
-    ) -> None:
-        super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.PandaLiveStream | None = None
-
-    @trace_error_decorator
-    async def get_stream_info(self, live_url: str) -> StreamData:
-        if not self.live_stream:
-            self.live_stream = streamget.PandaLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_web_stream_data(url=live_url)
-        return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+    stream_class_name = "PandaLiveStream"
 
 
-class MaoerFMHandler(PlatformHandler):
+class MaoerFMHandler(_TemplateHandler):
     platform = "maoerfm"
-
-    def __init__(
-        self,
-        proxy: str | None = None,
-        cookies: str | None = None,
-        record_quality: str | None = None,
-        platform: str | None = None,
-    ) -> None:
-        super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.MaoerLiveStream | None = None
-
-    @trace_error_decorator
-    async def get_stream_info(self, live_url: str) -> StreamData:
-        if not self.live_stream:
-            self.live_stream = streamget.MaoerLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_web_stream_data(url=live_url)
-        return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+    stream_class_name = "MaoerLiveStream"
 
 
-class LookHandler(PlatformHandler):
+class LookHandler(_TemplateHandler):
     platform = "look"
-
-    def __init__(
-        self,
-        proxy: str | None = None,
-        cookies: str | None = None,
-        record_quality: str | None = None,
-        platform: str | None = None,
-    ) -> None:
-        super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.LookLiveStream | None = None
-
-    @trace_error_decorator
-    async def get_stream_info(self, live_url: str) -> StreamData:
-        if not self.live_stream:
-            self.live_stream = streamget.LookLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_web_stream_data(url=live_url)
-        return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+    stream_class_name = "LookLiveStream"
 
 
 @deprecated(reason="Live platform has been shut down")
-class WinkTVHandler(PlatformHandler):
+class WinkTVHandler(_TemplateHandler):
     platform = "winktv"
-
-    def __init__(
-        self,
-        proxy: str | None = None,
-        cookies: str | None = None,
-        record_quality: str | None = None,
-        platform: str | None = None,
-    ) -> None:
-        super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.WinkTVLiveStream | None = None
-
-    @trace_error_decorator
-    async def get_stream_info(self, live_url: str) -> StreamData:
-        if not self.live_stream:
-            self.live_stream = streamget.WinkTVLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_web_stream_data(url=live_url)
-        return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+    stream_class_name = "WinkTVLiveStream"
 
 
 class FlexTVHandler(PlatformHandler):
@@ -613,363 +423,92 @@ class TwitcastingHandler(PlatformHandler):
         return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
 
 
-class BaiduHandler(PlatformHandler):
+class BaiduHandler(_TemplateHandler):
     platform = "baidu"
-
-    def __init__(
-        self,
-        proxy: str | None = None,
-        cookies: str | None = None,
-        record_quality: str | None = None,
-        platform: str | None = None,
-    ) -> None:
-        super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.BaiduLiveStream | None = None
-
-    @trace_error_decorator
-    async def get_stream_info(self, live_url: str) -> StreamData:
-        if not self.live_stream:
-            self.live_stream = streamget.BaiduLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_web_stream_data(url=live_url)
-        return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+    stream_class_name = "BaiduLiveStream"
 
 
-class WeiboHandler(PlatformHandler):
+class WeiboHandler(_TemplateHandler):
     platform = "weibo"
-
-    def __init__(
-        self,
-        proxy: str | None = None,
-        cookies: str | None = None,
-        record_quality: str | None = None,
-        platform: str | None = None,
-    ) -> None:
-        super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.WeiboLiveStream | None = None
-
-    @trace_error_decorator
-    async def get_stream_info(self, live_url: str) -> StreamData:
-        if not self.live_stream:
-            self.live_stream = streamget.WeiboLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_web_stream_data(url=live_url)
-        return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+    stream_class_name = "WeiboLiveStream"
 
 
-class KugouHandler(PlatformHandler):
+class KugouHandler(_TemplateHandler):
     platform = "kugou"
-
-    def __init__(
-        self,
-        proxy: str | None = None,
-        cookies: str | None = None,
-        record_quality: str | None = None,
-        platform: str | None = None,
-    ) -> None:
-        super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.KugouLiveStream | None = None
-
-    @trace_error_decorator
-    async def get_stream_info(self, live_url: str) -> StreamData:
-        if not self.live_stream:
-            self.live_stream = streamget.KugouLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_web_stream_data(url=live_url)
-        return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+    stream_class_name = "KugouLiveStream"
 
 
-class TwitchHandler(PlatformHandler):
+class TwitchHandler(_TemplateHandler):
     platform = "twitch"
-
-    def __init__(
-        self,
-        proxy: str | None = None,
-        cookies: str | None = None,
-        record_quality: str | None = None,
-        platform: str | None = None,
-    ) -> None:
-        super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.TwitchLiveStream | None = None
-
-    @trace_error_decorator
-    async def get_stream_info(self, live_url: str) -> StreamData:
-        if not self.live_stream:
-            self.live_stream = streamget.TwitchLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_web_stream_data(url=live_url)
-        return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+    stream_class_name = "TwitchLiveStream"
 
 
-class LivemeHandler(PlatformHandler):
+class LivemeHandler(_TemplateHandler):
     platform = "liveme"
-
-    def __init__(
-        self,
-        proxy: str | None = None,
-        cookies: str | None = None,
-        record_quality: str | None = None,
-        platform: str | None = None,
-    ) -> None:
-        super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.LiveMeLiveStream | None = None
-
-    @trace_error_decorator
-    async def get_stream_info(self, live_url: str) -> StreamData:
-        if not self.live_stream:
-            self.live_stream = streamget.LiveMeLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_web_stream_data(url=live_url)
-        return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+    stream_class_name = "LiveMeLiveStream"
 
 
-class HuajiaoHandler(PlatformHandler):
+class HuajiaoHandler(_TemplateHandler):
     platform = "huajiao"
-
-    def __init__(
-        self,
-        proxy: str | None = None,
-        cookies: str | None = None,
-        record_quality: str | None = None,
-        platform: str | None = None,
-    ) -> None:
-        super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.HuajiaoLiveStream | None = None
-
-    @trace_error_decorator
-    async def get_stream_info(self, live_url: str) -> StreamData:
-        if not self.live_stream:
-            self.live_stream = streamget.HuajiaoLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_app_stream_data(url=live_url)
-        return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+    stream_class_name = "HuajiaoLiveStream"
+    fetch_method = "fetch_app_stream_data"
 
 
-class ShowRoomHandlerHandler(PlatformHandler):
+class ShowRoomHandlerHandler(_TemplateHandler):
     platform = "showroom"
-
-    def __init__(
-        self,
-        proxy: str | None = None,
-        cookies: str | None = None,
-        record_quality: str | None = None,
-        platform: str | None = None,
-    ) -> None:
-        super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.ShowRoomLiveStream | None = None
-
-    @trace_error_decorator
-    async def get_stream_info(self, live_url: str) -> StreamData:
-        if not self.live_stream:
-            self.live_stream = streamget.ShowRoomLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_web_stream_data(url=live_url)
-        return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+    stream_class_name = "ShowRoomLiveStream"
 
 
-class AcfunHandler(PlatformHandler):
+class AcfunHandler(_TemplateHandler):
     platform = "acfun"
-
-    def __init__(
-        self,
-        proxy: str | None = None,
-        cookies: str | None = None,
-        record_quality: str | None = None,
-        platform: str | None = None,
-    ) -> None:
-        super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.AcfunLiveStream | None = None
-
-    @trace_error_decorator
-    async def get_stream_info(self, live_url: str) -> StreamData:
-        if not self.live_stream:
-            self.live_stream = streamget.AcfunLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_web_stream_data(url=live_url)
-        return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+    stream_class_name = "AcfunLiveStream"
 
 
-class InkeHandler(PlatformHandler):
+class InkeHandler(_TemplateHandler):
     platform = "inke"
-
-    def __init__(
-        self,
-        proxy: str | None = None,
-        cookies: str | None = None,
-        record_quality: str | None = None,
-        platform: str | None = None,
-    ) -> None:
-        super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.InkeLiveStream | None = None
-
-    @trace_error_decorator
-    async def get_stream_info(self, live_url: str) -> StreamData:
-        if not self.live_stream:
-            self.live_stream = streamget.InkeLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_web_stream_data(url=live_url)
-        return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+    stream_class_name = "InkeLiveStream"
 
 
 @deprecated(reason="Live platform has been shut down")
-class YinboHandler(PlatformHandler):
+class YinboHandler(_TemplateHandler):
     platform = "yinbo"
-
-    def __init__(
-        self,
-        proxy: str | None = None,
-        cookies: str | None = None,
-        record_quality: str | None = None,
-        platform: str | None = None,
-    ) -> None:
-        super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.YinboLiveStream | None = None
-
-    @trace_error_decorator
-    async def get_stream_info(self, live_url: str) -> StreamData:
-        if not self.live_stream:
-            self.live_stream = streamget.YinboLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_web_stream_data(url=live_url)
-        return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+    stream_class_name = "YinboLiveStream"
 
 
-class ChangliaoHandler(PlatformHandler):
+class ChangliaoHandler(_TemplateHandler):
     platform = "changliao"
-
-    def __init__(
-        self,
-        proxy: str | None = None,
-        cookies: str | None = None,
-        record_quality: str | None = None,
-        platform: str | None = None,
-    ) -> None:
-        super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.ChangliaoLiveStream | None = None
-
-    @trace_error_decorator
-    async def get_stream_info(self, live_url: str) -> StreamData:
-        if not self.live_stream:
-            self.live_stream = streamget.ChangliaoLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_web_stream_data(url=live_url)
-        return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+    stream_class_name = "ChangliaoLiveStream"
 
 
-class ZhihuHandler(PlatformHandler):
+class ZhihuHandler(_TemplateHandler):
     platform = "zhihu"
-
-    def __init__(
-        self,
-        proxy: str | None = None,
-        cookies: str | None = None,
-        record_quality: str | None = None,
-        platform: str | None = None,
-    ) -> None:
-        super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.ZhihuLiveStream | None = None
-
-    @trace_error_decorator
-    async def get_stream_info(self, live_url: str) -> StreamData:
-        if not self.live_stream:
-            self.live_stream = streamget.ZhihuLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_web_stream_data(url=live_url)
-        return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+    stream_class_name = "ZhihuLiveStream"
 
 
-class ChzzkHandler(PlatformHandler):
+class ChzzkHandler(_TemplateHandler):
     platform = "chzzk"
-
-    def __init__(
-        self,
-        proxy: str | None = None,
-        cookies: str | None = None,
-        record_quality: str | None = None,
-        platform: str | None = None,
-    ) -> None:
-        super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.ChzzkLiveStream | None = None
-
-    @trace_error_decorator
-    async def get_stream_info(self, live_url: str) -> StreamData:
-        if not self.live_stream:
-            self.live_stream = streamget.ChzzkLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_web_stream_data(url=live_url)
-        return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+    stream_class_name = "ChzzkLiveStream"
 
 
-class HaixiuHandler(PlatformHandler):
+class HaixiuHandler(_TemplateHandler):
     platform = "haixiu"
-
-    def __init__(
-        self,
-        proxy: str | None = None,
-        cookies: str | None = None,
-        record_quality: str | None = None,
-        platform: str | None = None,
-    ) -> None:
-        super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.HaixiuLiveStream | None = None
-
-    @trace_error_decorator
-    async def get_stream_info(self, live_url: str) -> StreamData:
-        if not self.live_stream:
-            self.live_stream = streamget.HaixiuLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_web_stream_data(url=live_url)
-        return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+    stream_class_name = "HaixiuLiveStream"
 
 
 @deprecated(reason="Live stream acquisition has been shut down")
-class VVXQHandler(PlatformHandler):
+class VVXQHandler(_TemplateHandler):
     platform = "vvxqiu"
-
-    def __init__(
-        self,
-        proxy: str | None = None,
-        cookies: str | None = None,
-        record_quality: str | None = None,
-        platform: str | None = None,
-    ) -> None:
-        super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.VVXQLiveStream | None = None
-
-    @trace_error_decorator
-    async def get_stream_info(self, live_url: str) -> StreamData:
-        if not self.live_stream:
-            self.live_stream = streamget.VVXQLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_web_stream_data(url=live_url)
-        return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+    stream_class_name = "VVXQLiveStream"
 
 
-class YiqiLiveHandler(PlatformHandler):
+class YiqiLiveHandler(_TemplateHandler):
     platform = "17live"
-
-    def __init__(
-        self,
-        proxy: str | None = None,
-        cookies: str | None = None,
-        record_quality: str | None = None,
-        platform: str | None = None,
-    ) -> None:
-        super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.YiqiLiveStream | None = None
-
-    @trace_error_decorator
-    async def get_stream_info(self, live_url: str) -> StreamData:
-        if not self.live_stream:
-            self.live_stream = streamget.YiqiLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_web_stream_data(url=live_url)
-        return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+    stream_class_name = "YiqiLiveStream"
 
 
-class LangLiveHandler(PlatformHandler):
+class LangLiveHandler(_TemplateHandler):
     platform = "langlive"
-
-    def __init__(
-        self,
-        proxy: str | None = None,
-        cookies: str | None = None,
-        record_quality: str | None = None,
-        platform: str | None = None,
-    ) -> None:
-        super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.LangLiveStream | None = None
-
-    @trace_error_decorator
-    async def get_stream_info(self, live_url: str) -> StreamData:
-        if not self.live_stream:
-            self.live_stream = streamget.LangLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_web_stream_data(url=live_url)
-        return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+    stream_class_name = "LangLiveStream"
 
 
 @deprecated(reason="Live stream acquisition has been shut down")
@@ -998,278 +537,71 @@ class PiaopiaoHandler(PlatformHandler):
         return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
 
 
-class SixRoomHandler(PlatformHandler):
+class SixRoomHandler(_TemplateHandler):
     platform = "sixroom"
-
-    def __init__(
-        self,
-        proxy: str | None = None,
-        cookies: str | None = None,
-        record_quality: str | None = None,
-        platform: str | None = None,
-    ) -> None:
-        super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.SixRoomLiveStream | None = None
-
-    @trace_error_decorator
-    async def get_stream_info(self, live_url: str) -> StreamData:
-        if not self.live_stream:
-            self.live_stream = streamget.SixRoomLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_web_stream_data(url=live_url)
-        return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+    stream_class_name = "SixRoomLiveStream"
 
 
-class LehaiHandler(PlatformHandler):
+class LehaiHandler(_TemplateHandler):
     platform = "lehai"
-
-    def __init__(
-        self,
-        proxy: str | None = None,
-        cookies: str | None = None,
-        record_quality: str | None = None,
-        platform: str | None = None,
-    ) -> None:
-        super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.LehaiLiveStream | None = None
-
-    @trace_error_decorator
-    async def get_stream_info(self, live_url: str) -> StreamData:
-        if not self.live_stream:
-            self.live_stream = streamget.LehaiLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_web_stream_data(url=live_url)
-        return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+    stream_class_name = "LehaiLiveStream"
 
 
-class HuamaoHandler(PlatformHandler):
+class HuamaoHandler(_TemplateHandler):
     platform = "huamao"
-
-    def __init__(
-        self,
-        proxy: str | None = None,
-        cookies: str | None = None,
-        record_quality: str | None = None,
-        platform: str | None = None,
-    ) -> None:
-        super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.HuamaoLiveStream | None = None
-
-    @trace_error_decorator
-    async def get_stream_info(self, live_url: str) -> StreamData:
-        if not self.live_stream:
-            self.live_stream = streamget.HuamaoLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_web_stream_data(url=live_url)
-        return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+    stream_class_name = "HuamaoLiveStream"
 
 
-class ShopeeHandler(PlatformHandler):
+class ShopeeHandler(_TemplateHandler):
     platform = "shopee"
-
-    def __init__(
-        self,
-        proxy: str | None = None,
-        cookies: str | None = None,
-        record_quality: str | None = None,
-        platform: str | None = None,
-    ) -> None:
-        super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.ShopeeLiveStream | None = None
-
-    @trace_error_decorator
-    async def get_stream_info(self, live_url: str) -> StreamData:
-        if not self.live_stream:
-            self.live_stream = streamget.ShopeeLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_app_stream_data(url=live_url)
-        return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+    stream_class_name = "ShopeeLiveStream"
+    fetch_method = "fetch_app_stream_data"
 
 
-class YoutubeHandler(PlatformHandler):
+class YoutubeHandler(_TemplateHandler):
     platform = "youtube"
-
-    def __init__(
-        self,
-        proxy: str | None = None,
-        cookies: str | None = None,
-        record_quality: str | None = None,
-        platform: str | None = None,
-    ) -> None:
-        super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.YoutubeLiveStream | None = None
-
-    @trace_error_decorator
-    async def get_stream_info(self, live_url: str) -> StreamData:
-        if not self.live_stream:
-            self.live_stream = streamget.YoutubeLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_web_stream_data(url=live_url)
-        return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+    stream_class_name = "YoutubeLiveStream"
 
 
-class TaobaoHandler(PlatformHandler):
+class TaobaoHandler(_TemplateHandler):
     platform = "taobao"
-
-    def __init__(
-        self,
-        proxy: str | None = None,
-        cookies: str | None = None,
-        record_quality: str | None = None,
-        platform: str | None = None,
-    ) -> None:
-        super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.TaobaoLiveStream | None = None
-
-    @trace_error_decorator
-    async def get_stream_info(self, live_url: str) -> StreamData:
-        if not self.live_stream:
-            self.live_stream = streamget.TaobaoLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_web_stream_data(url=live_url)
-        return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+    stream_class_name = "TaobaoLiveStream"
 
 
-class JDHandler(PlatformHandler):
+class JDHandler(_TemplateHandler):
     platform = "jd"
-
-    def __init__(
-        self,
-        proxy: str | None = None,
-        cookies: str | None = None,
-        record_quality: str | None = None,
-        platform: str | None = None,
-    ) -> None:
-        super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.JDLiveStream | None = None
-
-    @trace_error_decorator
-    async def get_stream_info(self, live_url: str) -> StreamData:
-        if not self.live_stream:
-            self.live_stream = streamget.JDLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_web_stream_data(url=live_url)
-        return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+    stream_class_name = "JDLiveStream"
 
 
-class FaceitHandler(PlatformHandler):
+class FaceitHandler(_TemplateHandler):
     platform = "faceit"
-
-    def __init__(
-        self,
-        proxy: str | None = None,
-        cookies: str | None = None,
-        record_quality: str | None = None,
-        platform: str | None = None,
-    ) -> None:
-        super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.FaceitLiveStream | None = None
-
-    @trace_error_decorator
-    async def get_stream_info(self, live_url: str) -> StreamData:
-        if not self.live_stream:
-            self.live_stream = streamget.FaceitLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_web_stream_data(url=live_url)
-        return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+    stream_class_name = "FaceitLiveStream"
 
 
-class LianJieHandler(PlatformHandler):
+class LianJieHandler(_TemplateHandler):
     platform = "lianjie"
-
-    def __init__(
-        self,
-        proxy: str | None = None,
-        cookies: str | None = None,
-        record_quality: str | None = None,
-        platform: str | None = None,
-    ) -> None:
-        super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.LianJieLiveStream | None = None
-
-    @trace_error_decorator
-    async def get_stream_info(self, live_url: str) -> StreamData:
-        if not self.live_stream:
-            self.live_stream = streamget.LianJieLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_web_stream_data(url=live_url)
-        return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+    stream_class_name = "LianJieLiveStream"
 
 
 @deprecated(reason="Live stream acquisition has been shut down")
-class MiguHandler(PlatformHandler):
+class MiguHandler(_TemplateHandler):
     platform = "migu"
-
-    def __init__(
-        self,
-        proxy: str | None = None,
-        cookies: str | None = None,
-        record_quality: str | None = None,
-        platform: str | None = None,
-    ) -> None:
-        super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.MiguLiveStream | None = None
-
-    @trace_error_decorator
-    async def get_stream_info(self, live_url: str) -> StreamData:
-        if not self.live_stream:
-            self.live_stream = streamget.MiguLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_web_stream_data(url=live_url)
-        return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+    stream_class_name = "MiguLiveStream"
 
 
-class LaixiuHandler(PlatformHandler):
+class LaixiuHandler(_TemplateHandler):
     platform = "laixiu"
-
-    def __init__(
-        self,
-        proxy: str | None = None,
-        cookies: str | None = None,
-        record_quality: str | None = None,
-        platform: str | None = None,
-    ) -> None:
-        super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.LaixiuLiveStream | None = None
-
-    @trace_error_decorator
-    async def get_stream_info(self, live_url: str) -> StreamData:
-        if not self.live_stream:
-            self.live_stream = streamget.LaixiuLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_web_stream_data(url=live_url)
-        return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+    stream_class_name = "LaixiuLiveStream"
 
 
-class PicartoHandler(PlatformHandler):
+class PicartoHandler(_TemplateHandler):
     platform = "picarto"
-
-    def __init__(
-        self,
-        proxy: str | None = None,
-        cookies: str | None = None,
-        record_quality: str | None = None,
-        platform: str | None = None,
-    ) -> None:
-        super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.PicartoLiveStream | None = None
-
-    @trace_error_decorator
-    async def get_stream_info(self, live_url: str) -> StreamData:
-        if not self.live_stream:
-            self.live_stream = streamget.PicartoLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_web_stream_data(url=live_url)
-        return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+    stream_class_name = "PicartoLiveStream"
 
 
-class XindongreboHandler(PlatformHandler):
+class XindongreboHandler(_TemplateHandler):
     platform = "xindongrebo"
-
-    def __init__(
-        self,
-        proxy: str | None = None,
-        cookies: str | None = None,
-        record_quality: str | None = None,
-        platform: str | None = None,
-    ) -> None:
-        super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.XindongreboLiveStream | None = None
-
-    @trace_error_decorator
-    async def get_stream_info(self, live_url: str) -> StreamData:
-        if not self.live_stream:
-            self.live_stream = streamget.XindongreboLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_web_stream_data(url=live_url)
-        return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
+    stream_class_name = "XindongreboLiveStream"
 
 
 CustomHandler.register(r"https?://.*\.(?:flv|m3u8)(\?.*)?$")
