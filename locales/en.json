@@ -132,6 +132,8 @@
     "RECORDING_ERROR": "Recording the live stream has failed",
     "NOT_RECORDING_SPACE": "Insufficient disk space to record",
     "LIVE_STATUS_CHECK_ERROR": "Live status error, check address accessibility",
+    "PLATFORM_BLOCKED": "IP likely restricted by the platform (risk control/ban), change IP or reduce check frequency",
+    "platform_blocked_tip": "{platform}: IP restriction detected, checks paused for {minutes} min",
     "LIVE_BROADCASTING": "Live Broadcasting",
     "not_disk_space_tip": "Insufficient disk storage space, stop recording ⚠️",
     "notify": "Notify",
@@ -184,6 +186,8 @@
     "all": "All",
     "recording": "Recording",
     "recording_error": "Recording Error",
+    "check_error": "Check Failed",
+    "platform_blocked": "IP Restricted",
     "live_broadcasting": "Live Broadcasting",
     "not_live": "Not Live",
     "stopped": "Stopped",
@@ -334,6 +338,9 @@
     "douyin_cookie": "Douyin Cookie",
     "tiktok_cookie": "Tiktok Cookie",
     "kuaishou_cookie": "Kuaishou Cookie",
+    "scan_qr_login": "QR Login",
+    "scan_qr_login_tip": "Scan with the Kuaishou app to fetch cookies automatically",
+    "qr_login_saved": "Kuaishou cookie saved",
     "huya_cookie": "Huya Cookie",
     "douyu_cookie": "Douyu Cookie",
     "yy_cookie": "YY Cookie",
@@ -400,6 +407,8 @@
     "switch_language_tip": "Tip: It is recommended to restart the program after switching languages",
     "platform_max_concurrent_requests": "Max concurrent recordings per platform",
     "platform_max_concurrent_requests_tip": "The maximum number of concurrent requests allowed per platform. Default is 3.",
+    "platform_request_interval": "Min request interval per platform (s)",
+    "platform_request_interval_tip": "Minimum gap between consecutive requests to the same platform, to avoid per-IP burst throttling. Default is 3 seconds, 0 disables it.",
     "check_live_on_browser_refresh": "Check live status when refreshing the web",
     "check_live_on_browser_refresh_tip": "Check live status when refreshing the web"
   },
@@ -536,5 +545,18 @@
     "input_required": "Please enter username and password",
     "login_failed": "Username or password is incorrect",
     "login_success": "Login successful"
+  },
+  "qr_login_dialog": {
+    "kuaishou_qr_login": "Kuaishou QR Login",
+    "qr_tip": "Scan the QR code with the Kuaishou app, then confirm on your phone",
+    "qr_loading": "Fetching QR code...",
+    "qr_waiting_scan": "Scan with the Kuaishou app ({seconds}s left)",
+    "qr_waiting_confirm": "Scanned, please confirm on your phone",
+    "qr_exchanging": "Retrieving cookies...",
+    "qr_success": "Logged in as {name}",
+    "qr_success_unverified": "Cookies retrieved but login state could not be verified",
+    "qr_expired_retry": "QR code expired, refreshing...",
+    "qr_failed": "QR login failed",
+    "qr_refresh": "Get a new QR code"
   }
 }

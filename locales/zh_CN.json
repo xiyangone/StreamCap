@@ -132,6 +132,8 @@
     "RECORDING_ERROR": "直播录制失败, 等待重试",
     "NOT_RECORDING_SPACE": "磁盘空间不足, 无法录制",
     "LIVE_STATUS_CHECK_ERROR": "直播状态检测错误, 请检查地址是否可正常访问",
+    "PLATFORM_BLOCKED": "疑似IP被平台限制(风控/封禁), 建议更换IP或降低检测频率",
+    "platform_blocked_tip": "检测到 {platform} 疑似封禁当前IP, 已暂停该平台检测 {minutes} 分钟",
     "LIVE_BROADCASTING": "正在直播中",
     "not_disk_space_tip": "磁盘存储空间不足, 停止录制 ⚠️",
     "notify": "通知",
@@ -184,6 +186,8 @@
     "all": "全部",
     "recording": "录制中",
     "recording_error": "录制错误",
+    "check_error": "检测失败",
+    "platform_blocked": "IP受限",
     "live_broadcasting": "正在直播中",
     "not_live": "未开播",
     "stopped": "已停止",
@@ -334,6 +338,9 @@
     "douyin_cookie": "抖音Cookie",
     "tiktok_cookie": "TikTok Cookie",
     "kuaishou_cookie": "快手Cookie",
+    "scan_qr_login": "扫码登录",
+    "scan_qr_login_tip": "用快手App扫码自动获取Cookie，免去手动复制",
+    "qr_login_saved": "快手Cookie已保存",
     "huya_cookie": "虎牙Cookie",
     "douyu_cookie": "斗鱼Cookie",
     "yy_cookie": "YY Cookie",
@@ -400,6 +407,8 @@
     "switch_language_tip": "提示: 建议切换语言后重启程序",
     "platform_max_concurrent_requests": "平台最大并发录制数",
     "platform_max_concurrent_requests_tip": "每个平台允许同时发起请求的最大并发数，默认3",
+    "platform_request_interval": "同平台请求最小间隔(秒)",
+    "platform_request_interval_tip": "同一平台相邻请求的最小间隔，用于规避平台按IP的突发限流，默认3秒，0为关闭",
     "check_live_on_browser_refresh": "刷新网页时检查直播状态",
     "check_live_on_browser_refresh_tip": "针对web端运行，开启后每次刷新网页都会重复检测直播间状态"
   },
@@ -536,5 +545,18 @@
     "input_required": "请输入用户名和密码",
     "login_failed": "用户名或密码错误",
     "login_success": "登录成功"
+  },
+  "qr_login_dialog": {
+    "kuaishou_qr_login": "快手扫码登录",
+    "qr_tip": "打开快手 App 扫描二维码，并在手机上确认登录",
+    "qr_loading": "正在获取二维码...",
+    "qr_waiting_scan": "请使用快手 App 扫码（{seconds} 秒后失效）",
+    "qr_waiting_confirm": "已扫描，请在手机上确认登录",
+    "qr_exchanging": "正在获取 Cookie...",
+    "qr_success": "登录成功：{name}",
+    "qr_success_unverified": "已获取 Cookie，但登录态校验未通过，请留意是否可用",
+    "qr_expired_retry": "二维码已过期，正在自动刷新...",
+    "qr_failed": "扫码登录失败",
+    "qr_refresh": "重新获取二维码"
   }
 }

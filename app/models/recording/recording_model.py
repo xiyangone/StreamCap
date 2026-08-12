@@ -83,6 +83,9 @@ class Recording:
         self.live_title = None
         self.detection_time = None
         self.loop_time_seconds = None
+        # 下次检测的实际间隔（loop_time 叠加随机抖动或失败退避后的值）
+        self.next_check_due_seconds: int | None = None
+        self.consecutive_check_failures: int = 0
         self.use_proxy = None
         self.record_url = None
         self.preview_url = None

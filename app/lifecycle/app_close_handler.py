@@ -23,7 +23,7 @@ async def handle_app_close(page: ft.Page, app, save_progress_overlay) -> None:
     for key in ("app_close_handler", "base"):
         _.update(language.get(key, {}))
 
-    if not getattr(app, "is_web_mode", False) and not hasattr(app, "tray_manager"):
+    if not getattr(app, "is_web_mode", False) and getattr(app, "tray_manager", None) is None:
         app.tray_manager = TrayManager(app)
 
     async def minimize_to_tray(e):
@@ -69,7 +69,7 @@ async def handle_app_close(page: ft.Page, app, save_progress_overlay) -> None:
                 except Exception as ex:
                     logger.error(f"close window error: {ex}")
                 finally:
-                    if not getattr(app, "is_web_mode", False) and hasattr(app, "tray_manager"):
+                    if not getattr(app, "is_web_mode", False) and getattr(app, "tray_manager", None):
                         app.tray_manager.stop()
                     page.run_task(page.window.destroy)
                     time.sleep(0.3)
@@ -77,7 +77,7 @@ async def handle_app_close(page: ft.Page, app, save_progress_overlay) -> None:
 
             threading.Thread(target=close_app, daemon=True).start()
         else:
-            if not getattr(app, "is_web_mode", False) and hasattr(app, "tray_manager"):
+            if not getattr(app, "is_web_mode", False) and getattr(app, "tray_manager", None):
                 app.tray_manager.stop()
             await _safe_destroy_window(page)
 

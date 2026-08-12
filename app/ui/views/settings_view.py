@@ -213,6 +213,26 @@ class SettingsPage(PageBase):
         self.page.run_task(self.delay_handler.start_task_timer, self.save_accounts_after_delay, None)
         self.has_unsaved_changes["accounts_config"] = True
 
+    def open_kuaishou_qr_login(self, _):
+        """打开快手扫码登录弹窗，成功后直接回填并保存 Cookie。"""
+        from ..components.dialogs.qr_login_dialog import KuaishouQrLoginDialog
+
+        async def apply_cookies(cookies: str):
+            self.cookies_config["kuaishou"] = cookies
+            await self.config_manager.save_cookies_config(self.cookies_config)
+            self.has_unsaved_changes["cookies_config"] = False
+            field = getattr(self, "kuaishou_cookie_field", None)
+            if field is not None:
+                field.value = cookies
+            self.page.update()
+            await self.app.snack_bar.show_snack_bar(self._["qr_login_saved"], bgcolor=ft.Colors.GREEN)
+
+        dialog = KuaishouQrLoginDialog(self.app, apply_cookies)
+        self.app.dialog_area.content = dialog
+        dialog.open = True
+        self.page.update()
+        dialog.start()
+
     async def save_user_config_after_delay(self, delay):
         await asyncio.sleep(delay)
         if self.has_unsaved_changes["user_config"]:
@@ -524,6 +544,16 @@ class SettingsPage(PageBase):
                                 data="platform_max_concurrent_requests",
                                 on_change=self.on_change,
                                 hint_text=self._["platform_max_concurrent_requests_tip"],
+                            ),
+                        ),
+                        self.create_setting_row(
+                            self._["platform_request_interval"],
+                            ft.TextField(
+                                value=str(self.get_config_value("platform_request_interval", 3)),
+                                width=100,
+                                data="platform_request_interval",
+                                on_change=self.on_change,
+                                hint_text=self._["platform_request_interval_tip"],
                             ),
                         ),
                         self.create_setting_row(
@@ -998,7 +1028,25 @@ class SettingsPage(PageBase):
             cookie_field = ft.TextField(
                 value=self.get_cookies_value(platform), width=500, data=platform, on_change=self.on_cookies_change
             )
-            setting_rows.append(self.create_setting_row(self._[f"{platform}_cookie"], cookie_field))
+            if platform == "kuaishou":
+                self.kuaishou_cookie_field = cookie_field
+                control = ft.Row(
+                    controls=[
+                        cookie_field,
+                        ft.OutlinedButton(
+                            content=self._["scan_qr_login"],
+                            icon=ft.Icons.QR_CODE_SCANNER,
+                            tooltip=self._["scan_qr_login_tip"],
+                            on_click=self.open_kuaishou_qr_login,
+                        ),
+                    ],
+                    spacing=8,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    wrap=True,
+                )
+            else:
+                control = cookie_field
+            setting_rows.append(self.create_setting_row(self._[f"{platform}_cookie"], control))
 
         return ft.Column(
             [

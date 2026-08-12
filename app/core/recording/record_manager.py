@@ -1,5 +1,7 @@
 import asyncio
+import random
 import threading
+import time
 from collections import defaultdict
 from datetime import datetime, timedelta
 
@@ -32,11 +34,60 @@ class RecordingManager:
         max_concurrent = int(self.settings.user_config.get("platform_max_concurrent_requests", 3))
         self.platform_semaphores = defaultdict(lambda: asyncio.Semaphore(max_concurrent))
         self.active_recorders = {}
+        # 同平台相邻请求的最小间隔。多房间同时到期时会被连续检测，
+        # 部分平台（如快手）按 IP 做突发限流，无间隔连打会返回错误页，
+        # 表现为在播房间被误判为未开播。
+        self.platform_request_interval = float(
+            self.settings.user_config.get("platform_request_interval", 3)
+        )
+        self.platform_last_request = defaultdict(float)
+        self.platform_pace_locks = defaultdict(asyncio.Lock)
+        # 检测到平台风控/封IP后，暂停该平台的周期性检测一段时间，
+        # 避免封禁期间持续撞墙、反而延长封禁时长
+        self.platform_block_cooldown = 1800.0
+        self.platform_block_until = defaultdict(float)
 
     @property
     def app(self):
         bridges = self.services.snapshot_bridges()
         return bridges[0] if bridges else None
+
+    async def _pace_platform_request(self, platform_key: str) -> None:
+        """确保同平台相邻请求之间至少间隔 platform_request_interval 秒。"""
+        interval = self.platform_request_interval
+        if interval <= 0:
+            return
+
+        async with self.platform_pace_locks[platform_key]:
+            loop = asyncio.get_running_loop()
+            # 间隔加随机抖动，避免精确等间隔的机器特征
+            spacing = interval * random.uniform(1.0, 1.5)
+            wait = self.platform_last_request[platform_key] + spacing - loop.time()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self.platform_last_request[platform_key] = loop.time()
+
+    def is_platform_blocked(self, platform_key: str | None) -> bool:
+        """该平台是否处于风控冷却期（暂停周期性检测）。"""
+        if not platform_key:
+            return False
+        return time.monotonic() < self.platform_block_until[platform_key]
+
+    def _handle_platform_block(self, platform_key: str | None, platform_name: str | None):
+        """记录平台被限制，进入冷却期并通知用户（同一冷却期内只通知一次）。"""
+        if not platform_key:
+            return
+        now = time.monotonic()
+        if now < self.platform_block_until[platform_key]:
+            return
+        self.platform_block_until[platform_key] = now + self.platform_block_cooldown
+        minutes = int(self.platform_block_cooldown // 60)
+        tip = self._.get("platform_blocked_tip", "{platform}: IP is restricted, checks paused for {minutes} min")
+        text = tip.replace("{platform}", str(platform_name or platform_key)).replace("{minutes}", str(minutes))
+        logger.warning(
+            f"Platform block detected: {platform_key}, pause live checks for {minutes} minutes"
+        )
+        self.services.broadcast_snack(text)
 
     @property
     def recordings(self):
@@ -216,7 +267,10 @@ class RecordingManager:
         """Check the live status of all recordings and update their display titles."""
         for recording in self.recordings:
             if recording.monitor_status and not recording.is_recording:
-                is_exceeded = utils.is_time_interval_exceeded(recording.detection_time, recording.loop_time_seconds)
+                if self.is_platform_blocked(getattr(recording, "platform_key", None)):
+                    continue
+                due_seconds = getattr(recording, "next_check_due_seconds", None) or recording.loop_time_seconds
+                is_exceeded = utils.is_time_interval_exceeded(recording.detection_time, due_seconds)
                 if not recording.detection_time or is_exceeded:
                     self.services.run_coro(self.check_if_live(recording))
 
@@ -235,17 +289,25 @@ class RecordingManager:
 
         async def periodic_check():
             logger.info("Starting periodic live check background task")
+            # 外层以固定小步长轮转，真正的检测节奏由每个房间的
+            # next_check_due_seconds（loop_time + 抖动/退避）决定；
+            # 这样各房间会自然错峰，而不是同一时刻集体到期
+            tick = max(10, min(30, interval))
+            delay_first_round = self.services.settings_config.user_config.get(
+                "check_live_on_browser_refresh", True
+            )
+            # 启动后先等待再首查，避免反复重启软件造成突发请求
+            await asyncio.sleep(interval if delay_first_round else 10)
+            last_space_check = 0.0
             while True:
-                immediate_check_on_startup = self.services.settings_config.user_config.get(
-                    "check_live_on_browser_refresh", True
-                )
-                if immediate_check_on_startup:
-                    await asyncio.sleep(interval)
-                await self.check_free_space()
+                now = asyncio.get_running_loop().time()
+                # 磁盘检查维持原有低频：空间不足时它会持续弹提示，不能跟着 tick 走
+                if now - last_space_check >= interval:
+                    last_space_check = now
+                    await self.check_free_space()
                 if self.services.recording_enabled:
                     await self.check_all_live_status()
-                if not immediate_check_on_startup:
-                    await asyncio.sleep(interval)
+                await asyncio.sleep(tick)
 
         if not RecordingManager.is_periodic_task_running():
             RecordingManager.set_periodic_task_running(True)
@@ -275,6 +337,9 @@ class RecordingManager:
             return
 
         recording.detection_time = datetime.now().time()
+        base_loop_seconds = int(recording.loop_time_seconds or self.loop_time_seconds or 300)
+        # 下次检测时间加 0-25% 随机抖动，避免所有房间长期同步到期
+        recording.next_check_due_seconds = int(base_loop_seconds * random.uniform(1.0, 1.25))
         recording.is_checking = True
 
         if not recording.showed_checking_status:
@@ -333,16 +398,28 @@ class RecordingManager:
         semaphore = self.platform_semaphores[platform_key]
         recorder = LiveStreamRecorder(self.services, recording, recording_info)
         async with semaphore:
+            await self._pace_platform_request(platform_key)
             stream_info = await recorder.fetch_stream()
             logger.info(f"Stream Data: {stream_info}")
         if not stream_info or not stream_info.anchor_name:
-            logger.error(f"Fetch stream data failed: {recording.url}")
+            fetch_error = getattr(recorder, "last_fetch_error", None)
+            logger.error(f"Fetch stream data failed: {recording.url} | {fetch_error or 'unknown reason'}")
             recording.is_checking = False
-            recording.status_info = RecordingStatus.LIVE_STATUS_CHECK_ERROR
+            failures = getattr(recording, "consecutive_check_failures", 0) + 1
+            recording.consecutive_check_failures = failures
+            # 连续失败按指数退避（封顶4倍循环时间），避免失败期间高频重试
+            backoff = min(2 ** (failures - 1), 4)
+            recording.next_check_due_seconds = int(base_loop_seconds * backoff * random.uniform(1.0, 1.25))
+            if utils.is_platform_block_error(fetch_error):
+                recording.status_info = RecordingStatus.PLATFORM_BLOCKED
+                self._handle_platform_block(platform_key, platform)
+            else:
+                recording.status_info = RecordingStatus.LIVE_STATUS_CHECK_ERROR
             if recording.monitor_status:
                 self.services.broadcast_card_update(recording)
                 self.services.broadcast_pubsub("update", recording)
             return
+        recording.consecutive_check_failures = 0
         if self.settings.user_config.get("remove_emojis"):
             stream_info.anchor_name = utils.clean_name(stream_info.anchor_name, self._["live_room"])
 

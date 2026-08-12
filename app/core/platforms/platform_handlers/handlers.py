@@ -1,6 +1,11 @@
+import json
+import time
+
 import streamget
 from deprecated import deprecated
+from streamget.requests.async_http import async_req
 
+from ....utils.logger import logger
 from ....utils.utils import trace_error_decorator
 from .base import PlatformHandler, StreamData
 
@@ -76,6 +81,104 @@ class TikTokHandler(PlatformHandler):
         return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
 
 
+class _KwaiLiveStreamHardened(streamget.KwaiLiveStream):
+    """快手加固版解析器。
+
+    针对上游 KwaiLiveStream 的三处问题：
+
+    1. _get_pc_headers 丢弃了用户 Cookie，主页面请求始终是匿名的；
+    2. get_user_info 假定 /u/ 后面是数字 principalId，遇到用户名形式的地址
+       或平台下发验证码挑战时会直接 KeyError，把整次检测拖崩——配了 Cookie
+       反而比不配更容易失败；
+    3. 只有网页抓取一条通道，而网页端按 IP 做严格突发限流。
+
+    手机分享接口（与 DouyinLiveRecorder v4.0.7 主通道一致）限流宽松，
+    因此优先走它，网页抓取兜底；该接口被限流时进入冷却，避免每次检测
+    都白打一次请求反而加重限流。
+    """
+
+    APP_API = "https://livev.m.chenzhongtech.com/rest/k/live/byUser?kpn=GAME_ZONE&captchaToken="
+    APP_HEADERS = {
+        "user-agent": "ios/7.830 (ios 17.0; ; iPhone 15 (A2846/A3089/A3090/A3092))",
+        "accept-language": "zh-CN,zh;q=0.8,zh-TW;q=0.7,zh-HK;q=0.5,en-US;q=0.3,en;q=0.2",
+        "referer": "https://www.kuaishou.com/short-video/3x224rwabjmuc9y?fid=1712760877&cc=share_copylink",
+        "content-type": "application/json",
+    }
+    APP_API_COOLDOWN = 600.0
+
+    def __init__(self, proxy_addr: str | None = None, cookies: str | None = None) -> None:
+        super().__init__(proxy_addr=proxy_addr, cookies=cookies)
+        self._app_api_ready_at = 0.0
+
+    def _get_pc_headers(self) -> dict:
+        headers = super()._get_pc_headers()
+        if self.cookies and self.cookies.strip():
+            headers["cookie"] = self.cookies
+        return headers
+
+    async def get_user_info(self, url: str):
+        """探测失败即放行，交给网页解析判断，不让一个辅助接口决定成败。
+
+        平台下发验证码挑战时响应里没有 userInfo，上游会 KeyError；
+        真正的账号风控（RuntimeError）仍然向上抛出，供上层归类展示。
+        """
+        try:
+            return await super().get_user_info(url)
+        except RuntimeError:
+            raise
+        except Exception as e:
+            logger.info(f"Kuaishou user info probe unavailable, fall back to page parsing: {e}")
+            return None, True
+
+    async def fetch_app_stream_data(self, url: str) -> dict | None:
+        if "/u/" not in url or time.monotonic() < self._app_api_ready_at:
+            return None
+        eid = url.split("/u/")[1].split("?")[0].strip("/").strip()
+        if not eid:
+            return None
+
+        headers = dict(self.APP_HEADERS)
+        if self.cookies and self.cookies.strip():
+            headers["cookie"] = self.cookies
+        body = {"source": 5, "eid": eid, "shareMethod": "card", "clientType": "WEB_OUTSIDE_SHARE_H5"}
+        # 必须走 json_data：该接口对表单编码的请求返回空响应体
+        raw = await async_req(url=self.APP_API, proxy_addr=self.proxy_addr, headers=headers, json_data=body)
+        if not isinstance(raw, str) or not raw.strip():
+            self._cool_down_app_api("empty response")
+            return None
+
+        json_data = json.loads(raw)
+        live_stream = json_data.get("liveStream")
+        if not live_stream:
+            self._cool_down_app_api(json_data.get("error_msg") or f"result={json_data.get('result')}")
+            return None
+
+        anchor_name = (live_stream.get("user") or {}).get("user_name")
+        if not anchor_name:
+            return None
+
+        result = {"type": 2, "anchor_name": anchor_name, "is_live": False, "live_url": url}
+        if live_stream.get("living"):
+            if "multiResolutionHlsPlayUrls" in live_stream:
+                result["m3u8_url_list"] = live_stream["multiResolutionHlsPlayUrls"][0]["urls"]
+            if "multiResolutionPlayUrls" in live_stream:
+                result["flv_url_list"] = live_stream["multiResolutionPlayUrls"][0]["urls"]
+            elif live_stream.get("playUrls"):
+                result["flv_url_list"] = live_stream["playUrls"]
+            if "flv_url_list" not in result and "m3u8_url_list" not in result:
+                # 在播但拿不到直播源地址，交给网页兜底解析
+                return None
+            result["is_live"] = True
+        return result
+
+    def _cool_down_app_api(self, reason: str) -> None:
+        self._app_api_ready_at = time.monotonic() + self.APP_API_COOLDOWN
+        logger.info(
+            f"Kuaishou app API unavailable ({reason}), use page parsing for the next "
+            f"{int(self.APP_API_COOLDOWN // 60)} minutes"
+        )
+
+
 class KuaishouHandler(PlatformHandler):
     platform = "kuaishou"
 
@@ -87,13 +190,21 @@ class KuaishouHandler(PlatformHandler):
         platform: str | None = None,
     ) -> None:
         super().__init__(proxy, cookies, record_quality, platform)
-        self.live_stream: streamget.KwaiLiveStream | None = None
+        self.live_stream: _KwaiLiveStreamHardened | None = None
 
     @trace_error_decorator
     async def get_stream_info(self, live_url: str) -> StreamData:
         if not self.live_stream:
-            self.live_stream = streamget.KwaiLiveStream(proxy_addr=self.proxy, cookies=self.cookies)
-        json_data = await self.live_stream.fetch_web_stream_data(url=live_url)
+            self.live_stream = _KwaiLiveStreamHardened(proxy_addr=self.proxy, cookies=self.cookies)
+        json_data = None
+        try:
+            json_data = await self.live_stream.fetch_app_stream_data(url=live_url)
+        except Exception as e:
+            logger.info(f"Kuaishou app API failed, fallback to web page: {e}")
+        if not json_data:
+            json_data = await self.live_stream.fetch_web_stream_data(url=live_url)
+        if not json_data:
+            raise Exception(f"Failed to fetch Kuaishou stream data from {live_url}")
         return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
 
 

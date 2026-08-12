@@ -99,16 +99,48 @@ def trace_error_decorator(func: callable) -> callable:
     @functools.wraps(func)
     async def wrapper(*args: list, **kwargs: dict) -> Any:
         try:
-            return await func(*args, **kwargs)
+            result = await func(*args, **kwargs)
+            if args:
+                try:
+                    setattr(args[0], "last_fetch_error", None)
+                except Exception:
+                    pass
+            return result
         except execjs.ProgramError:
             logger.warning("Failed to execute JS code. Please check if the Node.js environment")
         except Exception as e:
             error_line = traceback.extract_tb(e.__traceback__)[-1].lineno
             error_info = f"Type: {type(e).__name__}, {e} in function {func.__name__} at line: {error_line}"
             logger.error(error_info)
+            # 把原始错误留在实例上，供上层区分“被平台限制”与普通检测失败
+            if args:
+                try:
+                    setattr(args[0], "last_fetch_error", error_info)
+                except Exception:
+                    pass
             return []
 
     return wrapper
+
+
+# 平台风控/封禁的错误特征。命中即视为 IP 被平台限制，而非普通检测失败
+PLATFORM_BLOCK_KEYWORDS = (
+    "ip banned",
+    "risk control",
+    "风控",
+    "ip已封禁",
+    "请求次数过多",
+    "操作太快",
+    "captcha",
+    "验证码",
+)
+
+
+def is_platform_block_error(error_text: str | None) -> bool:
+    if not error_text:
+        return False
+    lowered = error_text.lower()
+    return any(keyword in lowered for keyword in PLATFORM_BLOCK_KEYWORDS)
 
 
 def check_md5(file_path: str | Path) -> str:
