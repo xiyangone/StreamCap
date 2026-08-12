@@ -37,7 +37,9 @@ class LiveStreamRecorder:
         self.user_config = self.settings.user_config
         self.account_config = self.settings.accounts_config
         self.platform_key = self._get_info("platform_key")
-        self.cookies = self.settings.cookies_config.get(self.platform_key)
+        # 未配置时必须回落为空串：streamget 多个平台解析器直接调用 cookies.strip()，
+        # 传 None 会抛 'NoneType' object has no attribute 'strip'
+        self.cookies = self.settings.cookies_config.get(self.platform_key) or ""
 
         self.platform = self._get_info("platform")
         self.live_url = self._get_info("live_url")
@@ -51,6 +53,7 @@ class LiveStreamRecorder:
         self.direct_downloader = None
         self.min_valid_recording_duration = 25
         self.recording_start_time = 0
+        self.last_fetch_error = None
         os.makedirs(self.output_dir, exist_ok=True)
         self.services.language_manager.add_observer(self)
         self._ = {}
@@ -252,6 +255,8 @@ class LiveStreamRecorder:
             logger.error(f"No handler found for platform: {self.recording.url}")
             return
         stream_info = await handler.get_stream_info(self.live_url)
+        # 检测失败时把 handler 捕获的原始错误带回，供 record_manager 分类展示
+        self.last_fetch_error = getattr(handler, "last_fetch_error", None)
         self.recording.is_checking = False
         return stream_info
 

@@ -5,7 +5,11 @@ from ....models.recording.recording_status_model import CardStateType, Recording
 
 
 class RecordingCardState:
-    ERROR_STATUSES = [RecordingStatus.RECORDING_ERROR, RecordingStatus.LIVE_STATUS_CHECK_ERROR]
+    ERROR_STATUSES = [
+        RecordingStatus.RECORDING_ERROR,
+        RecordingStatus.LIVE_STATUS_CHECK_ERROR,
+        RecordingStatus.PLATFORM_BLOCKED,
+    ]
 
     @staticmethod
     def get_card_state(recording: Recording) -> CardStateType:
@@ -76,6 +80,17 @@ class RecordingCardState:
                 "text_color": ft.Colors.WHITE,
             },
         }
+
+        # 错误态细分文案：区分“IP被平台限制”“检测失败”与真正的录制错误
+        if state == CardStateType.ERROR:
+            error_text_keys = {
+                RecordingStatus.PLATFORM_BLOCKED: "platform_blocked",
+                RecordingStatus.LIVE_STATUS_CHECK_ERROR: "check_error",
+            }
+            text_key = error_text_keys.get(recording.status_info or "")
+            override_text = language_dict.get(text_key) if text_key else None
+            if override_text:
+                configs[CardStateType.ERROR]["text"] = override_text
 
         return configs.get(state, {})
 

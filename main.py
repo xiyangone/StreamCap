@@ -26,11 +26,88 @@ WINDOWS_WINDOW_SCALE = 0.68
 MIN_WIDTH = 950
 MIN_HEIGHT = 620
 ASSETS_DIR = "assets"
+# 窗口最多占逻辑屏幕的比例，避免 DPI 探测失败时窗口撑出屏幕
+MAX_SCREEN_RATIO = 0.94
 
 
 def get_desktop_window_scale(page: ft.Page) -> float:
     is_macos = page.platform is not None and page.platform.value == "macos"
     return MACOS_WINDOW_SCALE if is_macos else WINDOWS_WINDOW_SCALE
+
+
+def get_display_scale_factor() -> float:
+    """返回主显示器的缩放系数。
+
+    screeninfo 报告的是物理像素，而 flet 的 window.width/height 使用逻辑像素。
+    高 DPI 屏上若不换算，窗口会超出屏幕表现为全屏无边框。
+    非 Windows 或查询失败时返回 1.0（macOS 的 screeninfo 已是逻辑点）。
+    """
+    if os.name != "nt":
+        return 1.0
+
+    import ctypes
+
+    class _Point(ctypes.Structure):
+        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+    # GetScaleFactorForMonitor 不受调用进程 DPI 感知级别影响，优先使用
+    try:
+        monitor_default_to_primary = 1
+        monitor = ctypes.windll.user32.MonitorFromPoint(_Point(0, 0), monitor_default_to_primary)
+        factor = ctypes.c_int()
+        if ctypes.windll.shcore.GetScaleFactorForMonitor(monitor, ctypes.byref(factor)) == 0:
+            if factor.value > 0:
+                return factor.value / 100.0
+    except Exception:
+        pass
+
+    try:
+        dpi = ctypes.windll.user32.GetDpiForSystem()
+        if dpi > 0:
+            return dpi / 96.0
+    except Exception:
+        pass
+
+    return 1.0
+
+
+def get_logical_screen_size() -> tuple[int, int] | None:
+    """取系统报告的屏幕尺寸，用于校验换算结果。
+
+    DPI 不感知的进程里 GetSystemMetrics 返回的已是虚拟化后的逻辑尺寸，
+    可作为独立于缩放探测的上界，兜住探测失败的情形。
+    """
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        width = user32.GetSystemMetrics(0)
+        height = user32.GetSystemMetrics(1)
+        if width > 0 and height > 0:
+            return width, height
+    except Exception:
+        pass
+    return None
+
+
+def calc_window_size(screen_width: int, screen_height: int, window_scale: float) -> tuple[int, int]:
+    """由物理屏幕尺寸算出合适的逻辑窗口尺寸。"""
+    scale_factor = get_display_scale_factor() or 1.0
+    logical_width = screen_width / scale_factor
+    logical_height = screen_height / scale_factor
+
+    # 取两个来源的较小值作为逻辑屏上界，任一来源失准都不会导致窗口撑出屏幕
+    system_size = get_logical_screen_size()
+    if system_size:
+        logical_width = min(logical_width, system_size[0])
+        logical_height = min(logical_height, system_size[1])
+
+    width = min(logical_width * window_scale, logical_width * MAX_SCREEN_RATIO)
+    height = min(logical_height * window_scale, logical_height * MAX_SCREEN_RATIO)
+
+    return int(width), int(height)
 
 
 async def setup_desktop_window(page: ft.Page, app: App) -> None:
@@ -47,20 +124,16 @@ async def setup_desktop_window(page: ft.Page, app: App) -> None:
         page.window.min_width = MIN_WIDTH
         page.window.min_height = max(MIN_HEIGHT, MIN_WIDTH * window_scale)
 
-        if app.settings.user_config.get("remember_window_size"):
-            window_width = app.settings.user_config.get("window_width")
-            window_height = app.settings.user_config.get("window_height")
-            if window_width and window_height:
-                page.window.width = int(window_width)
-                page.window.height = int(window_height)
-            else:
-                screen = get_monitors()[0]
-                page.window.width = int(screen.width * window_scale)
-                page.window.height = int(screen.height * window_scale)
+        saved_width = app.settings.user_config.get("window_width")
+        saved_height = app.settings.user_config.get("window_height")
+        if app.settings.user_config.get("remember_window_size") and saved_width and saved_height:
+            page.window.width = int(saved_width)
+            page.window.height = int(saved_height)
         else:
             screen = get_monitors()[0]
-            page.window.width = int(screen.width * window_scale)
-            page.window.height = int(screen.height * window_scale)
+            page.window.width, page.window.height = calc_window_size(
+                screen.width, screen.height, window_scale
+            )
 
         page.update()
         await page.window.center()
@@ -182,7 +255,7 @@ async def main(page: ft.Page) -> None:
             if page.platform and page.platform.value == "windows":
                 if app.tray_manager is not None:
                     try:
-                        app.tray_manager.start(page)
+                        app.tray_manager.start(page, save_progress_overlay)
                     except Exception as err:
                         logger.error(f"Failed to start tray manager: {err}")
 

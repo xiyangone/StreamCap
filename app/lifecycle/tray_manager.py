@@ -13,6 +13,7 @@ class TrayManager:
         self.icon_path = None
         self.tray_thread = None
         self.is_running = False
+        self.save_progress_overlay = None
         self.assets_dir = getattr(app, "assets_dir", os.path.join(os.getcwd(), "assets"))
 
     def create_image(self):
@@ -22,6 +23,8 @@ class TrayManager:
             self.icon_path = os.path.join(self.assets_dir, "icons", "tray_icon.ico")
             if os.path.exists(self.icon_path):
                 return Image.open(self.icon_path)
+            logger.warning(f"Tray icon file not found: {self.icon_path}, using fallback image")
+            return Image.new("RGB", (32, 32), color=(255, 255, 255))
         except Exception as e:
             logger.error(f"Failed to load icon file: {e}")
             try:
@@ -48,11 +51,12 @@ class TrayManager:
                 page.update()
 
             def on_exit(_icon, _item):
-                self.is_running = False
+                # pystray 回调运行在托盘线程，必须经 page.run_task 切回
+                # Flet 事件循环；退出统一走 handle_app_close 的确认弹窗流程
+                from .app_close_handler import handle_app_close
+
                 on_restore(_icon, _item)
-                if hasattr(self.app, "close_confirm_dialog"):
-                    self.app.close_confirm_dialog.open = True
-                    page.update()
+                page.run_task(handle_app_close, page, self.app, self.save_progress_overlay)
 
             language = self.app.language_manager.language
             _ = {}
@@ -69,12 +73,16 @@ class TrayManager:
             self.is_running = False
             page.run_task(page.window.destroy)
             raise e
+        except Exception as e:
+            logger.error(f"Tray icon failed to start: {e}")
+            self.is_running = False
 
-    def start(self, page: ft.Page):
+    def start(self, page: ft.Page, save_progress_overlay=None):
         if getattr(self.app, "is_web_mode", False):
             logger.info("Tray icon not available in web mode")
             return False
 
+        self.save_progress_overlay = save_progress_overlay
         if self.tray_thread is None or not self.tray_thread.is_alive():
             self.tray_thread = threading.Thread(target=self.create_tray_icon, args=(page,), daemon=True)
             self.tray_thread.start()

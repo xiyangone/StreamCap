@@ -14,7 +14,7 @@
     "proxy_address": "",
     "video_format": "TS",
     "record_quality": "OD",
-    "loop_time_seconds": "180",
+    "loop_time_seconds": "600",
     "segmented_recording_enabled": true,
     "force_https_recording": true,
     "default_live_source": "FLV",
@@ -69,6 +69,7 @@
     "is_grid_view": true,
     "theme_mode": "light",
     "platform_max_concurrent_requests": "3",
+    "platform_request_interval": "3",
     "last_route": "/home",
     "check_live_on_browser_refresh": false
 }
