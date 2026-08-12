@@ -1047,7 +1047,6 @@ class SettingsPage(PageBase):
                     ],
                     spacing=8,
                     vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                    wrap=True,
                 )
             else:
                 control = cookie_field

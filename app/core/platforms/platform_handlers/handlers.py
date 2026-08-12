@@ -87,14 +87,14 @@ class _KwaiLiveStreamHardened(streamget.KwaiLiveStream):
     针对上游 KwaiLiveStream 的三处问题：
 
     1. _get_pc_headers 丢弃了用户 Cookie，主页面请求始终是匿名的；
-    2. get_user_info 假定 /u/ 后面是数字 principalId，遇到用户名形式的地址
-       或平台下发验证码挑战时会直接 KeyError，把整次检测拖崩——配了 Cookie
-       反而比不配更容易失败；
+    2. Cookie 非空时会先打 userinfo 辅助接口，该接口限流时返回语义虚假的
+       占位响应且不抛异常，导致网页通道被完全短路（详见 get_user_info）；
     3. 只有网页抓取一条通道，而网页端按 IP 做严格突发限流。
 
     手机分享接口（与 DouyinLiveRecorder v4.0.7 主通道一致）限流宽松，
     因此优先走它，网页抓取兜底；该接口被限流时进入冷却，避免每次检测
-    都白打一次请求反而加重限流。
+    都白打一次请求反而加重限流。冷却原因会通过 last_fetch_error 上报，
+    供上层区分"平台限流"与"普通检测失败"。
     """
 
     APP_API = "https://livev.m.chenzhongtech.com/rest/k/live/byUser?kpn=GAME_ZONE&captchaToken="
@@ -109,6 +109,19 @@ class _KwaiLiveStreamHardened(streamget.KwaiLiveStream):
     def __init__(self, proxy_addr: str | None = None, cookies: str | None = None) -> None:
         super().__init__(proxy_addr=proxy_addr, cookies=cookies)
         self._app_api_ready_at = 0.0
+        self._block_reason: str | None = None
+
+    @property
+    def pending_block_reason(self) -> str | None:
+        """手机接口当前是否正因限流处于冷却期，是则返回平台给出的原因。
+
+        以冷却截止时间为准而非一次性标志：handler 实例被 _instances 缓存复用，
+        冷却期内每次检测都直接跳过请求，原因不会被重新赋值。绑定截止时间可以
+        让原因随冷却自然过期，不需要手动清理。
+        """
+        if time.monotonic() < self._app_api_ready_at:
+            return self._block_reason
+        return None
 
     def _get_pc_headers(self) -> dict:
         headers = super()._get_pc_headers()
@@ -117,18 +130,26 @@ class _KwaiLiveStreamHardened(streamget.KwaiLiveStream):
         return headers
 
     async def get_user_info(self, url: str):
-        """探测失败即放行，交给网页解析判断，不让一个辅助接口决定成败。
+        """废弃 userinfo 前置探测，恒定放行，一律交给网页解析判断。
 
-        平台下发验证码挑战时响应里没有 userInfo，上游会 KeyError；
-        真正的账号风控（RuntimeError）仍然向上抛出，供上层归类展示。
+        上游 fetch_web_stream_data 在 Cookie 非空时会先打这个辅助接口，
+        拿到 living 为假就直接 early return，网页通道一次都不请求。
+
+        但该接口在限流时会返回结构完整、语义虚假的占位响应——实测同一房间
+        三分钟内在 result=1（name 正常）、result=2（name 为 None）、
+        result=400002（userInfo 整体缺失）之间跳变。占位响应不抛异常，
+        干净地返回 (None, False)，于是整次检测被判成未开播，
+        表现为卡片"检测失败"。配了 Cookie 反而比不配更容易失败。
+
+        返回 (None, True) 让上游跳过 early return 分支；不再发这次请求，
+        同时也少一个被限流的接口面。
+
+        取舍：一并放弃了上游基于该接口的账号风控识别
+        （result==2 且 name 存在时抛 RuntimeError）。该判据本身不可靠——
+        限流占位响应同样是 result=2。真实的房间级异常仍由网页通道的
+        errorType 与 "IP banned" 分支反馈。
         """
-        try:
-            return await super().get_user_info(url)
-        except RuntimeError:
-            raise
-        except Exception as e:
-            logger.info(f"Kuaishou user info probe unavailable, fall back to page parsing: {e}")
-            return None, True
+        return None, True
 
     async def fetch_app_stream_data(self, url: str) -> dict | None:
         if "/u/" not in url or time.monotonic() < self._app_api_ready_at:
@@ -173,6 +194,7 @@ class _KwaiLiveStreamHardened(streamget.KwaiLiveStream):
 
     def _cool_down_app_api(self, reason: str) -> None:
         self._app_api_ready_at = time.monotonic() + self.APP_API_COOLDOWN
+        self._block_reason = reason
         logger.info(
             f"Kuaishou app API unavailable ({reason}), use page parsing for the next "
             f"{int(self.APP_API_COOLDOWN // 60)} minutes"
@@ -197,13 +219,21 @@ class KuaishouHandler(PlatformHandler):
         if not self.live_stream:
             self.live_stream = _KwaiLiveStreamHardened(proxy_addr=self.proxy, cookies=self.cookies)
         json_data = None
+        app_exception: Exception | None = None
         try:
             json_data = await self.live_stream.fetch_app_stream_data(url=live_url)
         except Exception as e:
+            app_exception = e
             logger.info(f"Kuaishou app API failed, fallback to web page: {e}")
         if not json_data:
             json_data = await self.live_stream.fetch_web_stream_data(url=live_url)
         if not json_data:
+            # 两条通道都失败时才判断平台级限流：手机接口正处于冷却，且有限流原因
+            if reason := self.live_stream.pending_block_reason:
+                raise Exception(f"Kuaishou channels blocked: {reason}")
+            # 否则是普通失败：手机接口抛异常（网络错误、解析错等）+ 网页空
+            if app_exception:
+                raise Exception(f"App API: {app_exception}; web page also failed") from app_exception
             raise Exception(f"Failed to fetch Kuaishou stream data from {live_url}")
         return await self.live_stream.fetch_stream_url(json_data, self.record_quality)
 
