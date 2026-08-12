@@ -96,10 +96,8 @@ class RecordingCardState:
 
     @staticmethod
     def get_display_title(recording: Recording, language_dict: dict) -> str:
-        status_prefix = ""
-        if not recording.monitor_status:
-            status_prefix = f"[{language_dict.get('monitor_stopped')}] "
-        return f"{status_prefix}{recording.title}"
+        # 状态已由卡片右上角的独立状态标签展示，标题不再重复拼前缀
+        return recording.title
 
     @staticmethod
     def get_title_weight(recording: Recording) -> ft.FontWeight:

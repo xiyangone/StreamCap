@@ -1026,7 +1026,12 @@ class SettingsPage(PageBase):
         setting_rows = []
         for platform in platforms:
             cookie_field = ft.TextField(
-                value=self.get_cookies_value(platform), width=500, data=platform, on_change=self.on_cookies_change
+                value=self.get_cookies_value(platform),
+                expand=True,
+                min_lines=1,
+                max_lines=3,
+                data=platform,
+                on_change=self.on_cookies_change,
             )
             if platform == "kuaishou":
                 self.kuaishou_cookie_field = cookie_field

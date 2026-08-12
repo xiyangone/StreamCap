@@ -146,7 +146,8 @@ class Recording:
     def update_title(self, quality_info, prefix=None):
         """Helper method to update the title."""
         self.title = f"{self.streamer_name} - {quality_info}"
-        self.display_title = f"{prefix or ''}{self.title}"
+        # prefix 参数保留兼容签名，但标题不再拼接状态前缀（状态由卡片独立标签展示）
+        self.display_title = self.title
 
     def update(self, updated_info: dict):
         """Update the recording object with new information."""

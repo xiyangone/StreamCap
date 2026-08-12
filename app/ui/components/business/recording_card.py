@@ -260,7 +260,7 @@ class RecordingCardManager:
                     "recording": False,
                     "monitor_status": not recording.monitor_status,
                     "status_info": RecordingStatus.STOPPED_MONITORING,
-                    "display_title": f"[{self._['monitor_stopped']}] {recording.title}",
+                    "display_title": recording.title,
                 }
             )
             self.app.record_manager.stop_recording(recording, manually_stopped=True)
@@ -303,7 +303,7 @@ class RecordingCardManager:
 
         await self.app.record_manager.update_recording_card(recording, updated_info=recording_dict)
         if not recording_dict["monitor_status"]:
-            recording.display_title = f"[{self._['monitor_stopped']}] " + recording.title
+            recording.display_title = recording.title
 
         recording.scheduled_time_range = await self.app.record_manager.get_scheduled_time_range(
             recording.scheduled_start_time, recording.monitor_hours

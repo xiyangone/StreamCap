@@ -206,6 +206,10 @@ def handle_page_resize(page: ft.Page, app: App) -> Callable:
 
 async def main(page: ft.Page) -> None:
     page.title = "StreamCap"
+    # 尽早隐藏窗口，避免 Flet 初始化阶段闪出默认的小窗口；
+    # setup_desktop_window 设好尺寸后会再设为可见
+    if not page.web:
+        page.window.visible = False
 
     _services = BackendServices.get()
     app = App(page, services=_services)
