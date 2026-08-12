@@ -1,5 +1,10 @@
 # Phase 1: Handlers 重构 + Node.js 依赖优化
 
+> **状态：✅ 阶段 A/B 已完成** (2026-08-13)
+>
+> 实际收益：handlers.py 1326 → 658 行（-50%）；打包 _internal 299M → 210M（-89M）
+> 与计划差异见文末「执行修正记录」
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 消除 handlers.py 的 85% 代码重复（52 个平台 Handler 类），并优化 Node.js 依赖（89MB）为按需下载。
@@ -1193,3 +1198,94 @@ cp .backup/handlers_before_refactor.py app/core/platforms/platform_handlers/hand
 
 1. **superpowers:subagent-driven-development** (推荐) - 每个 Task 独立 subagent，中间人工审查
 2. **superpowers:executing-plans** - 当前会话批量执行，关键点设置 checkpoint
+---
+
+## 执行修正记录（2026-08-13）
+
+计划撰写时对代码的若干推断与实际不符，执行时按实际情况调整。留档备查。
+
+### 1. 分发机制：URL 正则注册表，不是平台键工厂
+
+计划设想 `HANDLER_REGISTRY = {"huya": GenericHandler, ...}` + `get_handler(platform)`。
+
+实际是 `base.py` 的 `PlatformHandler.register(*patterns)` 把 **URL 正则**注册进
+`_registry`，`get_handler_instance(live_url)` 用 `re.search` 逐条匹配选类。
+`handlers.py` 底部有 57 行 `XxxHandler.register(r"...")` 调用。
+
+影响：`__init__.py` 完全不需要改；每个平台必须保留自己的类名（正则绑定在类上）。
+因此方案从「删类 + 建注册表」改为「让模板类继承共享基类」，类名与注册块一律不动。
+
+### 2. 平台数量：44 个可迁移，不是 49 个
+
+用 AST 逐类比对归一化源码后得出：52 个类中 **44 个**是逐字符一致的模板，
+**8 个**有独立逻辑需保留（计划只识别出 3 个）。
+
+计划漏掉的 5 个特殊类及其原因：
+
+| 类 | 特殊之处 |
+|---|---|
+| `SoopHandler` | 额外传 `username`/`password` |
+| `FlexTVHandler` | 额外传 `username`/`password` |
+| `PopkonTVHandler` | 额外传 `username`/`password`/`account_type` |
+| `TwitcastingHandler` | 额外传 `username`/`password` |
+| `PiaopiaoHandler` | `fetch_stream_url` 多传一个 `url` 参数 |
+
+### 3. 平台配置表：不需要
+
+计划的 `platform_config.py` 是手写的 52 项映射表，撰写时凭推测填写，
+经核对 `class_name` 多处有误（如 `PamdaTVHandler` 实际用 `PandaLiveStream`
+而非 `PandaTVLiveStream`，`MaoerFMHandler` 用 `MaoerLiveStream`）。
+
+改为让每个子类用两个类属性自述差异，映射关系直接从原代码机械提取，
+不存在抄错的可能，也不引入需要与代码同步维护的第二份真相。
+
+```python
+class HuyaHandler(_TemplateHandler):
+    platform = "huya"
+    stream_class_name = "HuyaLiveStream"
+    fetch_method = "fetch_app_stream_data"
+```
+
+### 4. @deprecated 装饰器：计划未提及
+
+6 个类带 `@deprecated(reason="Live platform has been shut down")`：
+Qiandurebo / WinkTV / Yinbo / VVXQ / Piaopiao / Migu。迁移时逐一保留。
+
+### 5. 测试：无 pytest 基础设施
+
+项目没有 `tests/` 目录，`pyproject.toml` 无 pytest 配置。计划中的
+`pytest tests/...` 命令无法执行。改用等价强度的验证：
+
+- **注册表快照 diff**：重构前后导出 57 个 URL pattern 到文件，`diff` 逐字节一致
+- **反射校验**：44 个子类的 `stream_class_name` 在 streamget 中存在、
+  `fetch_method` 与 `fetch_stream_url` 均可解析、实例化不报错
+- **分发抽查**：6 个代表性 URL 命中的 Handler 类名与重构前一致
+- **真实网络 e2e**：B站（模板类）与快手（特殊类）均正常返回主播名
+- **打包后 e2e**：部署版启动，7 个房间全部返回主播名
+
+### 6. Node.js：无需改代码，只改打包配置
+
+计划设想要改 `paths.py` 的 `get_node_path()`。实际按需下载链路早已完整：
+
+- `paths.prepare_bundled_node()`：源文件不存在时直接 return，天然降级
+- `paths.prepend_user_bin_dirs()`：把 `%APPDATA%/StreamCap/node` 前置到 PATH
+- `InstallationManager` 启动时 `check_nodejs_installed()`，缺失则弹窗
+  调 `install_nodejs()` 从 npmmirror 下载并解压，带进度条
+
+因此只删了 `StreamCap.spec` 的 `datas` 中那一项，Python 代码一行未动。
+
+注：`StreamCap.spec` 与 `vendor/` 均被 `.gitignore` 忽略（`*.spec`、`node/`），
+属本机构建配置，不进仓库。换机器重建时需同步删除该项。
+
+### 实际结果
+
+| 项 | 计划预期 | 实际 |
+|---|---|---|
+| handlers.py | 1326 → ~350 行 | 1326 → **658 行**（-50%） |
+| 保留的特殊类 | 3 个 | **8 个** |
+| 打包 `_internal` | -89MB | 299M → **210M**（-89M） |
+| 新增文件 | platform_config.py + 3 个测试文件 | **0 个** |
+| 改动文件 | 4 个 + spec | **1 个** + spec |
+
+行数少减的 308 行，是那 5 个计划未识别的特殊类（各 23 行）与
+`_TemplateHandler` 基类本身（约 30 行）占用的——属于必要保留，不是遗留冗余。
