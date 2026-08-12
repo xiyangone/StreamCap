@@ -1047,6 +1047,10 @@ class SettingsPage(PageBase):
                     ],
                     spacing=8,
                     vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    # 必须 expand：外层 create_setting_row 的 Row 不会给无 expand 的
+                    # 子控件有界宽度，内部 expand=True 的 TextField 会撑塌整行——
+                    # 表现为输入框失去边框、文本溢出，按钮被挤成一个小圆角块。
+                    expand=True,
                 )
             else:
                 control = cookie_field
@@ -1076,7 +1080,7 @@ class SettingsPage(PageBase):
                             self._["sooplive_username"],
                             ft.TextField(
                                 value=self.get_accounts_value("sooplive_username"),
-                                width=500,
+                                expand=True,
                                 data="sooplive_username",
                                 on_change=self.on_accounts_change,
                             ),
@@ -1085,7 +1089,7 @@ class SettingsPage(PageBase):
                             self._["sooplive_password"],
                             ft.TextField(
                                 value=self.get_accounts_value("sooplive_password"),
-                                width=500,
+                                expand=True,
                                 data="sooplive_password",
                                 on_change=self.on_accounts_change,
                             ),
@@ -1094,7 +1098,7 @@ class SettingsPage(PageBase):
                             self._["flextv_username"],
                             ft.TextField(
                                 value=self.get_accounts_value("flextv_username"),
-                                width=500,
+                                expand=True,
                                 data="flextv_username",
                                 on_change=self.on_accounts_change,
                             ),
@@ -1103,7 +1107,7 @@ class SettingsPage(PageBase):
                             self._["flextv_password"],
                             ft.TextField(
                                 value=self.get_accounts_value("flextv_password"),
-                                width=500,
+                                expand=True,
                                 data="flextv_password",
                                 on_change=self.on_accounts_change,
                             ),
@@ -1112,7 +1116,7 @@ class SettingsPage(PageBase):
                             self._["popkontv_username"],
                             ft.TextField(
                                 value=self.get_accounts_value("popkontv_username"),
-                                width=500,
+                                expand=True,
                                 data="popkontv_username",
                                 on_change=self.on_accounts_change,
                             ),
@@ -1121,7 +1125,7 @@ class SettingsPage(PageBase):
                             self._["popkontv_password"],
                             ft.TextField(
                                 value=self.get_accounts_value("popkontv_password"),
-                                width=500,
+                                expand=True,
                                 data="popkontv_password",
                                 on_change=self.on_accounts_change,
                             ),
@@ -1131,7 +1135,7 @@ class SettingsPage(PageBase):
                             ft.Dropdown(
                                 options=[ft.dropdown.DropdownOption("Default"), ft.dropdown.DropdownOption("Twitter")],
                                 value=self.get_accounts_value("twitcasting_account_type", "Default"),
-                                width=500,
+                                expand=True,
                                 data="twitcasting_account_type",
                                 on_select=self.on_accounts_change,
                                 tooltip=self._["switch_account_type"],
@@ -1141,7 +1145,7 @@ class SettingsPage(PageBase):
                             self._["twitcasting_username"],
                             ft.TextField(
                                 value=self.get_accounts_value("twitcasting_username"),
-                                width=500,
+                                expand=True,
                                 data="twitcasting_username",
                                 on_change=self.on_accounts_change,
                             ),
@@ -1150,7 +1154,7 @@ class SettingsPage(PageBase):
                             self._["twitcasting_password"],
                             ft.TextField(
                                 value=self.get_accounts_value("twitcasting_password"),
-                                width=500,
+                                expand=True,
                                 data="twitcasting_password",
                                 on_change=self.on_accounts_change,
                             ),
