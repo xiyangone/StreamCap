@@ -98,16 +98,11 @@ async def handle_app_close(page: ft.Page, app, save_progress_overlay) -> None:
 
     if page.platform.value != "macos":
         close_confirm_controls.append(
-            ft.Container(
-                content=ft.Text(
-                    _["minimize_to_tray_tip"],
-                    size=12,
-                    color=ft.Colors.GREY_500,
-                    text_align=ft.TextAlign.CENTER,
-                ),
-                padding=ft.Padding.all(8),
-                border_radius=5,
-                bgcolor=ft.Colors.with_opacity(0.1, ft.Colors.BLUE_GREY),
+            ft.Text(
+                _["minimize_to_tray_tip"],
+                size=12,
+                color=ft.Colors.GREY_500,
+                text_align=ft.TextAlign.CENTER,
             )
         )
 
@@ -119,11 +114,12 @@ async def handle_app_close(page: ft.Page, app, save_progress_overlay) -> None:
                 color=ft.Colors.PRIMARY,
             ),
         ),
-        ft.OutlinedButton(
+        ft.FilledButton(
             content=ft.Text(_["exit_program"], size=14),
             on_click=close_dialog_dismissed,
             style=ft.ButtonStyle(
-                color=ft.Colors.ERROR,
+                bgcolor=ft.Colors.ERROR,
+                color=ft.Colors.WHITE,
             ),
         ),
     ]
