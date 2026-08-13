@@ -294,6 +294,55 @@ class RecordingManager:
     async def get_selected_recordings(self):
         return [recording for recording in self.recordings if recording.selected]
 
+    async def get_batch_target_recordings(self) -> list[Recording]:
+        """批量操作的作用域：有选中就只作用于选中项，否则作用于当前筛选下可见的项。
+
+        与批量开始/停止/删除保持同一套语义。
+        """
+        selected = await self.get_selected_recordings()
+        candidates = selected or self.recordings
+        cards_obj = self._get_visible_cards_obj()
+        return [rec for rec in candidates if rec is not None and self._is_card_visible(cards_obj, rec)]
+
+    async def batch_edit_recordings(self, changes: dict, follow_global: set[str]) -> tuple[int, int]:
+        """批量修改录制项字段。
+
+        Args:
+            changes: 要固化的字段与值，如 {"quality": "HD"}
+            follow_global: 要改回「跟随全局」的字段名集合
+
+        Returns:
+            (成功数, 因正在录制/监控而跳过数)
+
+        录制中或监控中的项会被跳过——与单卡编辑的前置校验保持一致，
+        避免改动在录制过程中半途生效导致输出参数前后不一。
+        """
+        targets = await self.get_batch_target_recordings()
+        applied = skipped = 0
+
+        for recording in targets:
+            if recording.is_recording or recording.monitor_status:
+                skipped += 1
+                continue
+
+            for attr, value in changes.items():
+                setattr(recording, attr, value)
+                recording.inherited_fields.discard(attr)
+            for attr in follow_global:
+                recording.inherited_fields.add(attr)
+
+            # 重新投影：跟随项取全局值，固化项若恰好等于全局值也会被判为跟随
+            self.apply_global_defaults(recording)
+            recording.update_title(self._.get(recording.quality, recording.quality))
+            self.services.broadcast_card_update(recording)
+            self.services.broadcast_pubsub("update", recording)
+            applied += 1
+
+        if applied:
+            await self.persist_recordings()
+        logger.info(f"Batch Edit Recordings: applied={applied} skipped={skipped} changes={changes}")
+        return applied, skipped
+
     async def remove_recordings(self, recordings: list[Recording]):
         """Remove a recording from the list and update the JSON file."""
         for recording in recordings:
