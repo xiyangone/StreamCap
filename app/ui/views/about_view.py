@@ -132,46 +132,33 @@ class AboutPage(PageBase):
                 alignment=ft.MainAxisAlignment.CENTER,
             )
         else:
+            # 固定 spacing=100 会让 5 项总宽超出内容区（950 窗口下可用约 634px），
+            # 表现为末尾两项被右侧截断。改为定宽 + wrap：放得下就一行，
+            # 窗口再窄自动折行，英文标签过长时在项内换行而不撑破布局。
+            def feature_item(icon: ft.IconData, color: ft.ColorValue, label: str) -> ft.Control:
+                controls: list[ft.Control] = [
+                    ft.Icon(icon, color=color),
+                    ft.Text(label, size=14, color=text_color_700, text_align=ft.TextAlign.CENTER),
+                ]
+                return ft.Column(
+                    controls=controls,
+                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                    spacing=5,
+                    width=110,
+                )
+
             feature_highlights = ft.Row(
                 controls=[
-                    ft.Column(
-                        controls=[
-                            ft.Icon(ft.Icons.VIDEO_LIBRARY, color=ft.Colors.BLUE),
-                            ft.Text(self._["support_platforms"], size=14, color=text_color_700),
-                        ],
-                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                    ),
-                    ft.Column(
-                        controls=[
-                            ft.Icon(ft.Icons.SETTINGS, color=ft.Colors.GREEN),
-                            ft.Text(self._["customize_recording"], size=14, color=text_color_700),
-                        ],
-                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                    ),
-                    ft.Column(
-                        controls=[
-                            ft.Icon(ft.Icons.LIGHTBULB, color=ft.Colors.ORANGE),
-                            ft.Text(self._["open_source"], size=14, color=text_color_700),
-                        ],
-                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                    ),
-                    ft.Column(
-                        controls=[
-                            ft.Icon(ft.Icons.AUTORENEW, color=ft.Colors.PURPLE),
-                            ft.Text(self._["automatic_transcoding"], size=14, color=text_color_700),
-                        ],
-                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                    ),
-                    ft.Column(
-                        controls=[
-                            ft.Icon(ft.Icons.NOTIFICATIONS_ACTIVE, color=ft.Colors.RED),
-                            ft.Text(self._["status_push"], size=14, color=text_color_700),
-                        ],
-                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                    ),
+                    feature_item(ft.Icons.VIDEO_LIBRARY, ft.Colors.BLUE, self._["support_platforms"]),
+                    feature_item(ft.Icons.SETTINGS, ft.Colors.GREEN, self._["customize_recording"]),
+                    feature_item(ft.Icons.LIGHTBULB, ft.Colors.ORANGE, self._["open_source"]),
+                    feature_item(ft.Icons.AUTORENEW, ft.Colors.PURPLE, self._["automatic_transcoding"]),
+                    feature_item(ft.Icons.NOTIFICATIONS_ACTIVE, ft.Colors.RED, self._["status_push"]),
                 ],
                 alignment=ft.MainAxisAlignment.CENTER,
-                spacing=100,
+                spacing=10,
+                run_spacing=16,
+                wrap=True,
             )
 
         if is_mobile:
@@ -262,7 +249,9 @@ class AboutPage(PageBase):
                                 ft.Text(
                                     self.about_config["introduction"].get(language_code),
                                     size=16,
-                                    text_align=ft.TextAlign.JUSTIFY,
+                                    # 中文没有词间空格，JUSTIFY 只能在标点处拉伸，
+                                    # 会在行内撑出突兀的空洞（如「咪咕」与「、Twitch」之间）
+                                    text_align=ft.TextAlign.START,
                                     color=text_color_600,
                                 ),
                             ],
@@ -334,7 +323,7 @@ class AboutPage(PageBase):
                                 ft.Text(self._["update"], size=20, weight=ft.FontWeight.W_600, color=text_color),
                                 ft.ListView(
                                     controls=[
-                                        ft.Text(update, size=16, text_align=ft.TextAlign.JUSTIFY, color=text_color_600)
+                                        ft.Text(update, size=16, text_align=ft.TextAlign.START, color=text_color_600)
                                         for update in version_updates["updates"][language_code]
                                     ],
                                     spacing=10,
