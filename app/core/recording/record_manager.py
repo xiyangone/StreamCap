@@ -30,7 +30,7 @@ class RecordingManager:
         self.load_recordings()
         self._ = {}
         self.load()
-        self.initialize_dynamic_state()
+        self.initialize_dynamic_state(persist_migration=False)
         max_concurrent = int(self.settings.user_config.get("platform_max_concurrent_requests", 3))
         self.platform_semaphores = defaultdict(lambda: asyncio.Semaphore(max_concurrent))
         self.active_recorders = {}
@@ -109,15 +109,25 @@ class RecordingManager:
             GlobalRecordingState.recordings = [Recording.from_dict(rec) for rec in recordings_data]
         logger.info(f"Live Recordings: Loaded {len(self.recordings)} items")
 
-    def initialize_dynamic_state(self):
-        """Initialize dynamic state for all recordings."""
+    def initialize_dynamic_state(self, persist_migration: bool = True):
+        """Initialize dynamic state for all recordings.
+
+        Args:
+            persist_migration: 迁移出新的跟随字段时是否落盘。构造期事件循环
+                还没起来，run_coro 会丢弃协程，故 __init__ 调用时传 False；
+                判定本身幂等，跟随状态会在此后任意一次持久化时自然写入。
+        """
         loop_time_seconds = self.settings.user_config.get("loop_time_seconds")
         self.loop_time_seconds = int(loop_time_seconds or 300)
+        migrated = False
         for recording in self.recordings:
             recording.loop_time_seconds = self.loop_time_seconds
-            self.apply_global_defaults(recording)
+            migrated |= self.apply_global_defaults(recording)
             recording.update_title(self._.get(recording.quality, recording.quality))
             recording.showed_checking_status = True
+        if migrated and persist_migration:
+            # 让文件形态与语义一致：跟随字段写成 null
+            self.services.run_coro(self.persist_recordings())
 
     @staticmethod
     def _same_setting_value(left, right) -> bool:
@@ -130,7 +140,7 @@ class RecordingManager:
             return bool(left) == bool(right)
         return str(left).strip().upper() == str(right).strip().upper()
 
-    def apply_global_defaults(self, recording) -> None:
+    def apply_global_defaults(self, recording) -> bool:
         """把全局设置投影到「跟随全局」的字段上，并完成一次性迁移判定。
 
         三种情形：
@@ -138,8 +148,12 @@ class RecordingManager:
         2. 未标记但值恰好等于当前全局值 -> 判为跟随（老数据迁移，
            下次持久化就会写成 null）
         3. 值与全局不同 -> 保持固化，不受全局变动影响
+
+        Returns:
+            跟随标记集合是否发生变化（用于决定要不要落盘）
         """
         user_config = self.settings.user_config
+        before = set(recording.inherited_fields)
         for attr, config_key in Recording.INHERITABLE_FIELDS.items():
             global_value = user_config.get(config_key)
             current = getattr(recording, attr, None)
@@ -150,6 +164,7 @@ class RecordingManager:
                     setattr(recording, attr, global_value)
             elif self._same_setting_value(current, global_value):
                 recording.inherited_fields.add(attr)
+        return recording.inherited_fields != before
 
     def apply_global_defaults_to_all(self) -> None:
         """全局设置变更后重新投影，让跟随中的录制项立即生效。"""
