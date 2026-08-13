@@ -177,3 +177,6 @@ backup_config/
 ffmpeg.exe
 ffplay.exe
 ffprobe.exe
+
+# 本地备份与配置恢复件（含敏感登录态，不得进仓库）
+/.backup/
