@@ -9,6 +9,7 @@ from ...core.runtime.scheduled_shutdown import MAX_QUICK_SHUTDOWN_HOURS
 from ...models.media.audio_format_model import AudioFormat
 from ...models.media.video_format_model import VideoFormat
 from ...models.media.video_quality_model import VideoQuality
+from ...models.recording.recording_model import Recording
 from ...utils.delay import DelayedTaskExecutor
 from ...utils.logger import logger
 from ..base_page import PageBase
@@ -190,6 +191,10 @@ class SettingsPage(PageBase):
 
         if key == "loop_time_seconds":
             self.app.record_manager.initialize_dynamic_state()
+        if key in Recording.INHERITABLE_FIELDS.values():
+            # 跟随全局的录制项立即生效，无需重启或逐个编辑
+            self.app.record_manager.apply_global_defaults_to_all()
+            self.app.services.run_coro(self.app.record_manager.persist_recordings())
         if key in {"scheduled_shutdown_enabled", "scheduled_shutdown_time"}:
             await self.app.shutdown_manager.reschedule()
         self.page.run_task(self.delay_handler.start_task_timer, self.save_user_config_after_delay, None)
