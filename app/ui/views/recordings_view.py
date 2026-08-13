@@ -160,6 +160,12 @@ class RecordingsPage(PageBase):
                 on_click=self.stop_monitor_recordings_on_click,
             ),
             ft.IconButton(
+                icon=ft.Icons.EDIT_NOTE,
+                icon_color=ft.Colors.PRIMARY,
+                tooltip=self._["batch_edit"],
+                on_click=self.batch_edit_on_click,
+            ),
+            ft.IconButton(
                 icon=ft.Icons.DELETE_SWEEP,
                 icon_color=ft.Colors.PRIMARY,
                 tooltip=self._["batch_delete"],
@@ -563,6 +569,22 @@ class RecordingsPage(PageBase):
 
     async def add_recording_on_click(self, _e):
         await self.add_recording_dialog.show_dialog()
+
+    async def batch_edit_on_click(self, _e):
+        from ..components.dialogs.batch_edit_dialog import BatchEditDialog
+
+        targets = await self.app.record_manager.get_batch_target_recordings()
+        if not targets:
+            await self.app.snack_bar.show_snack_bar(self._["batch_edit_no_target"])
+            return
+
+        async def on_done():
+            await self.refresh_cards_on_click(None)
+
+        dialog = BatchEditDialog(self.app, on_done=on_done)
+        self.app.dialog_area.content = dialog
+        dialog.open = True
+        self.app.dialog_area.update()
 
     async def refresh_cards_on_click(self, _e):
 
