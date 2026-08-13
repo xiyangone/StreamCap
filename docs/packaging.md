@@ -21,10 +21,17 @@ python scripts/build.py
 脚本会自动：
 
 - 准备 Flet desktop 运行资源。
-- 打包 `config`、`locales`、`assets`。
+- 打包 `config` 下的 `default_settings.json`、`language.json`、`version.json`，以及 `locales`、`assets`。
 - 打包 `streamget` 的数据文件。
 - 如果存在内置 FFmpeg / Node.js，则一起打包。
 - macOS 下隐藏外层 PyInstaller Dock 图标，只显示一个 StreamCap 熊猫图标。
+
+> `config` 只打包上述三个随版本分发的默认配置，不能整目录打包。
+> 从源码运行时用户数据目录就是仓库根目录，程序会在 `config/` 下生成
+> `recordings.json`、`cookies.json`、`accounts.json`、`user_settings.json`、
+> `web_auth.json` 等用户数据。这些文件都已 gitignore，`git status` 看不出来，
+> 但整目录打包会把它们带进安装包，安装后覆盖使用者的真实配置。
+> `app/core/runtime/paths.py` 另有一层防御：这几个文件只要目标已存在就不覆盖。
 
 macOS 打包完成后产物为：
 
@@ -146,6 +153,8 @@ python scripts/build.py --no-bundle-node
 
 - 如果系统 `PATH` 中已经有 `node`，不会复制内置版本。
 - 如果系统没有 `node`，且包内带了 Node.js，则复制到用户数据目录。
+- 如果包内也没有 Node.js，首次启动时 `InstallationManager` 会弹窗，
+  由 `app/scripts/node_install.py` 从 npmmirror 下载并解压，带进度提示。
 
 目标位置：
 
@@ -153,6 +162,10 @@ python scripts/build.py --no-bundle-node
 macOS:   ~/Library/Application Support/StreamCap/node/node
 Windows: %APPDATA%\StreamCap\node\node.exe
 ```
+
+> Node.js 只有 streamget 的 douyin / haixiu / liveme / migu 四个平台需要
+> （用 execjs 执行 JS 签名）。Windows 下 `node.exe` 约 89MB，占包体近三成，
+> 因此可按需用 `--no-bundle-node` 排除，交给运行时下载。
 
 ## macOS Flet 说明
 

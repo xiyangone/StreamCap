@@ -14,6 +14,12 @@ APP_NAME = "StreamCap"
 ROOT = Path(__file__).resolve().parents[1]
 FLET_ARCHIVE_DIR = ROOT / "build" / "flet_desktop_app"
 VENDOR_DIR = ROOT / "vendor"
+# config/ 下只有这三个是随版本分发的默认配置，必须逐个指定而不能整目录打包：
+# 从源码运行时 user_data_dir 就是仓库根目录，程序会在 config/ 生成
+# recordings.json / cookies.json / accounts.json / user_settings.json /
+# web_auth.json 等用户数据（均已 gitignore，git status 看不出来）。
+# 整目录打包会把它们带进安装包，覆盖使用者的真实配置。
+BUNDLED_CONFIG_FILES = ("default_settings.json", "language.json", "version.json")
 
 
 def detect_target_platform() -> str:
@@ -88,6 +94,9 @@ def bundled_node_source(target_platform: str) -> Path:
 
 def pyinstaller_command(args: argparse.Namespace, target_platform: str) -> list[str]:
     contents_directory = "_internal" if target_platform == "windows" else "."
+    config_data_args: list[str] = []
+    for filename in BUNDLED_CONFIG_FILES:
+        config_data_args += ["--add-data", add_data_arg(str(ROOT / "config" / filename), "config", target_platform)]
     command = [
         sys.executable,
         "-m",
@@ -96,8 +105,7 @@ def pyinstaller_command(args: argparse.Namespace, target_platform: str) -> list[
         "-w",
         "--contents-directory",
         contents_directory,
-        "--add-data",
-        add_data_arg(str(ROOT / "config"), "config", target_platform),
+        *config_data_args,
         "--add-data",
         add_data_arg(str(ROOT / "locales"), "locales", target_platform),
         "--add-data",
