@@ -107,10 +107,17 @@ class _KwaiLiveStreamHardened(streamget.KwaiLiveStream):
        占位响应且不抛异常，导致网页通道被完全短路（详见 get_user_info）；
     3. 只有网页抓取一条通道，而网页端按 IP 做严格突发限流。
 
-    手机分享接口（与 DouyinLiveRecorder v4.0.7 主通道一致）限流宽松，
-    因此优先走它，网页抓取兜底；该接口被限流时进入冷却，避免每次检测
-    都白打一次请求反而加重限流。冷却原因会通过 last_fetch_error 上报，
-    供上层区分"平台限流"与"普通检测失败"。
+    手机分享接口（与 DouyinLiveRecorder v4.0.7 主通道一致）优先，网页抓取兜底；
+    该接口被限流时进入冷却，避免每次检测都白打一次请求反而加重限流。
+    冷却原因会通过 last_fetch_error 上报，供上层区分"平台限流"与"普通检测失败"。
+
+    实测记录（2026-08-13，同一 IP、同一房间）：
+    - 手机接口的限流维度既不是 User-Agent（换 5 个 iOS/Android/浏览器 UA
+      全部返回「操作太快了」），也不是账号（匿名请求同样被限流）；
+      社区 DouyinLiveRecorder #1058 的「换 UA 可绕过」在此接口上不成立。
+    - 网页通道另有独立且宽松的配额（1.5 秒间隔连打 12 次未触发限流），
+      与 #862「6000 秒轮询间隔也照样被封」互为印证：触发条件不是请求频率。
+    因此该接口一旦配额耗尽可能长时间不可用，冷却采用指数退避而非固定值。
     """
 
     APP_API = "https://livev.m.chenzhongtech.com/rest/k/live/byUser?kpn=GAME_ZONE&captchaToken="
@@ -121,11 +128,15 @@ class _KwaiLiveStreamHardened(streamget.KwaiLiveStream):
         "content-type": "application/json",
     }
     APP_API_COOLDOWN = 600.0
+    # 连续失败时冷却翻倍的上限。配额耗尽后该接口可能整天不可用，
+    # 固定 10 分钟重试等于每天白打上百次请求
+    APP_API_COOLDOWN_MAX = 14400.0
 
     def __init__(self, proxy_addr: str | None = None, cookies: str | None = None) -> None:
         super().__init__(proxy_addr=proxy_addr, cookies=cookies)
         self._app_api_ready_at = 0.0
         self._block_reason: str | None = None
+        self._app_api_failures = 0
 
     @property
     def pending_block_reason(self) -> str | None:
@@ -194,6 +205,8 @@ class _KwaiLiveStreamHardened(streamget.KwaiLiveStream):
         if not anchor_name:
             return None
 
+        # 取到真实数据说明配额已恢复，退避重新从最短冷却起算
+        self._app_api_failures = 0
         result = {"type": 2, "anchor_name": anchor_name, "is_live": False, "live_url": url}
         if live_stream.get("living"):
             if "multiResolutionHlsPlayUrls" in live_stream:
@@ -209,11 +222,14 @@ class _KwaiLiveStreamHardened(streamget.KwaiLiveStream):
         return result
 
     def _cool_down_app_api(self, reason: str) -> None:
-        self._app_api_ready_at = time.monotonic() + self.APP_API_COOLDOWN
+        self._app_api_failures += 1
+        # 指数退避：10 分钟起，每次连续失败翻倍，封顶 4 小时
+        cooldown = min(self.APP_API_COOLDOWN * 2 ** (self._app_api_failures - 1), self.APP_API_COOLDOWN_MAX)
+        self._app_api_ready_at = time.monotonic() + cooldown
         self._block_reason = reason
         logger.info(
-            f"Kuaishou app API unavailable ({reason}), use page parsing for the next "
-            f"{int(self.APP_API_COOLDOWN // 60)} minutes"
+            f"Kuaishou app API unavailable ({reason}), consecutive failures="
+            f"{self._app_api_failures}, use page parsing for the next {int(cooldown // 60)} minutes"
         )
 
 
