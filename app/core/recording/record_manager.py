@@ -115,10 +115,51 @@ class RecordingManager:
         self.loop_time_seconds = int(loop_time_seconds or 300)
         for recording in self.recordings:
             recording.loop_time_seconds = self.loop_time_seconds
+            self.apply_global_defaults(recording)
             recording.update_title(self._.get(recording.quality, recording.quality))
             recording.showed_checking_status = True
 
+    @staticmethod
+    def _same_setting_value(left, right) -> bool:
+        """判断录制项字段值与全局设置值是否等价。
+
+        两边类型并不统一：分段时长在配置里是字符串 "1800"、在对话框里可能是
+        整数；录制格式存在 "ts"/"TS" 大小写差异。统一成规范化字符串再比。
+        """
+        if isinstance(left, bool) or isinstance(right, bool):
+            return bool(left) == bool(right)
+        return str(left).strip().upper() == str(right).strip().upper()
+
+    def apply_global_defaults(self, recording) -> None:
+        """把全局设置投影到「跟随全局」的字段上，并完成一次性迁移判定。
+
+        三种情形：
+        1. 已标记跟随，或持久化值为 null -> 用全局值填充运行时属性
+        2. 未标记但值恰好等于当前全局值 -> 判为跟随（老数据迁移，
+           下次持久化就会写成 null）
+        3. 值与全局不同 -> 保持固化，不受全局变动影响
+        """
+        user_config = self.settings.user_config
+        for attr, config_key in Recording.INHERITABLE_FIELDS.items():
+            global_value = user_config.get(config_key)
+            current = getattr(recording, attr, None)
+
+            if attr in recording.inherited_fields or current is None:
+                recording.inherited_fields.add(attr)
+                if global_value is not None:
+                    setattr(recording, attr, global_value)
+            elif self._same_setting_value(current, global_value):
+                recording.inherited_fields.add(attr)
+
+    def apply_global_defaults_to_all(self) -> None:
+        """全局设置变更后重新投影，让跟随中的录制项立即生效。"""
+        for recording in self.recordings:
+            self.apply_global_defaults(recording)
+            recording.update_title(self._.get(recording.quality, recording.quality))
+
     async def add_recording(self, recording):
+        # 新建项带的是对话框里的显式值，先判定哪些实际等同于全局设置
+        self.apply_global_defaults(recording)
         with GlobalRecordingState.lock:
             GlobalRecordingState.recordings.append(recording)
             await self.persist_recordings()
@@ -142,6 +183,10 @@ class RecordingManager:
         """Update an existing recording object and persist changes to a JSON file."""
         if recording:
             recording.update(updated_info)
+            # 对话框传回的是全部字段的显式值：先清空跟随标记再重判，
+            # 否则用户把某个原本跟随的字段改成别的值时会被全局值覆盖回去
+            recording.inherited_fields.clear()
+            self.apply_global_defaults(recording)
             self.services.run_coro(self.persist_recordings())
 
     @staticmethod

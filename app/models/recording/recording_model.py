@@ -1,7 +1,22 @@
 from datetime import timedelta
+from typing import ClassVar
 
 
 class Recording:
+    # 可继承字段 -> 对应的全局设置键。
+    # 语义：值等于当前全局值即视为「跟随全局」，持久化时写 null，
+    # 之后改设置页会自动生效；手动改成别的值才固化为该录制项专属。
+    # 不含 recording_dir —— 它是 stream_manager 写回的运行时输出目录缓存，
+    # 不是用户设置。
+    INHERITABLE_FIELDS: ClassVar[dict[str, str]] = {
+        "record_format": "video_format",
+        "quality": "record_quality",
+        "segment_record": "segmented_recording_enabled",
+        "segment_time": "video_segment_time",
+        "flv_use_direct_download": "flv_use_direct_download",
+        "only_notify_no_record": "only_notify_no_record",
+    }
+
     def __init__(
         self,
         rec_id,
@@ -89,6 +104,12 @@ class Recording:
         self.use_proxy = None
         self.record_url = None
         self.preview_url = None
+        # 当前跟随全局设置的字段名集合，由 RecordingManager.apply_global_defaults 维护
+        self.inherited_fields: set[str] = set()
+
+    def _stored_value(self, attr: str):
+        """跟随全局的字段持久化为 null，避免把当时的全局值固化成专属值。"""
+        return None if attr in self.inherited_fields else getattr(self, attr)
 
     def to_dict(self):
         """Convert the Recording instance to a dictionary for saving."""
@@ -96,10 +117,10 @@ class Recording:
             "rec_id": self.rec_id,
             "url": self.url,
             "streamer_name": self.streamer_name,
-            "record_format": self.record_format,
-            "quality": self.quality,
-            "segment_record": self.segment_record,
-            "segment_time": self.segment_time,
+            "record_format": self._stored_value("record_format"),
+            "quality": self._stored_value("quality"),
+            "segment_record": self._stored_value("segment_record"),
+            "segment_time": self._stored_value("segment_time"),
             "monitor_status": self.monitor_status,
             "scheduled_recording": self.scheduled_recording,
             "scheduled_start_time": self.scheduled_start_time,
@@ -108,8 +129,8 @@ class Recording:
             "enabled_message_push": self.enabled_message_push,
             "platform": self.platform,
             "platform_key": self.platform_key,
-            "only_notify_no_record": self.only_notify_no_record,
-            "flv_use_direct_download": self.flv_use_direct_download,
+            "only_notify_no_record": self._stored_value("only_notify_no_record"),
+            "flv_use_direct_download": self._stored_value("flv_use_direct_download"),
             "video_bitrate": self.video_bitrate,
         }
 
