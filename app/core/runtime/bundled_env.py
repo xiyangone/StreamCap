@@ -159,7 +159,7 @@ def setup_bundled_flet_view() -> None:
 
     if hasattr(sys, "_MEIPASS"):
         # noinspection PyProtectedMember
-        base = Path(sys._MEIPASS)
+        base = Path(vars(sys)["_MEIPASS"])
     else:
         base = Path(sys.executable).parent / "_internal"
 

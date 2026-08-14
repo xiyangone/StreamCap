@@ -1,3 +1,5 @@
+import json
+
 from ....utils.logger import logger
 from .base import PlatformHandler, StreamData
 from .handlers import (
@@ -66,8 +68,11 @@ def get_platform_handler(
     password: str | None = None,
     account_type: str | None = None,
 ) -> PlatformHandler | None:
+    normalized_cookies = (
+        json.dumps(cookies, ensure_ascii=False, sort_keys=True) if isinstance(cookies, dict) else cookies
+    )
     handler_instance = PlatformHandler.get_handler_instance(
-        live_url, proxy, cookies, record_quality, platform, username, password, account_type
+        live_url, proxy, normalized_cookies, record_quality, platform, username, password, account_type
     )
     if handler_instance:
         return handler_instance
@@ -75,7 +80,7 @@ def get_platform_handler(
     return None
 
 
-def get_platform_info(record_url: str) -> tuple:
+def get_platform_info(record_url: str) -> tuple[str | None, str | None]:
     platform_map = {
         "douyin.com/": ("抖音直播", "douyin"),
         "https://www.tiktok.com/": ("TikTok直播", "tiktok"),

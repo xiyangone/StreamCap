@@ -159,7 +159,7 @@ class LoginPage:
         self.login_button.disabled = False
         self.page.update()
 
-        if success:
+        if success and token is not None:
             logger.info(f"Login successful: {username}")
             await self.page.shared_preferences.set("session_token", token)
             await self.on_login_success(token)

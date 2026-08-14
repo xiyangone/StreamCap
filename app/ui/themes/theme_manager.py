@@ -9,8 +9,8 @@ class ThemeManager:
     def __init__(self, app):
         self.page = app.page
         self.app = app
-        self.custom_font = None
-        self.theme_color = None
+        self.custom_font = "AlibabaPuHuiTi Light"
+        self.theme_color = "blue"
         self.assets_dir = app.assets_dir
         self.init_fonts()
         self.page.run_task(self.apply_initial_theme)

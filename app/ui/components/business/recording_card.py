@@ -296,12 +296,23 @@ class RecordingCardManager:
         except Exception as e:
             logger.debug(f"Show recording info dialog failed: {e}")
 
-    async def edit_recording_callback(self, recording_list: list[dict]):
+    async def edit_recording_callback(self, recording_list: list[dict]) -> bool:
         recording_dict = recording_list[0]
         rec_id = recording_dict["rec_id"]
         recording = self.app.record_manager.find_recording_by_id(rec_id)
 
-        await self.app.record_manager.update_recording_card(recording, updated_info=recording_dict)
+        # The room may have gone live while the dialog was open. Recheck at
+        # commit time so active recording parameters are never changed midway.
+        if not self.app.record_manager.can_edit_recording(recording):
+            await self.app.snack_bar.show_snack_bar(self._["please_stop_monitor_tip"])
+            return False
+
+        try:
+            await self.app.record_manager.update_recording_card(recording, updated_info=recording_dict)
+        except Exception as exc:
+            logger.error(f"Failed to save recording configuration: {exc}")
+            await self.app.snack_bar.show_snack_bar(self._["save_recording_failed_tip"], bgcolor=ft.Colors.RED)
+            return False
         if not recording_dict["monitor_status"]:
             recording.display_title = recording.title
 
@@ -310,7 +321,8 @@ class RecordingCardManager:
         )
 
         await self.update_card(recording)
-        self.app.page.pubsub.send_others_on_topic("update", recording_dict)
+        self.app.page.pubsub.send_others_on_topic("update", recording)
+        return True
 
     async def on_toggle_recording(self, recording: Recording):
         """Toggle the recording state for a specific recording."""
@@ -451,7 +463,7 @@ class RecordingCardManager:
     async def edit_recording_button_click(self, _, recording: Recording):
         """Handle edit button click by showing the edit dialog with existing recording info."""
 
-        if recording.is_recording or recording.monitor_status:
+        if not self.app.record_manager.can_edit_recording(recording):
             await self.app.snack_bar.show_snack_bar(self._["please_stop_monitor_tip"])
             return
 
@@ -499,7 +511,11 @@ class RecordingCardManager:
     async def preview_video_button_on_click(self, _, recording: Recording):
         if self.app.page.web and recording.record_url:
             video_player = VideoPlayer(self.app)
-            await video_player.preview_video(recording.preview_url, is_file_path=False, room_url=recording.url)
+            await video_player.preview_video(
+                recording.preview_url or recording.record_url,
+                is_file_path=False,
+                room_url=recording.url,
+            )
         elif recording.recording_dir and os.path.exists(recording.recording_dir):
             video_files = []
             for root, _, files in os.walk(recording.recording_dir):

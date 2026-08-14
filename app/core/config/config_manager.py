@@ -144,6 +144,7 @@ class ConfigManager:
             logger.info(success_message)
         except Exception as e:
             logger.error(f"{error_message}: {e}")
+            raise
 
     async def save_recordings_config(self, config):
         await self._save_config(

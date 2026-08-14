@@ -79,7 +79,7 @@ class NotificationService:
         send_name = base64.b64encode((sender_name or "").encode("utf-8")).decode()
         message["From"] = f"=?UTF-8?B?{send_name}?= <{sender_email}>"
         message["To"] = ", ".join(receivers)
-        message["Subject"] = Header(title, "utf-8")
+        message["Subject"] = str(Header(title, "utf-8"))
         message.attach(MIMEText(content, "plain", "utf-8"))
 
         def send_sync() -> dict[str, list[str]]:
@@ -172,7 +172,7 @@ class NotificationService:
     ) -> dict[str, Any]:
         results = {"success": [], "error": []}
         api_list = api.replace("，", ",").split(",") if api.strip() else []
-        tags = tags.replace("，", ",").split(",") if tags else ["partying_face"]
+        tag_list = tags.replace("，", ",").split(",") if tags else ["partying_face"]
         actions = [{"action": "view", "label": "view live", "url": action_url}] if action_url else []
         for _api in api_list:
             server, topic = _api.rsplit("/", maxsplit=1)
@@ -180,7 +180,7 @@ class NotificationService:
                 "topic": topic,
                 "title": title,
                 "message": content,
-                "tags": tags,
+                "tags": tag_list,
                 "priority": priority,
                 "attach": attach,
                 "filename": filename,

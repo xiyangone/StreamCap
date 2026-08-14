@@ -89,10 +89,10 @@ class LeftNavigationMenu(ft.Column):
         self.app = app
         self.sidebar = app.sidebar
         self.flet_page = app.page
-        self.rail = None
-        self.dark_light_text = None
-        self.dark_light_icon = None
-        self.bottom_controls = None
+        self.rail: NavigationColumn
+        self.dark_light_text: ft.Text
+        self.dark_light_icon: ft.IconButton
+        self.bottom_controls: ft.Column
         self.first_run = True
         self.theme_manager = ThemeManager(self.app)
         self.app.language_manager.add_observer(self)
@@ -178,8 +178,9 @@ class LeftNavigationMenu(ft.Column):
     async def on_theme_change(self):
         """When the theme changes, recreate the content and update the page"""
         page_list = ["home", "about"]
-        if self.app.current_page.page_name in page_list:
-            await self.app.current_page.load()
+        current_page = self.app.current_page
+        if current_page is not None and current_page.page_name in page_list:
+            await current_page.load()
 
 
 class NavigationSidebar:

@@ -96,12 +96,13 @@ async def install_nodejs_windows(update_progress):
                     if Path(new_extract_dir_path).exists():
                         shutil.rmtree(new_extract_dir_path)
                     os.rename(extract_dir_path, new_extract_dir_path)
-                    os.environ["PATH"] = execute_dir + "/node" + os.pathsep + os.environ.get("PATH")
+                    os.environ["PATH"] = execute_dir + "/node" + os.pathsep + os.environ.get("PATH", "")
                     result = subprocess.run(["node", "-v"], capture_output=True, startupinfo=startupinfo)
                     if result.returncode == 0:
                         return True
                     else:
                         raise Exception("Please restart the program")
+                raise RuntimeError("Extracted Node.js directory was not found")
             else:
                 logger.error("Failed to retrieve the Node.js version page")
                 raise Exception("Failed to obtain the Node.js download address")
@@ -215,7 +216,7 @@ async def install_nodejs(update_progress) -> bool:
 
 
 def update_env_path():
-    current_env_path = os.environ.get("PATH")
+    current_env_path = os.environ.get("PATH", "")
     if current_platform != "Windows":
         path_list = ["/usr/bin/", "/usr/local/bin", "/opt/homebrew/bin"]
         current_env_path_list = current_env_path.split(os.pathsep)

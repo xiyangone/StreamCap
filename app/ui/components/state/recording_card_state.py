@@ -100,7 +100,7 @@ class RecordingCardState:
         return recording.title
 
     @staticmethod
-    def get_title_weight(recording: Recording) -> ft.FontWeight:
+    def get_title_weight(recording: Recording) -> ft.FontWeight | None:
         return ft.FontWeight.BOLD if recording.is_recording or recording.is_live or recording.is_checking else None
 
     @staticmethod

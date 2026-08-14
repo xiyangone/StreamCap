@@ -1,6 +1,4 @@
-import os
-import threading
-import time
+import asyncio
 
 import flet as ft
 
@@ -13,8 +11,35 @@ async def _safe_destroy_window(page):
         await page.window.destroy()
     except Exception as ex:
         logger.error(f"close window error: {ex}")
-    finally:
-        os._exit(0)
+
+
+async def _stop_active_recordings(app, timeout_seconds: float = 25.0) -> None:
+    record_manager = getattr(app, "record_manager", None)
+    if record_manager is None:
+        return
+
+    for recording in list(record_manager.recordings):
+        if recording.is_recording:
+            try:
+                record_manager.stop_recording(recording, manually_stopped=True)
+            except Exception as exc:
+                logger.error(f"Failed to request recording stop for {recording.rec_id}: {exc}")
+
+    for recorder in list(record_manager.active_recorders.values()):
+        try:
+            recorder.request_stop()
+        except Exception as exc:
+            logger.error(f"Failed to request recorder shutdown: {exc}")
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    while record_manager.active_recorders and loop.time() < deadline:
+        await asyncio.sleep(0.2)
+
+    if record_manager.active_recorders:
+        logger.warning(
+            f"Timed out waiting for active recorders to stop: {list(record_manager.active_recorders.keys())}"
+        )
 
 
 async def handle_app_close(page: ft.Page, app, save_progress_overlay) -> None:
@@ -35,53 +60,32 @@ async def handle_app_close(page: ft.Page, app, save_progress_overlay) -> None:
         app.recording_enabled = False
 
         app.settings.user_config["last_route"] = page.route
-        await app.config_manager.save_user_config(app.settings.user_config)
-        logger.info(f"Saved last route: {page.route}")
+        try:
+            await app.config_manager.save_user_config(app.settings.user_config)
+            logger.info(f"Saved last route: {page.route}")
+        except Exception as exc:
+            logger.error(f"Failed to save last route during shutdown: {exc}")
 
-        # check if there are active recordings
-        active_recordings = [p for p in app.process_manager.ffmpeg_processes if p.returncode is None]
-        active_recordings_count = len(active_recordings)
+        active_recorder_count = len(getattr(app.record_manager, "active_recorders", {}))
+        active_process_count = len([p for p in app.process_manager.ffmpeg_processes if p.returncode is None])
+        active_recordings_count = max(active_recorder_count, active_process_count)
 
-        if active_recordings_count > 0:
+        await close_dialog(e)
+        if active_recordings_count:
             save_progress_overlay.show(
                 _["saving_recordings"].format(active_recordings_count=active_recordings_count), cancellable=True
             )
             page.update()
 
-            def close_app():
-                try:
-                    # adjust wait time based on the number of recordings, at least 2 seconds
-                    base_wait_time = max(2, min(active_recordings_count, 10))
-                    logger.info(
-                        f"waiting for {active_recordings_count} recordings to finish, waiting {base_wait_time} seconds"
-                    )
-
-                    time.sleep(base_wait_time)
-
-                    # check again if there are active processes
-                    remaining = len([p for p in app.process_manager.ffmpeg_processes if p.returncode is None])
-                    if remaining > 0:
-                        logger.info(f"still {remaining} recordings are not finished, waiting for extra time")
-                        time.sleep(min(remaining, 5))
-
-                    time.sleep(0.5)
-
-                except Exception as ex:
-                    logger.error(f"close window error: {ex}")
-                finally:
-                    if not getattr(app, "is_web_mode", False) and getattr(app, "tray_manager", None):
-                        app.tray_manager.stop()
-                    page.run_task(page.window.destroy)
-                    time.sleep(0.3)
-                    os._exit(0)
-
-            threading.Thread(target=close_app, daemon=True).start()
-        else:
+        try:
+            await _stop_active_recordings(app)
+            await app.cleanup()
+        except Exception as ex:
+            logger.error(f"Application cleanup failed: {ex}")
+        finally:
             if not getattr(app, "is_web_mode", False) and getattr(app, "tray_manager", None):
                 app.tray_manager.stop()
             await _safe_destroy_window(page)
-
-        await close_dialog(e)
 
     async def close_dialog(_):
         close_confirm_dialog.open = False
@@ -96,7 +100,8 @@ async def handle_app_close(page: ft.Page, app, save_progress_overlay) -> None:
         ft.Container(height=10),
     ]
 
-    if page.platform.value != "macos":
+    platform_value = page.platform.value if page.platform is not None else ""
+    if platform_value != "macos":
         close_confirm_controls.append(
             ft.Text(
                 _["minimize_to_tray_tip"],
@@ -123,7 +128,7 @@ async def handle_app_close(page: ft.Page, app, save_progress_overlay) -> None:
             ),
         ),
     ]
-    if page.platform.value != "macos":
+    if platform_value != "macos":
         close_confirm_actions.insert(
             1,
             ft.TextButton(
@@ -151,7 +156,7 @@ async def handle_app_close(page: ft.Page, app, save_progress_overlay) -> None:
                 horizontal_alignment=ft.CrossAxisAlignment.CENTER,
             ),
             padding=ft.Padding.symmetric(horizontal=20, vertical=10),
-            width=400 if page.platform.value != "macos" else None,
+            width=400 if platform_value != "macos" else None,
         ),
         actions=close_confirm_actions,
         actions_alignment=ft.MainAxisAlignment.END,

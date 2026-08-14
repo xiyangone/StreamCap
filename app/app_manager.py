@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 import asyncio
 import os
 import time
+from typing import TYPE_CHECKING, Any
 
 import flet as ft
 
@@ -19,11 +22,15 @@ from .ui.views.settings_view import SettingsPage
 from .ui.views.storage_view import StoragePage
 from .utils.logger import logger
 
+if TYPE_CHECKING:
+    from .auth.auth_manager import AuthManager
+    from .core.recording.record_manager import RecordingManager
+
 
 class App:
     def __init__(self, page: ft.Page, services: BackendServices | None = None):
         self.page = page
-        self.install_progress = None
+        self.install_progress: Any | None = None
 
         if services is None:
             services = BackendServices.get_or_none()
@@ -37,11 +44,16 @@ class App:
         self.config_manager = services.config_manager
         self.process_manager = services.process_manager
         self.language_manager = services.language_manager
-        self.record_manager = services.recording_manager
+        record_manager = services.recording_manager
+        if record_manager is None:
+            raise RuntimeError("RecordingManager is not initialized")
+        self.record_manager: RecordingManager = record_manager
 
         self.is_web_mode = False
-        self.auth_manager = None
-        self.current_username = None
+        self.auth_manager: AuthManager | None = None
+        self.current_username: str | None = None
+        self.is_mobile = False
+        self.bottom_navigation: ft.NavigationBar | None = None
         self.content_area = ft.Column(
             controls=[],
             expand=True,
@@ -65,7 +77,7 @@ class App:
 
         self.snack_bar_area = ft.Container()
         self.dialog_area = ft.Container()
-        self.complete_page = ft.Row(
+        self.complete_page: ft.Control = ft.Row(
             expand=True,
             controls=[
                 self.left_navigation_menu,
@@ -79,7 +91,8 @@ class App:
         self.subprocess_start_up_info = services.subprocess_start_up_info
         self.shutdown_manager = ScheduledShutdownManager(self)
         self.record_card_manager = RecordingCardManager(self)
-        self.current_page = None
+        self.current_page: Any | None = None
+        self.close_confirm_dialog: ft.AlertDialog | None = None
         self._loading_page = False
         self.install_manager = InstallationManager(self)
         self.update_checker = UpdateChecker(self)

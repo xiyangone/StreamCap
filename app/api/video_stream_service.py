@@ -6,6 +6,7 @@ import sys
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
+from typing import TypedDict
 
 import aiofiles
 from cachetools import TTLCache
@@ -37,7 +38,14 @@ DEFAULT_VIDEO_ROOT_DIR = default_recordings_dir
 VIDEO_DIR = Path(CUSTOM_VIDEO_ROOT_DIR or DEFAULT_VIDEO_ROOT_DIR)
 os.makedirs(VIDEO_DIR, exist_ok=True)
 
-VIDEO_META_CACHE = TTLCache(maxsize=50, ttl=300)
+
+class VideoMeta(TypedDict):
+    etag: str
+    last_modified: str
+    file_size: int
+
+
+VIDEO_META_CACHE = TTLCache[str, VideoMeta](maxsize=50, ttl=300)
 
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())

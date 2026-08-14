@@ -59,7 +59,7 @@ class VideoPlayer:
         async def take_screenshot(_):
             await self._take_screenshot(video, video_source, is_file_path)
 
-        actions = [ft.TextButton(self._["close"], on_click=close_dialog)]
+        actions: list[ft.Control] = [ft.TextButton(self._["close"], on_click=close_dialog)]
 
         actions.insert(0, ft.TextButton(self._["screenshot"], on_click=take_screenshot))
 

@@ -1,5 +1,6 @@
 import asyncio
 import uuid
+from typing import Any
 
 import flet as ft
 
@@ -23,16 +24,22 @@ class RecordingsPage(PageBase):
     def __init__(self, app):
         super().__init__(app)
         self.page_name = "recordings"
-        self.recording_card_area = None
-        self.add_recording_dialog = None
+        self.recording_card_area: ft.Container
+        self.add_recording_dialog: RecordingDialog
         self.is_grid_view = app.settings.user_config.get("is_grid_view", True)
-        self.loading_indicator = None
+        self.loading_indicator: ft.ProgressRing
         self.app.language_manager.add_observer(self)
         self.load_language()
         self.current_filter = "all"
         self.current_platform_filter = "all"
         self.platform_buttons = {}
         self.init()
+
+    def _recording_controls(self) -> list[ft.Control]:
+        content = self.recording_card_area.content
+        if isinstance(content, (ft.GridView, ft.Column)):
+            return content.controls
+        raise RuntimeError("Recording card container has no list content")
 
     def load_language(self):
         language = self.app.language_manager.language
@@ -65,8 +72,9 @@ class RecordingsPage(PageBase):
         )
         self.content_area.update()
 
-        if not self.recording_card_area.content.controls:
-            self.recording_card_area.content.controls.clear()
+        recording_controls = self._recording_controls()
+        if not recording_controls:
+            recording_controls.clear()
             await self.add_record_cards()
         else:
             # if cards exist, apply filter
@@ -85,7 +93,9 @@ class RecordingsPage(PageBase):
     async def toggle_view_mode(self, _):
         self.is_grid_view = not self.is_grid_view
         current_content = self.recording_card_area.content
-        current_controls = current_content.controls if hasattr(current_content, "controls") else []
+        current_controls = (
+            list(current_content.controls) if isinstance(current_content, (ft.GridView, ft.Column)) else []
+        )
 
         runs_count = self.get_grid_runs_count()
         child_aspect_ratio = self.get_grid_child_aspect_ratio()
@@ -456,12 +466,12 @@ class RecordingsPage(PageBase):
             results = await asyncio.gather(*[create_card_with_time_range(recording) for recording in cards_to_create])
 
             for card, recording in results:
-                self.recording_card_area.content.controls.append(card)
+                self._recording_controls().append(card)
                 self.app.record_card_manager.cards_obj[recording.rec_id]["card"] = card
 
             if existing_cards:
                 for card in existing_cards:
-                    self.recording_card_area.content.controls.append(card)
+                    self._recording_controls().append(card)
 
         self.loading_indicator.visible = False
         self.loading_indicator.update()
@@ -482,11 +492,11 @@ class RecordingsPage(PageBase):
 
         await self.apply_filter()
 
-    async def add_recording(self, recordings_info):
+    async def add_recording(self, recordings_info: list[dict[str, Any]]):
         user_config = self.app.settings.user_config
         logger.info(f"Add items: {len(recordings_info)}")
 
-        new_recordings = []
+        new_recordings: list[Recording] = []
         for recording_info in recordings_info:
             if recording_info.get("record_format"):
                 recording = Recording(
@@ -534,10 +544,10 @@ class RecordingsPage(PageBase):
 
             recording.loop_time_seconds = int(user_config.get("loop_time_seconds", 300))
             recording.update_title(self._[recording.quality])
-            await self.app.record_manager.add_recording(recording)
             new_recordings.append(recording)
 
         if new_recordings:
+            await self.app.record_manager.add_recordings(new_recordings)
 
             async def create_card_with_time_range(rec):
                 _card = await self.app.record_card_manager.create_card(rec)
@@ -549,7 +559,7 @@ class RecordingsPage(PageBase):
             results = await asyncio.gather(*[create_card_with_time_range(rec) for rec in new_recordings])
 
             for card, recording in results:
-                self.recording_card_area.content.controls.append(card)
+                self._recording_controls().append(card)
                 self.app.record_card_manager.cards_obj[recording.rec_id]["card"] = card
                 self.app.page.pubsub.send_others_on_topic("add", recording)
 
@@ -602,13 +612,19 @@ class RecordingsPage(PageBase):
                 continue
             if card_id in selected_cards:
                 selected_cards[card_id].selected = False
-                card["card"].content.bgcolor = None
-                card["card"].update()
+                card_control = card["card"]
+                card_content = card_control.content
+                if isinstance(card_content, ft.Container):
+                    card_content.bgcolor = None
+                card_control.update()
 
         for card in to_remove:
             card_key = card["card"].key
             cards_obj.pop(card_key, None)
-            self.recording_card_area.controls.remove(card["card"])
+            card_control = card["card"]
+            controls = self._recording_controls()
+            if card_control in controls:
+                controls.remove(card_control)
         await self.show_all_cards()
 
         self.content_area.controls[1] = self.create_filter_area()
@@ -673,7 +689,7 @@ class RecordingsPage(PageBase):
         self.page.update()
 
     async def delete_all_recording_cards(self):
-        self.recording_card_area.content.controls.clear()
+        self._recording_controls().clear()
         self.recording_card_area.update()
         self.app.record_card_manager.cards_obj = {}
 
@@ -697,7 +713,7 @@ class RecordingsPage(PageBase):
                 recording.scheduled_start_time, recording.monitor_hours
             )
 
-            self.recording_card_area.content.controls.append(card)
+            self._recording_controls().append(card)
             self.app.record_card_manager.cards_obj[recording.rec_id]["card"] = card
 
             self.recording_card_area.update()

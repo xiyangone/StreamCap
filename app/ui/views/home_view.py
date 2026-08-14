@@ -1,4 +1,5 @@
 import os
+from collections.abc import Callable
 from datetime import datetime
 
 import flet as ft
@@ -98,7 +99,7 @@ class HomePage(PageBase):
         )
 
     def create_quick_action_area(self):
-        is_mobile = self.app.is_mobile or self.page.width < 600
+        is_mobile = self.app.is_mobile or (self.page.width or 0) < 600
 
         button_width = 150 if is_mobile else 180
         button_height = 50 if is_mobile else 60
@@ -242,7 +243,14 @@ class HomePage(PageBase):
             )
 
     @staticmethod
-    def create_action_button(text: str, icon: ft.IconData, color: ft.Colors, on_click: callable, width=180, height=60):
+    def create_action_button(
+        text: str,
+        icon: ft.IconData,
+        color: ft.Colors,
+        on_click: Callable,
+        width=180,
+        height=60,
+    ):
         return ft.Button(
             content=ft.Row(
                 controls=[
@@ -307,7 +315,7 @@ class HomePage(PageBase):
             )
 
         announcement_list = self.app.about.about_config["version_updates"][0]["announcement"][self.app.language_code]
-        announcements = [
+        announcements: list[ft.Control] = [
             create_announcement_card(
                 announcement_list[0]["title"],
                 announcement_list[0]["content"],
@@ -449,7 +457,7 @@ class HomePage(PageBase):
             height=130,
         )
 
-        is_mobile = self.app.is_mobile or self.page.width < 600
+        is_mobile = self.app.is_mobile or (self.page.width or 0) < 600
 
         if is_mobile:
             stat_row1 = ft.Row(
@@ -538,7 +546,7 @@ class HomePage(PageBase):
         )
 
     def create_features_area(self):
-        is_mobile = self.app.is_mobile or self.page.width < 600
+        is_mobile = self.app.is_mobile or (self.page.width or 0) < 600
 
         def create_feature_card(title, description, icon, color):
             return ft.Card(

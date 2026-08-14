@@ -14,26 +14,61 @@ class RecordingDialog:
         self.page = self.app.page
         self.on_confirm_callback = on_confirm_callback
         self.recording = recording
+        self.url_duplicate_confirm_dialog: ft.AlertDialog | None = None
         self.app.language_manager.add_observer(self)
         self._ = {}
         self.load()
 
     def load(self):
         language = self.app.language_manager.language
-        for key in ("recording_dialog", "recordings_page", "base", "video_quality"):
+        for key in ("recording_dialog", "recordings_page", "recording_card", "base", "video_quality"):
             self._.update(language.get(key, {}))
+
+    @staticmethod
+    def _parse_batch_line(line: str) -> tuple[str, str, str] | None:
+        """Parse one batch-entry line without leaking values from adjacent lines."""
+        if "http" not in line:
+            return None
+
+        parts = [item.strip() for item in line.strip().replace("，", ",").split(",") if item.strip()]
+        if not parts:
+            return None
+
+        quality_code = "0"
+        streamer_name = ""
+        if len(parts) >= 3:
+            quality_code, url, streamer_name = parts[:3]
+        elif len(parts) == 2:
+            if parts[1].startswith("http"):
+                quality_code, url = parts
+            else:
+                url, streamer_name = parts
+        else:
+            url = parts[0]
+
+        quality_map = {"0": "OD", "1": "UHD", "2": "HD", "3": "SD", "4": "LD"}
+        quality_code = quality_code.upper()
+        quality = quality_map.get(
+            quality_code,
+            quality_code if quality_code in VideoQuality.get_qualities() else VideoQuality.OD,
+        )
+        return quality, url.strip(), streamer_name
 
     async def show_dialog(self):
         """Show a dialog for adding or editing a recording."""
         initial_values = self.recording.to_dict() if self.recording else {}
 
         config = RecordingConfig(initial_values, self.app.settings.user_config)
-        default_record_format = config.get_value("record_format", "video_format", VideoFormat.TS).upper()
+        default_record_format = str(
+            config.get_value("record_format", "video_format", VideoFormat.TS) or VideoFormat.TS
+        ).upper()
         default_record_type = "video" if default_record_format in VideoFormat.get_formats() else "audio"
-        default_record_quality = config.get_value("quality", "record_quality", VideoQuality.OD)
+        default_record_quality = str(
+            config.get_value("quality", "record_quality", VideoQuality.OD) or VideoQuality.OD
+        )
         default_video_bitrate = initial_values.get("video_bitrate")
-        segment_record = config.get_value("segment_record", "segmented_recording_enabled", False)
-        segment_time = config.get_value("segment_time", "video_segment_time", 1800)
+        segment_record = bool(config.get_value("segment_record", "segmented_recording_enabled", False))
+        segment_time = str(config.get_value("segment_time", "video_segment_time", 1800) or 1800)
         only_notify_no_record = config.get_value("only_notify_no_record", default=False)
         flv_use_direct_download = config.get_value("flv_use_direct_download", default=False)
 
@@ -61,7 +96,7 @@ class RecordingDialog:
             border_radius=5,
             filled=False,
             expand=True,
-            value=initial_values.get("url"),
+            value=str(initial_values.get("url") or ""),
             on_change=on_url_change,
         )
 
@@ -148,7 +183,7 @@ class RecordingDialog:
             border_radius=5,
             filled=False,
             expand=True,
-            value=initial_values.get("recording_dir"),
+            value=str(initial_values.get("recording_dir") or ""),
         )
 
         async def on_segment_setting_change(e):
@@ -377,6 +412,19 @@ class RecordingDialog:
             logger.warning(f"This platform does not support recording: {url}")
             await self.app.snack_bar.show_snack_bar(self._["platform_not_supported_tip"], duration=3000)
 
+        async def submit_recordings(recordings_info):
+            try:
+                callback = self.on_confirm_callback
+                if callback is None:
+                    raise RuntimeError("Recording confirmation callback is not configured")
+                return await callback(recordings_info)
+            except Exception as exc:
+                logger.error(f"Failed to save recording configuration: {exc}")
+                await self.app.snack_bar.show_snack_bar(
+                    self._["save_recording_failed_tip"], bgcolor=ft.Colors.RED
+                )
+                return False
+
         def get_existing_recordings():
             existing_recordings = [rec.url for rec in self.app.record_manager.recordings]
             return existing_recordings
@@ -396,7 +444,7 @@ class RecordingDialog:
                         if video_bitrate <= 0:
                             raise ValueError
                     except ValueError:
-                        video_bitrate_field.error_text = self._["custom_video_bitrate_invalid"]
+                        video_bitrate_field.error = self._["custom_video_bitrate_invalid"]
                         video_bitrate_field.update()
                         return
 
@@ -440,6 +488,8 @@ class RecordingDialog:
                         "enabled_message_push": message_push_dropdown.value == "true",
                         "only_notify_no_record": no_record_dropdown.value == "true",
                         "flv_use_direct_download": flv_use_direct_download_dropdown.value == "true",
+                        "platform": platform,
+                        "platform_key": platform_key,
                     }
                 ]
 
@@ -447,55 +497,53 @@ class RecordingDialog:
 
                     async def confirm_duplicate():
                         async def close_duplicate_dialog(_):
-                            self.url_duplicate_confirm_dialog.open = False
+                            duplicate_dialog = self.url_duplicate_confirm_dialog
+                            if duplicate_dialog is not None:
+                                duplicate_dialog.open = False
                             self.page.update()
+
+                        async def cancel_duplicate(_):
+                            await close_duplicate_dialog(None)
                             await close_dialog(e)
 
                         async def proceed_with_add(_):
-                            await close_duplicate_dialog(e)
-                            await self.on_confirm_callback(recordings_info)
+                            await close_duplicate_dialog(None)
+                            callback_result = await submit_recordings(recordings_info)
+                            if callback_result is not False:
+                                await close_dialog(e)
 
                         duplicate_confirm_dialog = ft.AlertDialog(
                             modal=True,
                             title=ft.Text(self._["duplicate_url_title"]),
                             content=ft.Text(self._["duplicate_url_content"]),
                             actions=[
-                                ft.TextButton(self._["cancel"], on_click=close_duplicate_dialog),
+                                ft.TextButton(self._["cancel"], on_click=cancel_duplicate),
                                 ft.TextButton(self._["sure"], on_click=proceed_with_add),
                             ],
                             actions_alignment=ft.MainAxisAlignment.END,
                         )
 
                         self.url_duplicate_confirm_dialog = duplicate_confirm_dialog
-                        self.url_duplicate_confirm_dialog.open = True
+                        duplicate_confirm_dialog.open = True
                         self.page.overlay.append(duplicate_confirm_dialog)
                         self.page.update()
 
                     await confirm_duplicate()
                     return
                 else:
-                    await self.on_confirm_callback(recordings_info)
+                    callback_result = await submit_recordings(recordings_info)
+                    if callback_result is False:
+                        return
 
             elif tabs.selected_index == 1:  # Batch entry
                 lines = batch_input.value.splitlines()
                 recordings_info = []
                 batch_url_list = []
-                streamer_name = ""
-                quality = "OD"
-                quality_dict = {"0": "OD", "1": "UHD", "2": "HD", "3": "SD", "4": "LD"}
                 for line in lines:
-                    if "http" not in line:
+                    parsed_line = self._parse_batch_line(line)
+                    if parsed_line is None:
                         continue
-                    res = [i for i in line.strip().replace("，", ",").split(",") if i]
-                    if len(res) == 3:
-                        quality, url, streamer_name = res
-                    elif len(res) == 2:
-                        if res[1].startswith("http"):
-                            quality, url = res
-                        else:
-                            url, streamer_name = res
-                    else:
-                        url = res[0]
+                    quality, url, streamer_name = parsed_line
 
                     platform, platform_key = get_platform_info(url)
                     if not platform:
@@ -507,25 +555,27 @@ class RecordingDialog:
                         logger.info(f"Skip {url.strip()}, the live room URL already exists.")
                         continue
 
-                    quality = quality_dict.get(quality, "OD")
-                    title = f"{streamer_name} - {self._[quality]}"
-                    display_title = title
                     if not streamer_name:
                         streamer_name = self._["live_room"]
                         display_title = streamer_name + url.split("?")[0] + "... - " + self._[quality]
+                    else:
+                        display_title = f"{streamer_name} - {self._[quality]}"
+                    title = f"{streamer_name} - {self._[quality]}"
 
                     recording_info = {
-                        "url": url.strip(),
+                        "url": url,
                         "streamer_name": streamer_name,
                         "quality": quality,
-                        "quality_info": self._[VideoQuality.OD],
+                        "quality_info": self._[quality],
                         "title": title,
                         "display_title": display_title,
                     }
-                    batch_url_list.append(url.strip())
+                    batch_url_list.append(url)
                     recordings_info.append(recording_info)
 
-                await self.on_confirm_callback(recordings_info)
+                callback_result = await submit_recordings(recordings_info)
+                if callback_result is False:
+                    return
 
             await close_dialog(e)
 
@@ -569,4 +619,12 @@ class RecordingConfig:
         self.user_config = user_config
 
     def get_value(self, key, user_config_key=None, default=None):
-        return self.initial_values.get(key, self.user_config.get(user_config_key or key, default))
+        initial_value = self.initial_values.get(key)
+        if initial_value is not None:
+            return initial_value
+
+        # Inheritable recording fields are persisted as null. In an edit
+        # dialog null means "follow the current global setting", not an empty
+        # control value.
+        user_value = self.user_config.get(user_config_key or key, default)
+        return default if user_value is None else user_value

@@ -172,22 +172,50 @@ class RecordingManager:
             self.apply_global_defaults(recording)
             recording.update_title(self._.get(recording.quality, recording.quality))
 
-    async def add_recording(self, recording):
-        # 新建项带的是对话框里的显式值，先判定哪些实际等同于全局设置
-        self.apply_global_defaults(recording)
+    async def add_recordings(self, recordings: list[Recording]) -> None:
+        """Add recordings atomically from the user's perspective."""
+        if not recordings:
+            return
+
+        for recording in recordings:
+            # 新建项带的是对话框里的显式值，先判定哪些实际等同于全局设置
+            self.apply_global_defaults(recording)
+
         with GlobalRecordingState.lock:
-            GlobalRecordingState.recordings.append(recording)
+            GlobalRecordingState.recordings.extend(recordings)
+        try:
             await self.persist_recordings()
+        except Exception:
+            with GlobalRecordingState.lock:
+                for recording in recordings:
+                    if recording in GlobalRecordingState.recordings:
+                        GlobalRecordingState.recordings.remove(recording)
+            raise
+
+    async def add_recording(self, recording: Recording) -> None:
+        await self.add_recordings([recording])
 
     async def remove_recording(self, recording: Recording):
+        index = self.recordings.index(recording)
         with GlobalRecordingState.lock:
             GlobalRecordingState.recordings.remove(recording)
+        try:
             await self.persist_recordings()
+        except Exception:
+            with GlobalRecordingState.lock:
+                GlobalRecordingState.recordings.insert(index, recording)
+            raise
 
     async def clear_all_recordings(self):
+        previous_recordings = list(self.recordings)
         with GlobalRecordingState.lock:
             GlobalRecordingState.recordings.clear()
+        try:
             await self.persist_recordings()
+        except Exception:
+            with GlobalRecordingState.lock:
+                GlobalRecordingState.recordings[:] = previous_recordings
+            raise
 
     async def persist_recordings(self):
         """Persist recordings to a JSON file."""
@@ -196,13 +224,26 @@ class RecordingManager:
 
     async def update_recording_card(self, recording: Recording, updated_info: dict):
         """Update an existing recording object and persist changes to a JSON file."""
-        if recording:
-            recording.update(updated_info)
-            # 对话框传回的是全部字段的显式值：先清空跟随标记再重判，
-            # 否则用户把某个原本跟随的字段改成别的值时会被全局值覆盖回去
-            recording.inherited_fields.clear()
-            self.apply_global_defaults(recording)
-            self.services.run_coro(self.persist_recordings())
+        if recording is not None:
+            tracked_attrs = set(updated_info) | set(Recording.INHERITABLE_FIELDS) | {"platform", "platform_key"}
+            previous_values = {
+                attr: getattr(recording, attr) for attr in tracked_attrs if hasattr(recording, attr)
+            }
+            previous_inherited_fields = set(recording.inherited_fields)
+
+            try:
+                recording.update(updated_info)
+                recording.platform, recording.platform_key = get_platform_info(recording.url)
+                # 对话框传回的是全部字段的显式值：先清空跟随标记再重判，
+                # 否则用户把某个原本跟随的字段改成别的值时会被全局值覆盖回去
+                recording.inherited_fields.clear()
+                self.apply_global_defaults(recording)
+                await self.persist_recordings()
+            except Exception:
+                for attr, value in previous_values.items():
+                    setattr(recording, attr, value)
+                recording.inherited_fields = previous_inherited_fields
+                raise
 
     @staticmethod
     async def _update_recording(
@@ -309,6 +350,24 @@ class RecordingManager:
     async def get_selected_recordings(self):
         return [recording for recording in self.recordings if recording.selected]
 
+    def can_edit_recording(self, recording: Recording | None) -> bool:
+        """Return whether a recording can be edited without racing active work.
+
+        Monitoring by itself does not lock an item: an offline room may be
+        edited and the new configuration will be used by the next live check.
+        Only an active check/live/recording lifecycle blocks editing.
+        """
+        if recording is None:
+            return False
+        return not (
+            recording.is_recording
+            or recording.is_live
+            or recording.is_checking
+            or recording.stopping_in_progress
+            or recording.status_info == RecordingStatus.PREPARING_RECORDING
+            or recording.rec_id in self.active_recorders
+        )
+
     async def get_batch_target_recordings(self) -> list[Recording]:
         """批量操作的作用域：有选中就只作用于选中项，否则作用于当前筛选下可见的项。
 
@@ -327,34 +386,56 @@ class RecordingManager:
             follow_global: 要改回「跟随全局」的字段名集合
 
         Returns:
-            (成功数, 因正在录制/监控而跳过数)
+            (成功数, 因活跃检测/直播/录制而跳过数)
 
-        录制中或监控中的项会被跳过——与单卡编辑的前置校验保持一致，
-        避免改动在录制过程中半途生效导致输出参数前后不一。
+        仍在监控但处于离线状态的项允许编辑；正在检测、直播、准备录制或录制中的项
+        会被跳过，以免运行参数在活跃任务中途发生变化。
         """
         targets = await self.get_batch_target_recordings()
         applied = skipped = 0
+        changed_recordings: list[Recording] = []
+        snapshots: list[tuple[Recording, dict, set[str]]] = []
 
         for recording in targets:
-            if recording.is_recording or recording.monitor_status:
+            if not self.can_edit_recording(recording):
                 skipped += 1
                 continue
 
+            tracked_attrs = set(Recording.INHERITABLE_FIELDS) | {"title", "display_title"}
+            snapshots.append(
+                (
+                    recording,
+                    {attr: getattr(recording, attr) for attr in tracked_attrs},
+                    set(recording.inherited_fields),
+                )
+            )
             for attr, value in changes.items():
                 setattr(recording, attr, value)
                 recording.inherited_fields.discard(attr)
             for attr in follow_global:
                 recording.inherited_fields.add(attr)
 
-            # 重新投影：跟随项取全局值，固化项若恰好等于全局值也会被判为跟随
+            # 重新投影跟随项；批量对话框里的“指定值”是明确意图，
+            # 即使等于当前全局值也必须保持固化。
             self.apply_global_defaults(recording)
+            for attr in changes:
+                recording.inherited_fields.discard(attr)
             recording.update_title(self._.get(recording.quality, recording.quality))
-            self.services.broadcast_card_update(recording)
-            self.services.broadcast_pubsub("update", recording)
+            changed_recordings.append(recording)
             applied += 1
 
         if applied:
-            await self.persist_recordings()
+            try:
+                await self.persist_recordings()
+            except Exception:
+                for recording, values, inherited_fields in snapshots:
+                    for attr, value in values.items():
+                        setattr(recording, attr, value)
+                    recording.inherited_fields = inherited_fields
+                raise
+            for recording in changed_recordings:
+                self.services.broadcast_card_update(recording)
+                self.services.broadcast_pubsub("update", recording)
         logger.info(f"Batch Edit Recordings: applied={applied} skipped={skipped} changes={changes}")
         return applied, skipped
 
@@ -398,25 +479,35 @@ class RecordingManager:
 
         async def periodic_check():
             logger.info("Starting periodic live check background task")
-            # 外层以固定小步长轮转，真正的检测节奏由每个房间的
-            # next_check_due_seconds（loop_time + 抖动/退避）决定；
-            # 这样各房间会自然错峰，而不是同一时刻集体到期
-            tick = max(10, min(30, interval))
-            delay_first_round = self.services.settings_config.user_config.get(
-                "check_live_on_browser_refresh", True
-            )
-            # 启动后先等待再首查，避免反复重启软件造成突发请求
-            await asyncio.sleep(interval if delay_first_round else 10)
-            last_space_check = 0.0
-            while True:
-                now = asyncio.get_running_loop().time()
-                # 磁盘检查维持原有低频：空间不足时它会持续弹提示，不能跟着 tick 走
-                if now - last_space_check >= interval:
-                    last_space_check = now
-                    await self.check_free_space()
-                if self.services.recording_enabled:
-                    await self.check_all_live_status()
-                await asyncio.sleep(tick)
+            try:
+                # 外层以固定小步长轮转，真正的检测节奏由每个房间的
+                # next_check_due_seconds（loop_time + 抖动/退避）决定；
+                # 这样各房间会自然错峰，而不是同一时刻集体到期
+                tick = max(10, min(30, interval))
+                delay_first_round = self.services.settings_config.user_config.get(
+                    "check_live_on_browser_refresh", True
+                )
+                # 启动后先等待再首查，避免反复重启软件造成突发请求
+                await asyncio.sleep(interval if delay_first_round else 10)
+                last_space_check = 0.0
+                while True:
+                    try:
+                        now = asyncio.get_running_loop().time()
+                        # 磁盘检查维持原有低频：空间不足时它会持续弹提示，不能跟着 tick 走
+                        if now - last_space_check >= interval:
+                            last_space_check = now
+                            await self.check_free_space()
+                        if self.services.recording_enabled:
+                            await self.check_all_live_status()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        logger.error(f"Periodic live check iteration failed: {exc}")
+                    await asyncio.sleep(tick)
+            finally:
+                self.periodic_task_started = False
+                RecordingManager.set_periodic_task_running(False)
+                logger.info("Periodic live check background task stopped")
 
         if not RecordingManager.is_periodic_task_running():
             RecordingManager.set_periodic_task_running(True)
@@ -478,13 +569,19 @@ class RecordingManager:
         recording.status_info = RecordingStatus.STATUS_CHECKING
         platform, platform_key = get_platform_info(recording.url)
 
-        if platform and platform_key and (recording.platform is None or recording.platform_key is None):
+        if not platform or not platform_key:
+            recording.is_checking = False
+            recording.status_info = RecordingStatus.LIVE_STATUS_CHECK_ERROR
+            self.services.broadcast_card_update(recording)
+            self.services.broadcast_pubsub("update", recording)
+            return
+
+        if recording.platform is None or recording.platform_key is None:
             recording.platform = platform
             recording.platform_key = platform_key
             self.services.run_coro(self.persist_recordings())
 
-        if self.settings.user_config.get("language") != "zh_CN":
-            platform = platform_key
+        display_platform = platform_key if self.settings.user_config.get("language") != "zh_CN" else platform
 
         output_dir = self.settings.get_video_save_path()
         await self.check_free_space(output_dir)
@@ -493,7 +590,7 @@ class RecordingManager:
             recording.status_info = RecordingStatus.NOT_RECORDING_SPACE
             return
         recording_info = {
-            "platform": platform,
+            "platform": display_platform,
             "platform_key": platform_key,
             "live_url": recording.url,
             "output_dir": output_dir,
