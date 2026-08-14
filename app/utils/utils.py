@@ -10,9 +10,10 @@ import string
 import subprocess
 import sys
 import traceback
+from collections.abc import Awaitable, Callable
 from datetime import datetime, time, timedelta
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, ParamSpec, TypeVar, cast
 from urllib.parse import parse_qs, urlparse
 
 import execjs
@@ -95,19 +96,25 @@ class Color:
         print(f"{color}{text}{Color.RESET}")
 
 
-def trace_error_decorator(func: callable) -> callable:
+P = ParamSpec("P")
+R = TypeVar("R")
+
+
+def trace_error_decorator(func: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
     @functools.wraps(func)
-    async def wrapper(*args: list, **kwargs: dict) -> Any:
+    async def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
         try:
             result = await func(*args, **kwargs)
             if args:
                 try:
-                    setattr(args[0], "last_fetch_error", None)
+                    target: Any = args[0]
+                    target.last_fetch_error = None
                 except Exception:
                     pass
             return result
         except execjs.ProgramError:
             logger.warning("Failed to execute JS code. Please check if the Node.js environment")
+            return cast(R, [])
         except Exception as e:
             error_line = traceback.extract_tb(e.__traceback__)[-1].lineno
             error_info = f"Type: {type(e).__name__}, {e} in function {func.__name__} at line: {error_line}"
@@ -115,10 +122,11 @@ def trace_error_decorator(func: callable) -> callable:
             # 把原始错误留在实例上，供上层区分“被平台限制”与普通检测失败
             if args:
                 try:
-                    setattr(args[0], "last_fetch_error", error_info)
+                    target: Any = args[0]
+                    target.last_fetch_error = error_info
                 except Exception:
                     pass
-            return []
+            return cast(R, [])
 
     return wrapper
 

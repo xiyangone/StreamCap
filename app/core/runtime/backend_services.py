@@ -125,6 +125,15 @@ class BackendServices:
     def backend_loop(self) -> asyncio.AbstractEventLoop | None:
         return self._backend_loop
 
+    @staticmethod
+    def _log_background_task_error(task) -> None:
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except Exception as exc:
+            logger.error(f"Background task failed: {exc}")
+
     def run_coro(self, coro):
 
         if coro is None:
@@ -133,7 +142,9 @@ class BackendServices:
         loop = self._backend_loop
         if loop is not None and loop.is_running():
             try:
-                return asyncio.run_coroutine_threadsafe(coro, loop)
+                future = asyncio.run_coroutine_threadsafe(coro, loop)
+                future.add_done_callback(self._log_background_task_error)
+                return future
             except Exception as exc:
                 logger.warning(f"run_coro: backend loop refused task: {exc}")
                 try:
@@ -143,7 +154,9 @@ class BackendServices:
                 return None
         try:
             current = asyncio.get_running_loop()
-            return current.create_task(coro)
+            task = current.create_task(coro)
+            task.add_done_callback(self._log_background_task_error)
+            return task
         except RuntimeError:
             logger.warning("run_coro: no running loop available, dropping coroutine")
             try:

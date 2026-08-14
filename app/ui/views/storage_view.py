@@ -17,11 +17,11 @@ class StoragePage(BasePage):
     def __init__(self, app):
         super().__init__(app)
         self.page_name = "storage"
-        self.root_path = None
-        self.current_path = None
-        self.path_display = None
-        self.content = None
-        self.file_list = None
+        self.root_path = ""
+        self.current_path = ""
+        self.path_display: ft.Text
+        self.content: ft.Column
+        self.file_list: ft.ListView
         self._ = {}
         self.executor = ThreadPoolExecutor(max_workers=4)
         self.load_language()
@@ -111,7 +111,7 @@ class StoragePage(BasePage):
 
         items = await asyncio.get_event_loop().run_in_executor(self.executor, _get_items)
 
-        buttons = []
+        buttons: list[ft.Control] = []
         is_mobile = self.app.is_mobile
         for name, is_dir, full_path in items:
             if is_mobile:
@@ -156,7 +156,7 @@ class StoragePage(BasePage):
             )
         )
 
-    async def navigate_to(self, path):
+    async def navigate_to(self, path: str):
         self.current_path = path
         self.path_display.value = self._["current_path"] + ":" + self.current_path
         await self.update_file_list()
@@ -168,7 +168,7 @@ class StoragePage(BasePage):
         await self.update_file_list()
         self.content.update()
 
-    async def preview_file(self, file_path, room_url=None):
+    async def preview_file(self, file_path: str, room_url: str | None = None):
         import urllib.parse
 
         from ..components.business.video_player import VideoPlayer

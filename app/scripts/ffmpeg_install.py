@@ -49,7 +49,10 @@ async def get_lanzou_download_link(url: str, password: str | None = None, header
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.get(url, headers=headers)
             html_str = response.text
-            sign = re.search("var \\w+ = '([A-Za-z0-9_\\-+/]{80,})';", html_str).group(1)
+            sign_match = re.search("var \\w+ = '([A-Za-z0-9_\\-+/]{80,})';", html_str)
+            if sign_match is None:
+                raise ValueError("Unable to find Lanzou download signature")
+            sign = sign_match.group(1)
 
             data = {
                 "action": "downprocess",
@@ -117,7 +120,7 @@ async def install_ffmpeg_windows(update_progress):
             await update_progress(0.8, "Extracting and cleaning installation files")
             await unzip_file(zip_file_path, execute_dir)
             await update_progress(0.9, "Configuring FFmpeg environment variables")
-            os.environ["PATH"] = ffmpeg_path + os.pathsep + os.environ.get("PATH")
+            os.environ["PATH"] = ffmpeg_path + os.pathsep + os.environ.get("PATH", "")
             result = subprocess.run(["ffmpeg", "-version"], capture_output=True, startupinfo=startupinfo)
             if result.returncode == 0:
                 logger.success("FFmpeg installation was successful")
@@ -236,7 +239,7 @@ async def install_ffmpeg(update_progress) -> bool:
 
 
 def update_env_path():
-    current_env_path = os.environ.get("PATH")
+    current_env_path = os.environ.get("PATH", "")
     if current_platform != "Windows":
         path_list = ["/usr/bin/", "/usr/local/bin", "/opt/homebrew/bin"]
         current_env_path_list = current_env_path.split(os.pathsep)

@@ -106,7 +106,7 @@ class UpdateChecker:
 
         if not sources:
             logger.warning("No available update sources configured")
-            return {"has_update": False, "error": "No available update sources configured"}
+            return {"has_update": False, "error": "No available update sources configured", "source": "configuration"}
 
         tasks = []
         for source in sources:
@@ -116,7 +116,7 @@ class UpdateChecker:
                 tasks.append(self._check_custom_update(source))
 
         # Wait for any task to complete successfully or all to fail
-        results = []
+        results: list[UpdateInfo] = []
         for task in asyncio.as_completed(tasks):
             try:
                 result = await task
@@ -125,9 +125,13 @@ class UpdateChecker:
                 results.append(result)
             except Exception as e:
                 logger.error(f"Update check failed: {e}")
-                results.append({"has_update": False, "error": str(e)})
+                results.append({"has_update": False, "error": str(e), "source": "unknown"})
 
-        return results[-1] if results else {"has_update": False, "error": "All update sources check failed"}
+        return (
+            results[-1]
+            if results
+            else {"has_update": False, "error": "All update sources check failed", "source": "all"}
+        )
 
     async def _check_github_update(self, source: UpdateSource) -> UpdateInfo:
         """Check for updates from GitHub"""
@@ -160,7 +164,7 @@ class UpdateChecker:
                             "download_urls": download_urls,
                             "source": source["name"],
                         }
-                return {"has_update": False, "source": source["name"]}
+                return {"has_update": False, "error": "Already on the latest version", "source": source["name"]}
         except Exception as e:
             logger.error(f"Failed to check update from GitHub: {e}")
             return {"has_update": False, "error": str(e), "source": source["name"]}
@@ -187,10 +191,21 @@ class UpdateChecker:
             async with httpx.AsyncClient(timeout=timeout) as client:
                 response = await client.get(source["url"], params={"current_version": self.current_version})
                 if response.status_code == 200:
-                    update_info = response.json()
+                    update_info: dict[str, Any] = response.json()
                     if update_info.get("has_update", False):
-                        return {**update_info, "source": source["name"]}
-                    return {"has_update": False, "source": source["name"]}
+                        return {
+                            "has_update": True,
+                            "latest_version": str(update_info.get("latest_version", "")),
+                            "current_version": str(update_info.get("current_version", self.current_version)),
+                            "release_notes": str(update_info.get("release_notes", "")),
+                            "download_url": str(update_info.get("download_url", "")),
+                            "download_urls": {
+                                str(key): str(value)
+                                for key, value in dict(update_info.get("download_urls") or {}).items()
+                            },
+                            "source": source["name"],
+                        }
+                    return {"has_update": False, "error": "Already on the latest version", "source": source["name"]}
                 return {
                     "has_update": False,
                     "error": f"API returned status code: {response.status_code}",

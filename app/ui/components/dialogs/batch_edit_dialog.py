@@ -18,7 +18,7 @@ class BatchEditDialog(ft.AlertDialog):
       指定值   —— 固化为该值，不再受全局影响
 
     作用域与批量开始/停止/删除一致：有选中作用于选中项，
-    未选中则作用于当前筛选下可见的项。录制中/监控中的项会被跳过。
+    未选中则作用于当前筛选下可见的项。检测中/直播中/录制中的项会被跳过。
     """
 
     def __init__(self, app, on_done=None):
@@ -85,7 +85,7 @@ class BatchEditDialog(ft.AlertDialog):
 
     def load(self):
         language = self.app.language_manager.language
-        for key in ("recordings_page", "recording_dialog", "base", "video_quality"):
+        for key in ("recordings_page", "recording_dialog", "recording_card", "base", "video_quality"):
             self._.update(language.get(key, {}))
 
     def _build_dropdown(self, label: str, values: list[tuple[str, str]]):
@@ -140,7 +140,13 @@ class BatchEditDialog(ft.AlertDialog):
             await self.close_dialog(None)
             return
 
-        applied, skipped = await self.app.record_manager.batch_edit_recordings(changes, follow)
+        try:
+            applied, skipped = await self.app.record_manager.batch_edit_recordings(changes, follow)
+        except Exception:
+            await self.app.snack_bar.show_snack_bar(
+                self._["save_recording_failed_tip"], bgcolor=ft.Colors.RED
+            )
+            return
         await self.close_dialog(None)
 
         message = self._["batch_edit_done"].replace("{count}", str(applied))

@@ -8,13 +8,13 @@ class SaveProgressOverlay:
         self.app.language_manager.add_observer(self)
         self.load()
 
-        self.message_text = None
-        self.cancel_button = None
-        self.warning_text = None
-        self.progress_ring = None
-        self.simple_progress_ring = None
-        self.content_container = None
-        self.simple_container = None
+        self.message_text: ft.Text
+        self.cancel_button: ft.Button
+        self.warning_text: ft.Text
+        self.progress_ring: ft.ProgressRing
+        self.simple_progress_ring: ft.ProgressRing
+        self.content_container: ft.Container
+        self.simple_container: ft.Container
         self.overlay = ft.Stack([], visible=False)
 
         self.is_cancellable = False

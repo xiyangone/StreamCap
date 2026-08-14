@@ -1,11 +1,12 @@
 import asyncio
 import os
+import shlex
 import shutil
 import subprocess
 import sys
 import time
 from datetime import datetime
-from typing import TypeVar
+from typing import Any, TypeVar
 
 from ...messages import desktop_notify, message_pusher
 from ...models.media.video_quality_model import VideoQuality
@@ -26,7 +27,7 @@ class LiveStreamRecorder:
     DEFAULT_SAVE_FORMAT = "mp4"
     DEFAULT_QUALITY = VideoQuality.OD
 
-    def __init__(self, services, recording, recording_info):
+    def __init__(self, services, recording, recording_info: dict[str, Any]):
         self.services = services
         self.settings = services.settings_config
         self.recording = recording
@@ -36,24 +37,24 @@ class LiveStreamRecorder:
 
         self.user_config = self.settings.user_config
         self.account_config = self.settings.accounts_config
-        self.platform_key = self._get_info("platform_key")
+        self.platform_key = str(self._get_info("platform_key", default=""))
         # 未配置时必须回落为空串：streamget 多个平台解析器直接调用 cookies.strip()，
         # 传 None 会抛 'NoneType' object has no attribute 'strip'
         self.cookies = self.settings.cookies_config.get(self.platform_key) or ""
 
-        self.platform = self._get_info("platform")
-        self.live_url = self._get_info("live_url")
-        self.output_dir = self._get_info("output_dir")
-        self.segment_record = self._get_info("segment_record", default=False)
-        self.segment_time = self._get_info("segment_time", default=self.DEFAULT_SEGMENT_TIME)
-        self.quality = self._get_info("quality", default=self.DEFAULT_QUALITY)
+        self.platform = str(self._get_info("platform", default=""))
+        self.live_url = str(self._get_info("live_url", default=""))
+        self.output_dir = str(self._get_info("output_dir", default=""))
+        self.segment_record = bool(self._get_info("segment_record", default=False))
+        self.segment_time = str(self._get_info("segment_time", default=self.DEFAULT_SEGMENT_TIME))
+        self.quality = str(self._get_info("quality", default=self.DEFAULT_QUALITY))
         self.video_bitrate = self._get_info("video_bitrate")
-        self.save_format = self._get_info("save_format", default=self.DEFAULT_SAVE_FORMAT).lower()
+        self.save_format = str(self._get_info("save_format", default=self.DEFAULT_SAVE_FORMAT)).lower()
         self.proxy = self.is_use_proxy()
-        self.direct_downloader = None
+        self.direct_downloader: DirectStreamDownloader | None = None
         self.min_valid_recording_duration = 25
         self.recording_start_time = 0
-        self.last_fetch_error = None
+        self.last_fetch_error: str | None = None
         os.makedirs(self.output_dir, exist_ok=True)
         self.services.language_manager.add_observer(self)
         self._ = {}
@@ -82,15 +83,19 @@ class LiveStreamRecorder:
 
     def _get_filename(self, stream_info: StreamData) -> str:
         live_title = None
-        stream_info.title = utils.clean_name(stream_info.title, None)
+        stream_info.title = utils.clean_name(stream_info.title, "") or ""
         if self.user_config.get("filename_includes_title") and stream_info.title:
             stream_info.title = self._clean_and_truncate_title(stream_info.title) or stream_info.title
             live_title = stream_info.title
 
         if self.recording.streamer_name and self.recording.streamer_name != self._["live_room"]:
-            stream_info.anchor_name = utils.clean_name(self.recording.streamer_name)
+            stream_info.anchor_name = utils.clean_name(self.recording.streamer_name, self._["live_room"]) or self._[
+                "live_room"
+            ]
         else:
-            stream_info.anchor_name = utils.clean_name(stream_info.anchor_name, self._["live_room"])
+            stream_info.anchor_name = utils.clean_name(stream_info.anchor_name, self._["live_room"]) or self._[
+                "live_room"
+            ]
 
         now = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
 
@@ -128,9 +133,9 @@ class LiveStreamRecorder:
         now = datetime.today().strftime("%Y-%m-%d_%H-%M-%S")
         output_dir = self.output_dir.rstrip("/").rstrip("\\")
         if self.user_config.get("folder_name_platform"):
-            output_dir = os.path.join(output_dir, stream_info.platform)
+            output_dir = os.path.join(output_dir, stream_info.platform or "")
         if self.user_config.get("folder_name_author"):
-            output_dir = os.path.join(output_dir, stream_info.anchor_name)
+            output_dir = os.path.join(output_dir, stream_info.anchor_name or self._["live_room"])
         if self.user_config.get("folder_name_time"):
             output_dir = os.path.join(output_dir, now[:10])
         if self.user_config.get("folder_name_title") and stream_info.title:
@@ -618,35 +623,59 @@ class LiveStreamRecorder:
         split_video_by_time: bool,
         converts_to_mp4: bool,
     ):
-        from ..runtime.process_manager import BackgroundService
+        command = self._split_script_command(script_command)
+        executable_name = os.path.basename(command[0]).lower()
+        is_python_command = executable_name.startswith("python") or any(
+            arg.lower().endswith(".py") for arg in command[1:2]
+        )
 
-        if "python" in script_command:
-            params = [
-                f'--record_name "{record_name}"',
-                f'--save_file_path "{save_file_path}"',
-                f"--save_type {save_type}",
-                f"--split_video_by_time {split_video_by_time}",
-                f"--converts_to_mp4 {converts_to_mp4}",
-            ]
+        if is_python_command:
+            command.extend(
+                [
+                    "--record_name",
+                    record_name,
+                    "--save_file_path",
+                    save_file_path,
+                    "--save_type",
+                    save_type,
+                    "--split_video_by_time",
+                    str(split_video_by_time),
+                    "--converts_to_mp4",
+                    str(converts_to_mp4),
+                ]
+            )
         else:
-            params = [
-                f'"{record_name.split(" ", maxsplit=1)[-1]}"',
-                f'"{save_file_path}"',
-                save_type,
-                f"split_video_by_time: {split_video_by_time}",
-                f"converts_to_mp4: {converts_to_mp4}",
-            ]
-        script_command = script_command.strip() + " " + " ".join(params)
+            command.extend(
+                [
+                    record_name,
+                    save_file_path,
+                    save_type,
+                    f"split_video_by_time: {split_video_by_time}",
+                    f"converts_to_mp4: {converts_to_mp4}",
+                ]
+            )
 
         if not self.services.recording_enabled:
             logger.info("Application is closing, adding script execution task to background service")
-            BackgroundService.get_instance().add_task(self.run_script_sync, script_command)
+            BackgroundService.get_instance().add_task(self.run_script_sync, command)
         else:
-            self.services.run_coro(self.run_script_async(script_command))
+            self.services.run_coro(self.run_script_async(command))
 
         logger.success("Script command execution initiated!")
 
-    def run_script_sync(self, command: str) -> None:
+    @staticmethod
+    def _split_script_command(script_command: str) -> list[str]:
+        command = shlex.split(script_command.strip(), posix=os.name != "nt")
+        if os.name == "nt":
+            command = [
+                arg[1:-1] if len(arg) >= 2 and arg[0] == arg[-1] and arg[0] in {'"', "'"} else arg
+                for arg in command
+            ]
+        if not command:
+            raise ValueError("Custom script command is empty")
+        return command
+
+    def run_script_sync(self, command: list[str]) -> None:
         """Synchronous version of the script execution method, used for background service"""
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -655,14 +684,13 @@ class LiveStreamRecorder:
         finally:
             loop.close()
 
-    async def run_script_async(self, command: str) -> None:
+    async def run_script_async(self, command: list[str]) -> None:
         try:
             process = await asyncio.create_subprocess_exec(
-                *command.split(),
+                *command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 startupinfo=self.subprocess_start_info,
-                text=False,
             )
 
             stdout, stderr = await process.communicate()
@@ -680,8 +708,8 @@ class LiveStreamRecorder:
                 "Script has no execution permission!, If it is a Linux environment, "
                 "please first execute: chmod+x your_script.sh to grant script executable permission"
             )
-        except OSError:
-            logger.error("Please add `#!/bin/bash` at the beginning of your bash script file.")
+        except OSError as exc:
+            logger.error(f"Unable to execute custom script: {exc}")
         except Exception as e:
             logger.error(f"An error occurred: {e}")
 
@@ -719,7 +747,10 @@ class LiveStreamRecorder:
         self.should_stop = False
 
         try:
-            await self.direct_downloader.start_download()
+            direct_downloader = self.direct_downloader
+            if direct_downloader is None:
+                raise RuntimeError("Direct downloader is not initialized")
+            await direct_downloader.start_download()
 
             self.recording.status_info = RecordingStatus.RECORDING
             self.recording.record_url = record_url
@@ -732,13 +763,13 @@ class LiveStreamRecorder:
                     logger.info(f"Prepare to end direct download: {live_url}")
                     await self.remove_active_recorder()
                     self.recording.is_recording = False
-                    await self.direct_downloader.stop_download()
+                    await direct_downloader.stop_download()
                     self.recording.force_stop = False
                     break
 
                 await asyncio.sleep(1)
 
-                if self.direct_downloader.download_task and self.direct_downloader.download_task.done():
+                if direct_downloader.download_task and direct_downloader.download_task.done():
                     break
 
             await self.remove_active_recorder()

@@ -67,4 +67,12 @@ deprecated = ">=1.3.1"
 optional = true
 
 [tool.poetry.group.lint.dependencies]
+pyright = "1.1.411"
 ruff = "~0.16.0"
+types-cachetools = "*"
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+pythonVersion = "3.10"
+pythonPlatform = "Windows"

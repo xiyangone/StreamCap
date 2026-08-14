@@ -2,12 +2,13 @@ import abc
 import inspect
 import re
 import threading
+from collections.abc import Awaitable
 from typing import Any, Optional, TypeVar
 
 from streamget import StreamData
 
 T = TypeVar("T", bound="PlatformHandler")
-InstanceKey = tuple[str | None, tuple[tuple[str, str], ...] | None, str, str | None, str | None, str | None, str | None]
+InstanceKey = tuple[str | None, str | None, str | None, str | None, str | None, str | None, str | None]
 
 
 class PlatformHandler(abc.ABC):
@@ -34,11 +35,11 @@ class PlatformHandler(abc.ABC):
         self.account_type = account_type
 
     @abc.abstractmethod
-    async def get_stream_info(self, live_url: str) -> StreamData:
+    def get_stream_info(self, live_url: str) -> Awaitable[StreamData]:
         """
         Abstract method to get stream information based on the live URL.
         """
-        pass
+        raise NotImplementedError
 
     @classmethod
     def register(cls: type[T], *patterns: str) -> type[T]:
@@ -63,7 +64,7 @@ class PlatformHandler(abc.ABC):
         cls,
         proxy: str | None,
         cookies: str | None,
-        record_quality: str,
+        record_quality: str | None,
         platform: str | None,
         username: str | None = None,
         password: str | None = None,

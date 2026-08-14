@@ -1,5 +1,5 @@
-from datetime import timedelta
-from typing import ClassVar
+from datetime import time, timedelta
+from typing import Any, ClassVar
 
 
 class Recording:
@@ -73,7 +73,7 @@ class Recording:
         self.only_notify_no_record = only_notify_no_record
         self.flv_use_direct_download = flv_use_direct_download
         self.video_bitrate = video_bitrate
-        self.scheduled_time_range = None
+        self.scheduled_time_range: list[str] | None = None
         self.title = f"{streamer_name} - {self.quality}"
         self.speed = "X KB/s"
         self.is_live = False
@@ -83,8 +83,8 @@ class Recording:
         self.force_stop = False
         self.stopping_in_progress = False
         self.stop_requested = False
-        self.platform = None
-        self.platform_key = None
+        self.platform: str | None = None
+        self.platform_key: str | None = None
         self.notified_live_start = False
         self.notified_live_end = False
 
@@ -94,24 +94,24 @@ class Recording:
         self.selected = False
         self.is_checking = False
         self.showed_checking_status = False
-        self.status_info = None
-        self.live_title = None
-        self.detection_time = None
-        self.loop_time_seconds = None
+        self.status_info: str | None = None
+        self.live_title: str | None = None
+        self.detection_time: time | None = None
+        self.loop_time_seconds: int | None = None
         # 下次检测的实际间隔（loop_time 叠加随机抖动或失败退避后的值）
         self.next_check_due_seconds: int | None = None
         self.consecutive_check_failures: int = 0
-        self.use_proxy = None
-        self.record_url = None
-        self.preview_url = None
+        self.use_proxy: bool | None = None
+        self.record_url: str | None = None
+        self.preview_url: str | None = None
         # 当前跟随全局设置的字段名集合，由 RecordingManager.apply_global_defaults 维护
         self.inherited_fields: set[str] = set()
 
-    def _stored_value(self, attr: str):
+    def _stored_value(self, attr: str) -> Any:
         """跟随全局的字段持久化为 null，避免把当时的全局值固化成专属值。"""
         return None if attr in self.inherited_fields else getattr(self, attr)
 
-    def to_dict(self):
+    def to_dict(self) -> dict[str, Any]:
         """Convert the Recording instance to a dictionary for saving."""
         return {
             "rec_id": self.rec_id,
@@ -129,13 +129,14 @@ class Recording:
             "enabled_message_push": self.enabled_message_push,
             "platform": self.platform,
             "platform_key": self.platform_key,
+            "last_duration": self.last_duration.total_seconds(),
             "only_notify_no_record": self._stored_value("only_notify_no_record"),
             "flv_use_direct_download": self._stored_value("flv_use_direct_download"),
             "video_bitrate": self.video_bitrate,
         }
 
     @classmethod
-    def from_dict(cls, data):
+    def from_dict(cls, data: dict[str, Any]):
         """Create a Recording instance from a dictionary."""
         recording = cls(
             data.get("rec_id"),
@@ -157,11 +158,11 @@ class Recording:
         )
         recording.title = data.get("title", recording.title)
         recording.display_title = data.get("display_title", recording.title)
-        recording.last_duration_str = data.get("last_duration")
+        last_duration = data.get("last_duration")
         recording.platform = data.get("platform")
         recording.platform_key = data.get("platform_key")
-        if recording.last_duration_str is not None:
-            recording.last_duration = timedelta(seconds=float(recording.last_duration_str))
+        if last_duration is not None:
+            recording.last_duration = timedelta(seconds=float(last_duration))
         return recording
 
     def update_title(self, quality_info, prefix=None):
@@ -170,7 +171,7 @@ class Recording:
         # prefix 参数保留兼容签名，但标题不再拼接状态前缀（状态由卡片独立标签展示）
         self.display_title = self.title
 
-    def update(self, updated_info: dict):
+    def update(self, updated_info: dict[str, Any]):
         """Update the recording object with new information."""
         for attr, value in updated_info.items():
             if hasattr(self, attr):

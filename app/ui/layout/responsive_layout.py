@@ -5,7 +5,7 @@ from ...utils.logger import logger
 
 
 def is_mobile_device(page: ft.Page) -> bool:
-    return page.width < 768
+    return (page.width or 0) < 768
 
 
 def setup_responsive_layout(page: ft.Page, app: App) -> None:

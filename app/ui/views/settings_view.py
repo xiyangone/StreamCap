@@ -53,13 +53,13 @@ class SettingsPage(PageBase):
         self.tab_accounts = self.create_accounts_settings_tab()
         self.page.on_keyboard_event = self.on_keyboard
 
-        tab_labels = [
+        tab_labels: list[ft.Control] = [
             ft.Tab(label=self._["recording_settings"]),
             ft.Tab(label=self._["push_settings"]),
             ft.Tab(label=self._["cookies_settings"]),
             ft.Tab(label=self._["accounts_settings"]),
         ]
-        tab_contents = [
+        tab_contents: list[ft.Control] = [
             self.tab_recording,
             self.tab_push,
             self.tab_cookies,
@@ -73,7 +73,7 @@ class SettingsPage(PageBase):
 
         settings_tabs = ft.Tabs(
             content=ft.Column(
-                [
+                controls=[
                     ft.TabBar(tabs=tab_labels),
                     ft.TabBarView(controls=tab_contents, expand=True),
                 ],
@@ -939,7 +939,7 @@ class SettingsPage(PageBase):
         )
 
     def create_push_channels_layout(self):
-        controls = [
+        controls: list[ft.Control] = [
             self.create_channel_switch_container(self._["dingtalk"], ft.Icons.BUSINESS_CENTER, "dingtalk_enabled"),
             self.create_channel_switch_container(self._["wechat"], ft.Icons.WECHAT, "wechat_enabled"),
             self.create_channel_switch_container(self._["feishu"], ft.Icons.BOOK, "feishu_enabled"),
@@ -1315,7 +1315,7 @@ class SettingsPage(PageBase):
         async def update_active_state(target):
             is_active = target is not None
             hours_field.disabled = is_active
-            hours_field.error_text = None
+            hours_field.error = None
             start_button.disabled = is_active
             cancel_button.disabled = not is_active
             status_text.value = (
@@ -1335,13 +1335,13 @@ class SettingsPage(PageBase):
             except ValueError:
                 hours = 0
             if not 1 <= hours <= MAX_QUICK_SHUTDOWN_HOURS:
-                hours_field.error_text = self._["quick_shutdown_invalid_hours"].format(
+                hours_field.error = self._["quick_shutdown_invalid_hours"].format(
                     max_hours=MAX_QUICK_SHUTDOWN_HOURS
                 )
                 hours_field.update()
                 return
 
-            hours_field.error_text = None
+            hours_field.error = None
             hours_field.update()
             expected_time = datetime.now() + timedelta(hours=hours)
 
