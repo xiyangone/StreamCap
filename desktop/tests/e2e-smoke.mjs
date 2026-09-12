@@ -1,0 +1,304 @@
+import assert from 'node:assert/strict';
+import { createHarness, eventually, go, hidden, inspectLayout, visible, waitTheme } from './ui-fixtures.mjs';
+
+const h = await createHarness('interaction');
+const { page, state } = h;
+const steps = [];
+const card = (id) => page.locator('article[data-rec-id="' + id + '"]');
+const dialog = (name) => page.getByRole('dialog', { name, exact: true });
+const requests = (method, path) => state.requests.filter((r) => r.method === method && r.path === path);
+const record = (id) => state.recordings.find((r) => r.recId === id);
+const waitState = (read, predicate, message) => eventually(read, predicate, message);
+const navigate = async (name) => { await page.getByRole('navigation', { name: '主导航' }).getByRole('link', { name }).click(); };
+let failure;
+async function step(name, action) {
+  await action();
+  assert.deepEqual(h.runtimeErrors, [], '浏览器出现未处理运行时错误');
+  steps.push(name);
+  console.log('PASS ' + name);
+}
+
+try {
+  await step('真实 WASM 启动、初始任务与 SSE 连接', async () => {
+    await go(page, h.base, '/home');
+    await waitState(() => page.locator('.recording-card').count(), (n) => n === 6, '初始任务数量');
+    await visible(page.getByText('实时同步', { exact: true }));
+    const layout = await inspectLayout(page);
+    assert.equal(layout.dialogs, 0); assert.ok(layout.glass.includes('blur'));
+    await h.shot('01-home-light');
+  });
+  await step('明暗主题即时切换与样式实际生效', async () => {
+    await page.getByRole('button', { name: '切换到深色' }).click();
+    await waitTheme(page, 'dark');
+    const bg = await page.locator('body').evaluate((e) => getComputedStyle(e).backgroundColor);
+    assert.equal(bg, 'rgb(16, 23, 37)');
+    await h.shot('02-home-dark');
+    await page.getByRole('button', { name: '切换到浅色' }).click();
+    await waitTheme(page, 'light');
+  });
+  await step('搜索、平台筛选、空态与网格/列表', async () => {
+    await navigate('录制任务');
+    await page.getByRole('textbox', { name: '搜索直播间' }).fill('山野');
+    await waitState(() => page.locator('.recording-card').count(), (n) => n === 1, '搜索结果');
+    await page.getByRole('textbox', { name: '搜索直播间' }).fill('不存在的直播间');
+    await visible(page.getByText('没有匹配的直播间', { exact: true }));
+    await page.getByRole('button', { name: '清除筛选' }).click();
+    await page.getByRole('combobox', { name: '筛选平台' }).selectOption('bilibili');
+    await waitState(() => page.locator('.recording-card').count(), (n) => n === 2, '平台筛选');
+    await page.getByRole('combobox', { name: '筛选平台' }).selectOption('');
+    await page.getByRole('button', { name: '列表视图', exact: true }).click();
+    await visible(page.locator('.cards-grid.list-view'));
+    await h.shot('03-recordings-list');
+    await page.getByRole('button', { name: '网格视图', exact: true }).click();
+  });
+  await step('弹窗焦点隔离、Escape 与恢复焦点', async () => {
+    const trigger = page.getByRole('button', { name: '添加直播间', exact: true });
+    await trigger.click();
+    const modal = dialog('添加直播间'); await visible(modal);
+    assert.equal(await modal.evaluate((el) => el.contains(document.activeElement)), true);
+    for (let i = 0; i < 8; i++) await page.keyboard.press('Tab');
+    assert.equal(await modal.evaluate((el) => el.contains(document.activeElement)), true);
+    await page.keyboard.press('Escape'); await hidden(modal);
+    assert.equal(await trigger.evaluate((el) => el === document.activeElement), true);
+  });
+  await step('添加校验、逐行名称与清晰度、无额外任务写入', async () => {
+    await page.getByRole('button', { name: '添加直播间', exact: true }).click();
+    const modal = dialog('添加直播间');
+    const urls = modal.getByRole('textbox', { name: /直播间地址/ });
+    const before = requests('POST', '/api/recordings').length;
+    await urls.fill('file:///private');
+    await modal.getByRole('button', { name: '添加直播间', exact: true }).click();
+    await visible(modal.getByRole('alert'));
+    assert.equal(requests('POST', '/api/recordings').length, before);
+    await urls.fill('https://custom.example.invalid/one\nhttps://custom.example.invalid/one');
+    await modal.getByRole('button', { name: '添加直播间', exact: true }).click();
+    await visible(modal.getByText(/地址重复/));
+    await urls.fill('2,https://custom.example.invalid/one,测试甲\nhttps://custom.example.invalid/two,测试乙');
+    await h.shot('04-add-dialog');
+    await modal.getByRole('button', { name: '添加直播间', exact: true }).click();
+    await hidden(modal);
+    await waitState(() => state.recordings.length, (n) => n === 8, '添加两条任务');
+    const body = requests('POST', '/api/recordings').at(-1).body;
+    assert.equal(body.items[0].quality, 'HD'); assert.equal(body.items[1].streamerName, '测试乙');
+  });
+  await step('单项编辑、字段契约和实时卡片更新', async () => {
+    await card('fixture-3').getByRole('button', { name: '编辑任务' }).click();
+    const modal = dialog('编辑直播间');
+    await modal.getByRole('textbox', { name: '主播名称' }).fill('小宇 · 已编辑');
+    await modal.getByRole('combobox', { name: '清晰度', exact: true }).selectOption('HD');
+    await modal.getByRole('combobox', { name: '录制格式', exact: true }).selectOption('MKV');
+    await h.shot('05-edit-dialog');
+    await modal.getByRole('button', { name: '保存修改', exact: true }).click();
+    await hidden(modal);
+    await visible(card('fixture-3').getByText('小宇 · 已编辑', { exact: true }));
+    assert.equal(record('fixture-3').quality, 'HD'); assert.equal(record('fixture-3').recordFormat, 'MKV');
+    assert.ok(!record('fixture-3').inheritedFields.includes('quality'));
+  });
+  await step('批量编辑仅限选中 ID，保持原值不静默提交', async () => {
+    await card('fixture-3').getByRole('checkbox').check();
+    await card('fixture-5').getByRole('checkbox').check();
+    const untouched = structuredClone(state.recordings.filter((r) => !['fixture-3', 'fixture-5'].includes(r.recId)));
+    await page.getByRole('button', { name: '批量编辑', exact: true }).click();
+    const modal = dialog('批量编辑任务');
+    const before = requests('POST', '/api/recordings/batch-edit').length;
+    await modal.getByRole('button', { name: '应用到所选任务' }).click();
+    await visible(modal.getByText('请至少选择一项需要修改的设置', { exact: true }));
+    assert.equal(requests('POST', '/api/recordings/batch-edit').length, before);
+    await modal.getByRole('combobox', { name: '清晰度', exact: true }).selectOption('SD');
+    await h.shot('06-batch-dialog');
+    await modal.getByRole('button', { name: '应用到所选任务' }).click();
+    await hidden(modal);
+    assert.deepEqual(requests('POST', '/api/recordings/batch-edit').at(-1).body.recIds.sort(), ['fixture-3', 'fixture-5']);
+    assert.deepEqual(state.recordings.filter((r) => !['fixture-3', 'fixture-5'].includes(r.recId)), untouched);
+    assert.equal(record('fixture-3').recordFormat, 'MKV');
+    await page.getByRole('button', { name: '取消选择' }).click();
+  });
+  await step('恢复跟随全局，覆盖项保持独立', async () => {
+    await card('fixture-3').getByRole('button', { name: '编辑任务' }).click();
+    const modal = dialog('编辑直播间');
+    await modal.getByRole('combobox', { name: '清晰度', exact: true }).selectOption('__global');
+    await modal.getByRole('combobox', { name: '录制格式', exact: true }).selectOption('__global');
+    await modal.getByRole('button', { name: '保存修改', exact: true }).click(); await hidden(modal);
+    await navigate('偏好设置');
+    await page.getByRole('combobox', { name: '默认清晰度', exact: true }).selectOption('UHD');
+    await page.getByRole('combobox', { name: '默认录制格式', exact: true }).selectOption('MP4');
+    await page.locator('.settings-savebar').getByRole('button', { name: '保存修改' }).click();
+    await waitState(() => state.userConfig.record_quality, (v) => v === 'UHD', '全局清晰度写入');
+    await hidden(page.locator('.settings-savebar'));
+    assert.equal(record('fixture-3').quality, 'UHD'); assert.equal(record('fixture-3').recordFormat, 'MP4');
+    assert.equal(record('fixture-5').quality, 'SD');
+    await h.shot('07-settings-recording');
+  });
+  await step('设置数值校验和失败反馈不伪报成功', async () => {
+    await page.getByRole('button', { name: '网络与检测', exact: true }).click();
+    const interval = page.getByRole('textbox', { name: /检测间隔/ });
+    await interval.fill('0');
+    const before = requests('PUT', '/api/settings').length;
+    await page.locator('.settings-savebar').getByRole('button', { name: '保存修改' }).click();
+    await visible(page.getByText(/检测间隔应为/)); assert.equal(requests('PUT', '/api/settings').length, before);
+    await interval.fill('120');
+    h.failNext('PUT', '/api/settings', '模拟磁盘不可写');
+    await page.locator('.settings-savebar').getByRole('button', { name: '保存修改' }).click();
+    await visible(page.getByText('模拟磁盘不可写', { exact: true }));
+    assert.notEqual(state.userConfig.loop_time_seconds, '120');
+    await page.locator('.settings-savebar').getByRole('button', { name: '保存修改' }).click();
+    await waitState(() => state.userConfig.loop_time_seconds, (v) => v === '120', '重试保存');
+    await hidden(page.locator('.settings-savebar'));
+  });
+  await step('系统主题随系统实时变化，强调色与持久化', async () => {
+    await page.getByRole('button', { name: '外观', exact: true }).click();
+    await page.getByRole('button', { name: '跟随系统', exact: true }).click();
+    await waitState(() => state.userConfig.theme_mode, (v) => v === 'system', '主题保存');
+    await page.emulateMedia({ colorScheme: 'dark' });
+    await waitTheme(page, 'dark');
+    await visible(page.getByRole('button', { name: '切换到浅色' }));
+    await page.getByRole('button', { name: '鸢尾紫' }).click();
+    await page.waitForFunction(() => document.documentElement.dataset.accent === 'purple');
+    await h.shot('08-settings-dark-purple');
+    await page.emulateMedia({ colorScheme: 'light' });
+    await waitTheme(page, 'light');
+    await page.getByRole('button', { name: '晴空蓝' }).click();
+    await page.getByRole('button', { name: '浅色', exact: true }).click();
+    await waitState(() => state.userConfig.theme_mode, (v) => v === 'light', '浅色恢复');
+  });
+  await step('登录信息按平台局部保存，扫码仅在隔离服务模拟', async () => {
+    await page.getByRole('button', { name: '平台登录', exact: true }).click();
+    const input = page.getByRole('textbox', { name: '平台 Cookie' });
+    await visible(input);
+    const untouched = state.cookies.bilibili;
+    await input.fill('fixture-edited-not-a-credential');
+    await page.getByRole('button', { name: '保存登录信息' }).click();
+    await waitState(() => state.cookies.douyin, (v) => v === 'fixture-edited-not-a-credential', 'Cookie 局部保存');
+    assert.deepEqual(requests('PUT', '/api/cookies').at(-1).body.cookies, { douyin: 'fixture-edited-not-a-credential' });
+    assert.equal(state.cookies.bilibili, untouched);
+    await page.getByRole('textbox', { name: '搜索平台' }).fill('快手');
+    await page.locator('.cookie-platform-list').getByRole('button', { name: '快手', exact: true }).click();
+    await page.getByRole('button', { name: '扫码登录' }).click();
+    const modal = dialog('快手扫码登录');
+    await visible(modal.getByText('二维码有效期：120 秒', { exact: true }));
+    await modal.getByRole('button', { name: '关闭', exact: true }).click(); await hidden(modal);
+    await waitState(() => state.qrCancelled, (n) => n >= 1, '关闭取消模拟扫码');
+    state.qrPhase = 'success';
+    await page.getByRole('button', { name: '扫码登录' }).click();
+    await waitState(() => input.inputValue(), (v) => v === 'fixture-qr-not-a-credential', '模拟扫码结果填入');
+    assert.equal(state.cookies.kuaishou, undefined, '扫码结果不应自动持久化');
+    await page.getByRole('button', { name: '保存登录信息' }).click();
+    await waitState(() => state.cookies.kuaishou, (v) => v === 'fixture-qr-not-a-credential', '明确保存模拟扫码结果');
+  });
+  await step('未实现能力明确禁用，不显示假开关', async () => {
+    await page.getByRole('button', { name: '自动化与通知', exact: true }).click();
+    assert.equal(await page.locator('.unavailable-row').count(), 4);
+    assert.equal(await page.locator('.unavailable-row input').count(), 0);
+  });
+  await step('监控、录制、停止与失败反馈', async () => {
+    await navigate('录制任务');
+    await card('fixture-5').getByRole('button', { name: '开启监控', exact: true }).click();
+    await waitState(() => record('fixture-5').monitorStatus, Boolean, '监控启用');
+    await card('fixture-5').getByRole('button', { name: '开始录制', exact: true }).click();
+    await waitState(() => record('fixture-5').isRecording, Boolean, '开始录制');
+    assert.equal(await card('fixture-5').getByRole('button', { name: '编辑任务' }).isDisabled(), true);
+    assert.equal(await card('fixture-5').getByRole('button', { name: '删除任务' }).isDisabled(), true);
+    await card('fixture-5').getByRole('button', { name: '停止录制', exact: true }).click();
+    await waitState(() => record('fixture-5').isRecording, (v) => !v, '停止录制');
+    h.failNext('POST', '/api/recordings/fixture-5/start', '模拟 FFmpeg 启动失败');
+    await card('fixture-5').getByRole('button', { name: '开始录制', exact: true }).click();
+    await visible(page.getByText('模拟 FFmpeg 启动失败', { exact: true }));
+    assert.equal(record('fixture-5').isRecording, false);
+  });
+  await step('删除确认、取消与 SSE 删除后无信号生命周期错误', async () => {
+    const before = requests('DELETE', '/api/recordings/fixture-7').length;
+    await card('fixture-7').getByRole('button', { name: '删除任务' }).click();
+    const modal = dialog('移除直播间'); await visible(modal);
+    await modal.getByRole('button', { name: '取消', exact: true }).click(); await hidden(modal);
+    assert.equal(requests('DELETE', '/api/recordings/fixture-7').length, before);
+    await card('fixture-7').getByRole('button', { name: '删除任务' }).click();
+    await modal.getByRole('button', { name: '确认删除' }).click();
+    await hidden(card('fixture-7'));
+    await waitState(() => requests('DELETE', '/api/recordings/fixture-7').length, (n) => n === before + 1, '仅删除选定任务');
+    assert.ok(record('fixture-8'));
+  });
+  await step('录制预览对不支持容器清晰降级', async () => {
+    await card('fixture-1').getByRole('button', { name: '预览录制文件' }).click();
+    const modal = dialog('录制预览');
+    await visible(modal.getByText('此格式需要本地播放器', { exact: true }));
+    await visible(modal.getByRole('listitem'));
+    await h.shot('09-recording-preview');
+    await modal.getByRole('button', { name: '关闭预览' }).click(); await hidden(modal);
+    assert.equal(await page.locator('video,audio').count(), 0);
+  });
+  await step('媒体库筛选、目录导航与真正的内嵌音频加载', async () => {
+    await navigate('媒体库');
+    await waitState(() => page.locator('.file-table tbody tr').count(), (n) => n === 4, '根目录文件');
+    await h.shot('10-storage');
+    await page.getByRole('button', { name: '音频', exact: true }).click();
+    assert.equal(await page.locator('.file-table tbody tr').count(), 1);
+    await page.getByRole('button', { name: /^清晨片段.wav/ }).click();
+    const modal = dialog('媒体预览');
+    await visible(modal.getByLabel('录制音频预览'));
+    await page.waitForFunction(() => document.querySelector('audio')?.readyState >= 1);
+    await modal.getByRole('button', { name: '关闭预览' }).click(); await hidden(modal);
+    assert.equal(await page.locator('audio').count(), 0);
+    await page.getByRole('button', { name: '全部文件', exact: true }).click();
+    await page.getByRole('button', { name: /^云间电台.*文件夹/ }).click();
+    await visible(page.getByRole('button', { name: /^周末音乐.ts/ }));
+    await page.getByRole('button', { name: '返回媒体库根目录' }).click();
+    await visible(page.getByRole('button', { name: /^录制说明.txt/ }));
+  });
+  await step('媒体库删除只修改模拟目录并要求确认', async () => {
+    await page.getByRole('button', { name: '删除录制说明.txt', exact: true }).click();
+    const modal = dialog('永久删除文件'); await visible(modal);
+    await modal.getByRole('button', { name: '取消', exact: true }).click();
+    assert.ok(state.files.some((f) => f.name === '录制说明.txt'));
+    await page.getByRole('button', { name: '删除录制说明.txt', exact: true }).click();
+    await modal.getByRole('button', { name: '确认删除' }).click(); await hidden(modal);
+    await waitState(() => state.files.some((f) => f.name === '录制说明.txt'), (v) => !v, '模拟文件删除');
+  });
+  await step('异步预览期间切页，不访问已销毁信号', async () => {
+    await navigate('录制任务');
+    h.delayNext('GET', '/api/recordings/fixture-1/files', 700);
+    await card('fixture-1').getByRole('button', { name: '预览录制文件' }).click();
+    await page.keyboard.press('Escape');
+    await navigate('总览');
+    await visible(page.getByRole('heading', { name: '录制工作台', exact: true }));
+  });
+  await step('区分解析不可用与后端断线，保留任务并自动恢复', async () => {
+    state.resolverReady = false;
+    await visible(page.locator('.health-row').getByText('不可用', { exact: true }));
+    assert.equal(await card('fixture-3').getByRole('button', { name: '开始录制', exact: true }).isDisabled(), true);
+    const count = state.recordings.length;
+    h.setOffline(true);
+    await visible(page.locator('.connection-banner'));
+    assert.equal(await page.locator('.recording-card').count(), Math.min(count, 6));
+    h.setOffline(false); state.resolverReady = true;
+    await hidden(page.locator('.connection-banner'));
+    await visible(page.getByText('实时同步', { exact: true }));
+    assert.equal(state.recordings.length, count);
+  });
+  await step('SSE 更新直接反映在现有卡片', async () => {
+    record('fixture-2').streamerName = '阿鹿 · 实时更新'; h.emit('update', record('fixture-2'));
+    await visible(page.getByText('阿鹿 · 实时更新', { exact: true }));
+  });
+  await step('服务端列表失败停止骨架屏并展示错误', async () => {
+    h.failNext('GET', '/api/recordings', '模拟列表读取失败', 500);
+    h.failNext('GET', '/api/recordings', '模拟列表读取失败', 500);
+    await go(page, h.base, '/home');
+    await visible(page.locator('.connection-banner'));
+    assert.equal(await page.locator('.skeleton-grid').count(), 0);
+    await hidden(page.locator('.connection-banner'));
+    await waitState(() => page.locator('.recording-card').count(), (n) => n === Math.min(state.recordings.length, 6), '列表失败自动重试后恢复');
+  });
+  await step('最终安全检查：无真实网络、未处理请求或浏览器异常', async () => {
+    assert.deepEqual(h.blocked, []); assert.deepEqual(state.unexpected, []); assert.deepEqual(h.runtimeErrors, []);
+    const appErrors = h.consoleErrors.filter((message) => !message.startsWith('Failed to load resource:'));
+    assert.deepEqual(appErrors, [], '应用 console.error');
+  });
+} catch (error) {
+  failure = error;
+  await h.shot('failure').catch(() => {});
+  console.error(error.stack ?? error);
+} finally {
+  await h.report({ passed: !failure, steps, failure: failure ? String(failure.stack ?? failure) : null });
+  await h.close();
+}
+console.log(JSON.stringify({ passed: !failure, checks: steps.length, artifacts: h.runDir }));
+if (failure) process.exitCode = 1;

@@ -1,0 +1,35 @@
+[package]
+name = "streamcap-tauri"
+version = "0.1.0"
+edition = "2021"
+description = "StreamCap Tauri shell"
+
+[lib]
+name = "streamcap_tauri_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+streamcap-core = { path = "../core" }
+tauri = { version = "2", features = ["tray-icon"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+env_logger = "0.11"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+opt-level = "z"
+# fat LTO（lto = true）在本机 rustc 1.95 上编译 main.rs 时会稳定触发
+# STATUS_ACCESS_VIOLATION（编译器崩溃，非代码问题）；thin LTO 收益接近且稳定通过。
+lto = "thin"
+
+[workspace]
+members = ["."]
+resolver = "2"

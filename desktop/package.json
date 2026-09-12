@@ -1,0 +1,19 @@
+{
+  "name": "streamcap-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "trunk serve --port 1420",
+    "build": "trunk build --release",
+    "tauri": "tauri",
+    "tauri:dev": "trunk build && tauri dev",
+    "tauri:build": "trunk build --release && tauri build",
+    "test:ui": "node tests/e2e-smoke.mjs",
+    "test:smoke": "node tests/white-screen-smoke.mjs",
+    "test": "npm run test:ui && npm run test:smoke"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "playwright": "1.63.0"
+  }
+}

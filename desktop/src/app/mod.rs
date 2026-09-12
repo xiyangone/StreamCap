@@ -1,0 +1,135 @@
+pub mod components;
+pub mod labels;
+pub mod navigation;
+pub mod views;
+
+use crate::api::gateway;
+use components::Icon;
+use leptos::prelude::*;
+use leptos_router::hooks::use_location;
+use wasm_bindgen::{closure::Closure, JsCast};
+
+#[component]
+pub fn AppShell() -> impl IntoView {
+    view! { <leptos_router::components::Router><Shell /></leptos_router::components::Router> }
+}
+
+#[component]
+fn Shell() -> impl IntoView {
+    let state = gateway::provide_app_state();
+    let media_listener = window()
+        .match_media("(prefers-color-scheme: dark)")
+        .ok()
+        .flatten()
+        .map(|query| {
+            let observed = query.clone();
+            let handler = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
+                state.system_dark.set(observed.matches())
+            });
+            let _ =
+                query.add_event_listener_with_callback("change", handler.as_ref().unchecked_ref());
+            (query, handler)
+        });
+    let media_listener = StoredValue::new_local(media_listener);
+    on_cleanup(move || {
+        media_listener.update_value(|slot| {
+            if let Some((query, handler)) = slot.take() {
+                let _ = query.remove_event_listener_with_callback(
+                    "change",
+                    handler.as_ref().unchecked_ref(),
+                );
+            }
+        })
+    });
+    let events = StoredValue::new_local(None::<gateway::EventConnection>);
+    Effect::new(move |_| {
+        let _ = state.events_revision.get();
+        events.update_value(|connection| {
+            *connection = None;
+            *connection = gateway::subscribe_events(state);
+        });
+    });
+    on_cleanup(move || events.update_value(|connection| *connection = None));
+    leptos::task::spawn_local_scoped_with_cancellation(gateway::poll_connection(state));
+    Effect::new(move |_| {
+        let theme = state.theme.get();
+        let accent = state.accent.get();
+        let resolved = if state.is_dark() { "dark" } else { "light" };
+        if let Some(root) = document().document_element() {
+            let _ = root.set_attribute("data-theme", resolved);
+            let _ = root.set_attribute("data-accent", &accent);
+        }
+        if let Ok(Some(storage)) = window().local_storage() {
+            let _ = storage.set_item(
+                "streamcap.appearance",
+                &serde_json::json!({"theme":theme,"accent":accent}).to_string(),
+            );
+        }
+    });
+    view! {
+        <div class="app-shell">
+            <a class="skip-link" href="#main-content">"跳到主要内容"</a>
+            <navigation::Sidebar />
+            <div class="main-area">
+                <Topbar />
+                <main id="main-content" class="content-area" tabindex="-1">
+                    <Show when=move || state.error.get().is_some()>
+                        <div class="connection-banner" role="alert"><Icon name="alert" /><div><strong>"暂时无法连接本地服务"</strong><p>"正在自动重试。已有任务仍保留，恢复连接后将重新同步。"</p></div></div>
+                    </Show>
+                    <AppRoutes />
+                </main>
+            </div>
+            <components::Toast />
+        </div>
+    }
+}
+
+#[component]
+fn Topbar() -> impl IntoView {
+    let state = gateway::app_state();
+    let location = use_location();
+    let title = move || match location.pathname.get().as_str() {
+        "/recordings" => "录制任务",
+        "/storage" => "媒体库",
+        "/settings" => "偏好设置",
+        "/about" => "关于",
+        _ => "总览",
+    };
+    view! {
+        <header class="topbar">
+            <div class="breadcrumbs"><span>"工作空间"</span><Icon name="chevron" size=13 /><strong>{title}</strong></div>
+            <div class="topbar-actions">
+                <span class="sync-status" class:online=move || state.status.get().ok>
+                    <i class="status-dot" />{move || if !state.status.get().ok { "连接中" } else if state.events_connected.get() { "实时同步" } else { "同步重连中" }}
+                </span>
+                <span class="topbar-divider" />
+                <button class="icon-button theme-toggle" title="切换明暗主题"
+                    aria-label=move || if state.is_dark() { "切换到浅色" } else { "切换到深色" }
+                    on:click=move |_| {
+                        state.theme.set(if state.is_dark() { "light".into() } else { "dark".into() });
+                        gateway::save_appearance(state);
+                    }>
+                    <Show when=move || state.is_dark() fallback=|| view! { <Icon name="moon" /> }><Icon name="sun" /></Show>
+                </button>
+                <span class="device-avatar" title="此设备的本地工作空间"><Icon name="monitor" size=17 /></span>
+            </div>
+        </header>
+    }
+}
+
+#[component]
+pub fn AppRoutes() -> impl IntoView {
+    use leptos_router::components::{Route, Routes};
+    use leptos_router::path;
+    use views::{AboutView, HomeView, RecordingsView, SettingsView, StorageView};
+    view! {
+        <Routes fallback=|| view! { <div class="empty-state"><h1>"页面不存在"</h1><a class="button primary" href="/home">"返回总览"</a></div> }>
+            <Route path=path!("/") view=HomeView />
+            <Route path=path!("/home") view=HomeView />
+            <Route path=path!("/recordings") view=RecordingsView />
+            <Route path=path!("/storage") view=StorageView />
+            <Route path=path!("/settings") view=SettingsView />
+            <Route path=path!("/about") view=AboutView />
+        </Routes>
+    }
+}
