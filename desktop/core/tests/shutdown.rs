@@ -2,7 +2,7 @@ use futures::StreamExt;
 use std::{path::PathBuf, sync::atomic::Ordering, time::Duration};
 use streamcap_core::{
     api,
-    engine::{Engine, RecordOptions},
+    engine::RecordOptions,
     service::{Server, ServerOptions},
     Workspace,
 };
@@ -146,8 +146,31 @@ async fn ffmpeg_is_stopped_with_a_valid_completed_file() {
     let source = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    let engine = Engine::new();
-    let output = dir.path().join("capture.mkv");
+    let state = streamcap_core::api::bootstrap(Workspace::from_repo_root(dir.path()))
+        .await
+        .unwrap();
+    state
+        .config
+        .write()
+        .await
+        .update_user_config(
+            serde_json::json!({"live_save_path":dir.path().to_string_lossy()})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+        .unwrap();
+    let engine = state.engine.clone();
+    let api = Server::start(
+        state,
+        ServerOptions {
+            port: 0,
+            monitoring: false,
+        },
+    )
+    .await
+    .unwrap();
+    let output = dir.path().join("downloads/capture.mkv");
     let options = RecordOptions {
         record_url: format!("http://127.0.0.1:{port}/audio.wav"),
         save_path: output.to_string_lossy().into(),
@@ -162,6 +185,22 @@ async fn ffmpeg_is_stopped_with_a_valid_completed_file() {
     };
     engine.start(&ffmpeg, "fixture", &options).await.unwrap();
     tokio::time::sleep(Duration::from_secs(3)).await;
+    let client = reqwest::Client::new();
+    for target in ["downloads/capture.mkv", "downloads"] {
+        assert_eq!(
+            client
+                .delete(format!(
+                    "http://{}/api/storage?path={target}",
+                    api.address()
+                ))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            409
+        );
+    }
+    assert!(output.exists());
     tokio::time::timeout(Duration::from_secs(12), engine.stop_all(8))
         .await
         .unwrap();
@@ -217,6 +256,7 @@ async fn ffmpeg_is_stopped_with_a_valid_completed_file() {
         decoded.status.success() && decoded.stderr.is_empty(),
         "stopped recording must decode without errors"
     );
+    api.shutdown().await.unwrap();
     source.abort();
 }
 
@@ -294,4 +334,39 @@ async fn shutdown_reports_persistence_failure_but_still_closes_listener() {
         .await
         .is_err());
     assert!(workspace.recordings_path().is_dir());
+}
+
+#[tokio::test]
+async fn pending_storage_scan_is_cancelled_and_cannot_register_after_shutdown() {
+    let dir = tempfile::tempdir().unwrap();
+    let state =
+        streamcap_core::api::bootstrap(streamcap_core::Workspace::from_repo_root(dir.path()))
+            .await
+            .unwrap();
+    let worker_state = state.storage.clone();
+    let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let signal = started.clone();
+    let work = tokio::spawn(async move {
+        worker_state
+            .blocking(move |stop| {
+                signal.store(true, std::sync::atomic::Ordering::SeqCst);
+                while !stop.is_cancelled() {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                streamcap_core::storage::check_cancel(&stop)
+            })
+            .await
+    });
+    while !started.load(std::sync::atomic::Ordering::SeqCst) {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        streamcap_core::api::shutdown(&state),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(work.await.unwrap().is_err());
+    assert!(state.storage.blocking(|_| Ok(())).await.is_err());
 }

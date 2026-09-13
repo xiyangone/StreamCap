@@ -34,6 +34,7 @@ pub fn native_defaults() -> Map<String, Value> {
         serde_json::from_str(include_str!("../../../config/default_settings.json"))
             .expect("validated bundled defaults");
     disable_unimplemented(&mut values);
+    values.insert("close_action".into(), Value::String("ask".into()));
     values
 }
 pub fn disable_unimplemented(values: &mut Map<String, Value>) {
@@ -122,6 +123,12 @@ pub fn validate_settings(patch: &Map<String, Value>) -> io::Result<()> {
         .is_some_and(|v| !matches!(v.as_str(), Some("light" | "dark" | "system")))
     {
         return Err(invalid("主题模式无效"));
+    }
+    if patch
+        .get("close_action")
+        .is_some_and(|v| !matches!(v.as_str(), Some("ask" | "exit" | "tray")))
+    {
+        return Err(invalid("关闭窗口行为必须为每次询问、退出或最小化到托盘"));
     }
     let defaults = native_defaults();
     for (key, value) in patch {

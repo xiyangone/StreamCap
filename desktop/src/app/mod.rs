@@ -3,7 +3,7 @@ pub mod labels;
 pub mod navigation;
 pub mod views;
 
-use crate::api::gateway;
+use crate::api::{desktop, gateway};
 use components::Icon;
 use leptos::prelude::*;
 use leptos_router::hooks::use_location;
@@ -17,6 +17,7 @@ pub fn AppShell() -> impl IntoView {
 #[component]
 fn Shell() -> impl IntoView {
     let state = gateway::provide_app_state();
+    let desktop = desktop::provide_desktop();
     let media_listener = window()
         .match_media("(prefers-color-scheme: dark)")
         .ok()
@@ -55,6 +56,7 @@ fn Shell() -> impl IntoView {
         let theme = state.theme.get();
         let accent = state.accent.get();
         let resolved = if state.is_dark() { "dark" } else { "light" };
+        desktop::apply_theme(&theme);
         if let Some(root) = document().document_element() {
             let _ = root.set_attribute("data-theme", resolved);
             let _ = root.set_attribute("data-accent", &accent);
@@ -67,19 +69,20 @@ fn Shell() -> impl IntoView {
         }
     });
     view! {
-        <div class="app-shell">
+        <div class="app-shell" class:native-desktop=desktop.available>
             <a class="skip-link" href="#main-content">"跳到主要内容"</a>
             <navigation::Sidebar />
             <div class="main-area">
                 <Topbar />
                 <main id="main-content" class="content-area" tabindex="-1">
                     <Show when=move || state.error.get().is_some()>
-                        <div class="connection-banner" role="alert"><Icon name="alert" /><div><strong>"暂时无法连接本地服务"</strong><p>"正在自动重试。已有任务仍保留，恢复连接后将重新同步。"</p></div></div>
+                        <div class="connection-banner" role="alert"><Icon name="alert" /><div><strong>"暂时无法连接本地服务"</strong><p>"正在自动重试。已有任务仍保留，恢复连接后将刷新任务状态。"</p></div></div>
                     </Show>
                     <AppRoutes />
                 </main>
             </div>
             <components::Toast />
+            <components::CloseDialog />
         </div>
     }
 }
@@ -87,31 +90,28 @@ fn Shell() -> impl IntoView {
 #[component]
 fn Topbar() -> impl IntoView {
     let state = gateway::app_state();
+    let desktop = desktop::state();
     let location = use_location();
     let title = move || match location.pathname.get().as_str() {
         "/recordings" => "录制任务",
         "/storage" => "媒体库",
         "/settings" => "偏好设置",
-        "/about" => "关于",
+        "/about" => "关于 StreamCap",
         _ => "总览",
     };
     view! {
         <header class="topbar">
-            <div class="breadcrumbs"><span>"工作空间"</span><Icon name="chevron" size=13 /><strong>{title}</strong></div>
+            <div class="titlebar-drag-zone" data-tauri-drag-region="deep"><div class="breadcrumbs"><strong>{title}</strong></div></div>
             <div class="topbar-actions">
-                <span class="sync-status" class:online=move || state.status.get().ok>
-                    <i class="status-dot" />{move || if !state.status.get().ok { "连接中" } else if state.events_connected.get() { "实时同步" } else { "同步重连中" }}
-                </span>
-                <span class="topbar-divider" />
-                <button class="icon-button theme-toggle" title="切换明暗主题"
-                    aria-label=move || if state.is_dark() { "切换到浅色" } else { "切换到深色" }
-                    on:click=move |_| {
-                        state.theme.set(if state.is_dark() { "light".into() } else { "dark".into() });
-                        gateway::save_appearance(state);
-                    }>
-                    <Show when=move || state.is_dark() fallback=|| view! { <Icon name="moon" /> }><Icon name="sun" /></Show>
+                <span class="sync-status" class:online=move||state.status.get().ok&&state.events_connected.get() title="任务状态由本机自动更新，不涉及云同步"><i class="status-dot" />{move||if !state.status.get().ok{"本地服务连接中"}else if state.events_connected.get(){"本地实时更新"}else{"正在重连"}}</span>
+                <button class="icon-button theme-toggle" title="切换明暗主题" aria-label=move||if state.is_dark(){"切换到浅色"}else{"切换到深色"} on:click=move |_|{state.theme.set(if state.is_dark(){"light".into()}else{"dark".into()});gateway::save_appearance(state);}>
+                    <Show when=move||state.is_dark() fallback=||view!{<Icon name="moon"/>}><Icon name="sun"/></Show>
                 </button>
-                <span class="device-avatar" title="此设备的本地工作空间"><Icon name="monitor" size=17 /></span>
+                <Show when=move||desktop.available><div class="window-controls" role="group" aria-label="窗口控制">
+                    <button class="window-button" title="最小化" aria-label="最小化窗口" on:click=move |_|desktop::action(desktop,state,"minimize")><Icon name="minimize" size=16/></button>
+                    <button class="window-button" title=move||if desktop.status.get().maximized{"还原"}else{"最大化"} aria-label=move||if desktop.status.get().maximized{"还原窗口"}else{"最大化窗口"} on:click=move |_|desktop::action(desktop,state,"maximize")><Show when=move||desktop.status.get().maximized fallback=||view!{<Icon name="maximize" size=14/>}><Icon name="restore" size=14/></Show></button>
+                    <button class="window-button window-close" title="关闭" aria-label="关闭窗口" on:click=move |_|desktop::action(desktop,state,"close")><Icon name="close" size=18/></button>
+                </div></Show>
             </div>
         </header>
     }

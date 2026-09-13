@@ -1,324 +1,61 @@
-<div align="center">
-  <img src="./assets/images/logo.svg" alt="StreamCap" />
-</div>
-<p align="center">
-  <img alt="Python version" src="https://img.shields.io/badge/python-3.10%2B-blue.svg">
-  <a href="https://github.com/ihmily/StreamCap">
-      <img alt="Supported Platforms" src="https://img.shields.io/badge/Platforms-Win%20%7C%20Mac%20%7C%20Linux-6B5BFF.svg"></a>
-    <a href="https://hub.docker.com/r/ihmily/streamcap/tags">
-      <img alt="Docker Pulls" src="https://img.shields.io/docker/pulls/ihmily/streamcap?label=Docker%20Pulls&color=2496ED&logo=docker&v=0"></a>
-  <a href="https://github.com/ihmily/StreamCap/releases/latest">
-      <img alt="Latest Release" src="https://img.shields.io/github/v/release/ihmily/StreamCap"></a>
-  <a href="https://github.com/ihmily/StreamCap/releases/latest">
-      <img alt="Downloads" src="https://img.shields.io/github/downloads/ihmily/StreamCap/total?v=0"></a>
-</p>
-<div align="center">
-  简体中文 / <a href="./README_EN.md">English</a>
-</div><br>
+# StreamCap 原生桌面版
+
+StreamCap 使用 **Rust + Tauri 2 + Leptos/WASM**，当前交付目标为 **Windows x64 noFF 单 EXE**。后端解析、任务管理、配置与调度均在 Rust 进程中运行，不安装或启动 Python/Flet/Node 服务。
+
+## 当前能力
+
+- 原生解析：抖音、快手、媒体直链；快手支持扫码验证后显式保存登录信息。
+- 任务单项/批量编辑、监控、录制、配置继承、媒体预览与回收站操作。
+- 原生标题栏、关闭确认、最小化到托盘、记住关闭偏好和退出收尾。
+- 检测间隔保存后立即重新计时；媒体预览使用有界文件流和 HTTP Range。
+
+尚未迁移的平台、定时录制/关机、消息推送、自动转码和自定义脚本不属于当前可用能力。界面不会把这些功能显示成已生效。当前维护与交付入口仅限 Rust 原生版；旧 Python/Flet、Docker Web 和旧 macOS 打包入口不再用于本版本。
+
+## 运行要求
+
+- Windows 10/11 x64，系统 Microsoft Edge WebView2 Runtime。
+- noFF 不捆绑 FFmpeg；录制需要已有的 FFmpeg，优先使用用户数据目录下的 FFmpeg，其次 PATH。
+- 运行发行 EXE 不需要 Python、Node、Rust 开发工具。WebView2 和录制时的 FFmpeg 子进程属于正常运行依赖。
+
+用户数据默认位于 %APPDATA%\StreamCap，已有任务、Cookie、账号与设置不会被发行文件覆盖。下载位置遵循用户设置。
+
+## 源码开发与构建
+
+需要 Rust 1.95.0、MSVC C++ 构建工具、Windows SDK、Node.js 24 和 npm。下面从仓库的 desktop 目录执行：
 
 
-
-
-StreamCap 是一个基于FFmpeg和StreamGet的多平台直播流录制客户端，覆盖 40+ 国内外主流直播平台，支持批量录制、循环监控、定时监控和自动转码等功能。
-
-## ✨功能特性
-
-- **多端支持**：支持Windows/MacOS/Web运行
-- **循环监控**：实时监控直播间状态，开播即录。
-- **定时任务**：根据设定时间范围检查直播间状态。
-- **多种输出格式**：支持 ts、flv、mkv、mov、mp4、mp3、m4a 等格式。
-- **自动转码**：录制完成后自动转码为 mp4 格式。
-- **消息推送**：支持直播状态推送，及时获取开播通知。
-
-## 📸录制界面
-
-![StreamCap Interface](./assets/images/example01.png)
-
-## 🛠️快速开始
-
-### 1.**运行预构建的程序**：
-
-访问 [StreamCap Releases](https://github.com/ihmily/StreamCap/releases/latest) 页面，根据自身系统下载对应的最新版本压缩包。
-
-- **Windows 用户**：下载 `StreamCap.zip` 文件，解压后运行 `StreamCap.exe`。
-- **macOS 用户**：下载 `StreamCap.dmg` 文件，按照提示完成安装，即可在启动台找到应用并运行。
-
-### 2.从源代码运行
-
-确保已安装 **Python 3.10** 或更高版本。💥
-
-1.**克隆项目代码**：
-
-```bash
-git clone https://github.com/ihmily/StreamCap.git
-cd StreamCap
+```powershell
+rustup target add wasm32-unknown-unknown
+npm ci --cache .\build\npm-cache
+cargo install trunk --version 0.21.14 --locked --root .\target\tools
+cargo install wasm-bindgen-cli --version 0.2.128 --locked --root .\target\tools
+cargo fetch --manifest-path Cargo.toml --locked
+cargo fetch --manifest-path core/Cargo.toml --locked
+cargo fetch --manifest-path src-tauri/Cargo.toml --locked
+npm run tauri:dev
 ```
 
-2.**安装依赖**：
+构建脚本检查项目本地 wasm-bindgen CLI 与前端锁文件一致；缺少工具或版本不符会明确报错，不静默切换运行方案。
 
-```bash
-# 安装核心依赖
-pip install -i https://pypi.org/simple streamget 
+```powershell
+# 完整验证并生成 noFF EXE（首次测试须先安装 Playwright Chromium）
+npx playwright install chromium
+npm run verify
 
-# 桌面端
-pip install -r requirements.txt
-
-# Web端
-pip install -r requirements-web.txt
+# 仅构建新的发布目录，不覆盖已有产物
+pwsh -NoProfile -File .\scripts\build-release.ps1
 ```
 
-3.**配置运行环境**：
+产物：desktop/src-tauri/target/native-noFF-*/StreamCap.exe 和 StreamCap.exe.sha256。不生成安装器，不打包用户配置、Cookie 或下载文件。详细说明见 [打包与验收](docs/packaging.md)。
 
-将.env.example示例配置文件复制一份并将文件重命名为.env
+## 数据与安全
 
-```bash
-cp .env.example .env
-```
+- 保持现有 JSON 任务/配置契约；保留缺省继承和用户扩展字段。
+- 本地 API 只监听 loopback，校验 Host/Origin；桌面命令仅授予主窗口必要权限，CSP 只允许打包资源、IPC 和本次运行的本地服务。
+- 媒体文件路径不能越出录制根目录；链接不被递归跟随。正在录制的文件及其父目录不允许回收。
+- 回收不可用、文件被占用或操作失败时保留原文件，不退回永久删除。
+- UI 和原生 smoke 使用隔离数据；平台自动测试使用本地夹具，不触发真实扫码或平台探测。
 
-4.**运行程序**：
+## 许可
 
-在Windows和macOS上默认以桌面程序的方式运行，使用以下命令启动程序：
-
-```bash
-python main.py
-```
-
-Linux请使用web方式运行，修改 `.env` 文件，将 `PLATFORM` 的值改为 `web`，即可以Web方式运行。
-
-或者无需修改配置文件，直接使用以下命令启动
-
-```bash
-python main.py --web
-```
-
-启动成功后，通过 `http://127.0.0.1:6006` 访问。更多配置请参考 [Web运行指南](https://github.com/ihmily/StreamCap/wiki/安装指南#web-端运行)
-
-如果程序提示缺少 FFmpeg，请访问 FFmpeg 官方下载页面[Download FFmpeg](https://ffmpeg.org/download.html)，下载预编译的 FFmpeg 可执行文件，并配置环境变量。
-
-## 🐋容器运行
-
-本机无需Python环境运行，在运行命令之前，请确保您的机器上安装了 [Docker](https://docs.docker.com/get-docker/) 和 [Docker Compose](https://docs.docker.com/compose/install/) 
-
-1.**快速启动**
-
-最简单方法是使用`docker compose`运行，进入项目根目录后，只需简单执行以下命令(确保已经存在`.env`文件)：
-
-```bash
-docker compose up
-```
-
-可选 `-d` 在后台运行。注意容器内时区问题，默认使用的是 `Asia/Shanghai` ，如需修改可以在.env文件配置。
-
-2.**停止容器实例**
-
-```bash
-docker compose stop
-```
-
-3.**构建镜像(可选)**
-
-Docker仓库中的镜像的代码版本不一定是最新的，如有需要运行本仓库主分支最新代码，可以本地自定义构建
-
-```bash
-docker build -t streamcap .
-```
-
-## 😺已支持平台
-
-**国内平台（30+）**：
-
-抖音、快手、虎牙、斗鱼、B站、小红书、YY、映客、Acfun、Blued、京东、淘宝...
-
-**海外平台（10+）**：
-
-TikTok、Twitch、PandTV、Soop、Twitcasting、CHZZK、Shopee、Youtube、LiveMe、Flextv(TTingLive)、Popkontv、Bigo...
-
-**示例地址：**
-
-如未特殊备注，默认使用直播间地址录制
-
-```
-抖音:
-https://live.douyin.com/745964462470 (网页端主播直播间地址)
-https://v.douyin.com/iQFeBnt/ (app端主播直播间地址)
-https://live.douyin.com/yall1102 (拼接“https://live.douyin.com/”+抖音号, 可支持录制VR直播)
-https://v.douyin.com/CeiU5cbX (app端主播主页地址)
-https://www.douyin.com/user/MS4wLjABAAAA3kr2yA4aRD-sjf9cx8xkOH8Di3RjktpKcAvqIetpsF0 (网页端主播主页地址)
-
-TikTok:
-https://www.tiktok.com/@pearlgaga88/live
-
-快手:
-https://live.kuaishou.com/u/yall1102
-
-虎牙:
-https://www.huya.com/52333
-
-斗鱼:
-https://www.douyu.com/3637778?dyshid=
-https://www.douyu.com/topic/wzDBLS6?rid=4921614&dyshid=
-
-YY:
-https://www.yy.com/22490906/22490906
-
-B站:
-https://live.bilibili.com/320
-
-小红书:
-http://xhslink.com/xpJpfM  (一次性地址，暂不支持循环监控)
-
-bigo直播:
-https://www.bigo.tv/cn/716418802
-
-buled直播:
-https://app.blued.cn/live?id=Mp6G2R
-
-SOOP:
-https://play.sooplive.com/yoomingseo/293945591
-
-网易cc:
-https://cc.163.com/583946984
-
-千度热播:
-https://qiandurebo.com/web/video.php?roomnumber=33333
-
-PandaTV:
-https://www.pandalive.co.kr/live/play/bara0109
-
-猫耳FM:
-https://fm.missevan.com/live/868895007
-
-Look直播:
-https://look.163.com/live?id=65108820&position=3
-
-WinkTV:
-https://www.winktv.co.kr/live/play/anjer1004
-
-FlexTV/TTinglive:
-https://www.flextv.co.kr/channels/593127/live
-https://www.ttinglive.com/channels/593127/live
-
-PopkonTV:
-https://www.popkontv.com/live/view?castId=wjfal007&partnerCode=P-00117
-https://www.popkontv.com/channel/notices?mcid=wjfal007&mcPartnerCode=P-00117
-
-TwitCasting:
-https://twitcasting.tv/c:uonq
-
-百度直播:
-https://live.baidu.com/m/media/pclive/pchome/live.html?room_id=9175031377&tab_category
-
-微博直播:
-https://weibo.com/l/wblive/p/show/1022:2321325026370190442592
-
-酷狗直播:
-https://fanxing2.kugou.com/50428671?refer=2177&sourceFrom=
-
-TwitchTV:
-https://www.twitch.tv/gamerbee
-
-LiveMe:
-https://www.liveme.com/zh/v/17141543493018047815/index.html
-
-花椒直播:
-https://www.huajiao.com/l/345096174  (一次性地址，暂不支持循环监控)
-
-ShowRoom:
-https://www.showroom-live.com/room/profile?room_id=480206  (主播主页地址)
-
-Acfun:
-https://live.acfun.cn/live/179922
-
-映客直播:
-https://www.inke.cn/liveroom/index.html?uid=22954469&id=1720860391070904
-
-音播直播:
-https://live.ybw1666.com/800002949
-
-知乎直播:
-https://www.zhihu.com/theater/10687?drama_id=2037464603865642996  (直播间地址)
-
-CHZZK:
-https://chzzk.naver.com/live/458f6ec20b034f49e0fc6d03921646d2
-
-嗨秀直播:
-https://www.haixiutv.com/6095106
-
-VV星球直播:
-https://h5webcdn-pro.vvxqiu.com//activity/videoShare/videoShare.html?h5Server=https://h5p.vvxqiu.com&roomId=LP115924473&platformId=vvstar
-
-17Live:
-https://17.live/en/live/6302408
-
-浪Live:
-https://www.lang.live/en-US/room/3349463
-
-畅聊直播:
-https://live.tlclw.com/106188
-
-飘飘直播:
-https://m.pp.weimipopo.com/live/preview.html?uid=91648673&anchorUid=91625862&app=plpl
-
-六间房直播:
-https://v.6.cn/634435
-
-乐嗨直播:
-https://www.lehaitv.com/8059096
-
-花猫直播:
-https://h.catshow168.com/live/preview.html?uid=19066357&anchorUid=18895331
-
-Shopee:
-https://sg.shp.ee/GmpXeuf?uid=1006401066&session=802458
-
-Youtube(需配置cookie):
-https://www.youtube.com/watch?v=cS6zS5hi1w0
-
-淘宝:
-https://tbzb.taobao.com/live?liveSource=pc_live.discovery&liveId=563820798126  (一次性地址，暂不支持循环监控)
-
-京东:
-https://3.cn/28MLBy-E
-
-Faceit:
-https://www.faceit.com/zh/players/Compl1/stream
-
-连接直播:
-https://show.lailianjie.com/10000258
-
-咪咕直播:
-https://www.miguvideo.com/p/live/120000541321
-
-来秀直播:
-https://www.imkktv.com/h5/share/video.html?uid=1845195&roomId=1710496
-
-Picarto:
-https://www.picarto.tv/cuteavalanche
-
-心动热播：
-https://xcqrkj.com/web/video.php?roomnumber=10394232
-```
-
-## 📖文档
-
-如需完整文档和高级用法，请访问官方文档 [Wiki](https://github.com/ihmily/StreamCap/wiki/%E4%B8%BB%E9%A1%B5)
-
-## ❤️贡献者
-
-<a href="https://github.com/ihmily/StreamCap/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=ihmily/StreamCap" />
-</a>
-
-## 📜许可证
-
-StreamCap在Apache License 2.0下发布。有关详情，请参阅[LICENSE](./LICENSE)文件。
-
-## 🙏特别感谢
-
-特别感谢以下开源项目和技术的支持：
-
-- [flet](https://github.com/flet-dev/flet)
-- [FFmpeg](https://ffmpeg.org)
-- [streamget](https://github.com/ihmily/streamget)
-
-如果您有任何问题或建议，请随时通过GitHub Issues与我们联系。
+项目许可见 [LICENSE](LICENSE)，移植算法与依赖声明见 [第三方许可](desktop/THIRD_PARTY_NOTICES.md)。

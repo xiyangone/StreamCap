@@ -6,7 +6,23 @@ use serde_json::{json, Map, Value};
 use std::{cell::RefCell, rc::Rc};
 use wasm_bindgen::prelude::*;
 
-pub const GATEWAY_BASE: &str = "http://127.0.0.1:6059";
+/// The native shell supplies the actual bound address before WASM starts.
+fn gateway_base() -> String {
+    let value = js_sys::Reflect::get(&window(), &JsValue::from_str("__STREAMCAP_RUNTIME__"))
+        .ok()
+        .and_then(|runtime| js_sys::Reflect::get(&runtime, &JsValue::from_str("apiOrigin")).ok())
+        .and_then(|value| value.as_string())
+        .unwrap_or_default();
+    if let Ok(url) = web_sys::Url::new(&value) {
+        if url.protocol() == "http:"
+            && url.hostname() == "127.0.0.1"
+            && url.port().parse::<u16>().is_ok_and(|p| p > 0)
+        {
+            return url.origin();
+        }
+    }
+    String::new()
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -318,7 +334,11 @@ async fn call<T: DeserializeOwned>(
     path: &str,
     body: Option<Value>,
 ) -> Result<T, String> {
-    let url = format!("{GATEWAY_BASE}{path}");
+    let base = gateway_base();
+    if base.is_empty() {
+        return Err("原生运行配置未就绪，请从桌面程序启动".into());
+    }
+    let url = format!("{base}{path}");
     let abort = web_sys::AbortController::new().map_err(|_| "无法创建请求".to_string())?;
     let builder = match method {
         "POST" => Request::post(&url),
@@ -520,7 +540,11 @@ pub async fn delete_storage(path: &str) -> Result<(), String> {
     .map(|_| ())
 }
 pub fn video_url(path: &str) -> String {
-    format!("{GATEWAY_BASE}/api/videos?path={}", encode(path))
+    let base = gateway_base();
+    if base.is_empty() {
+        return String::new();
+    }
+    format!("{base}/api/videos?path={}", encode(path))
 }
 pub async fn fetch_recording_files(id: &str) -> Result<RecordingFiles, String> {
     call(
@@ -600,7 +624,11 @@ impl Drop for EventConnection {
     }
 }
 pub fn subscribe_events(state: AppState) -> Option<EventConnection> {
-    let source = web_sys::EventSource::new(&format!("{GATEWAY_BASE}/api/events")).ok()?;
+    let base = gateway_base();
+    if base.is_empty() {
+        return None;
+    }
+    let source = web_sys::EventSource::new(&format!("{base}/api/events")).ok()?;
     let retry_timer = Rc::new(RefCell::new(None::<gloo_timers::callback::Timeout>));
     let connected_timer = retry_timer.clone();
     let on_open = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {

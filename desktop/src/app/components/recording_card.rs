@@ -107,7 +107,7 @@ pub fn RecordingCard(
             </div>
             <div class="card-main">
                 <button class="card-name" title="查看录制信息" on:click=move |_| on_info.run(record.get_untracked())>{move || record.get().name()}</button>
-                <p class="card-subtitle" title=move || record.get().live_title.unwrap_or_default()>{move || record.get().live_title.filter(|s| !s.is_empty()).unwrap_or_else(|| if record.get().monitor_status { "等待直播开始，精彩不错过".into() } else { "监控已暂停".into() })}</p>
+                <p class="card-subtitle" title=move || record.get().live_title.unwrap_or_default()>{move || record.get().live_title.filter(|s| !s.is_empty()).unwrap_or_else(|| if record.get().monitor_status { "监控中，开播后自动录制".into() } else { "监控已暂停".into() })}</p>
             </div>
             <div class="card-meta"><div class="card-tags"><span>{move || quality_label(record.get().quality.as_deref())}</span><span>{move || format_label(record.get().record_format.as_deref())}</span>{move || record.get().segment_record.unwrap_or(false).then(|| view! { <span>"分段"</span> })}</div>
                 <span class="card-speed"><Show when=move || record.get().is_recording><Icon name="signal" size=13 /></Show>{move || record.get().speed.unwrap_or_else(|| "—".into())}</span>

@@ -1,8 +1,8 @@
+mod about;
 mod home;
 mod recordings;
 mod settings;
 mod storage;
-mod about;
 
 pub use about::AboutView;
 pub use home::HomeView;

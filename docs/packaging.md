@@ -1,236 +1,42 @@
-# StreamCap 打包说明
+# 原生 noFF 打包与验收
 
-本文档说明如何使用 PyInstaller 打包 StreamCap 桌面应用，以及如何准备可选的内置 FFmpeg / Node.js。
+## 唯一发布路径
 
-## 环境要求
+当前只交付 Windows x64 的 StreamCap.exe。它内嵌前端和默认配置，不内嵌 Python、Node、FFmpeg、用户设置、账号或录制文件。运行依赖系统 WebView2；实际录制仍需要 FFmpeg。
 
-- 使用目标平台本机打包：
-  - macOS 包必须在 macOS 上打。
-  - Windows 包必须在 Windows 上打。
-- PyInstaller 不支持用 macOS 直接交叉打 Windows 包，反过来也一样。
-- 先安装项目依赖，确保当前 Python 环境可以正常运行 StreamCap。
+所有命令从 desktop 目录执行。工具安装步骤见仓库 README。首次构建先用 cargo fetch --locked 为前端、core 和 src-tauri 三个 manifest 准备依赖；正式构建使用锁文件和离线模式。
 
-## 一键打包
-
-在项目根目录执行：
-
-```bash
-python scripts/build.py
+```powershell
+npm run verify
 ```
 
-脚本会自动：
+统一验收脚本执行 Rust 格式/Clippy/测试、WASM 构建、UI 与布局回归、原生 EXE 的关闭和托盘 smoke，并写入新的测试证据目录。任一必要检查失败会返回非零，不发布成功报告。
 
-- 准备 Flet desktop 运行资源。
-- 打包 `config` 下的 `default_settings.json`、`language.json`、`version.json`，以及 `locales`、`assets`。
-- 打包 `streamget` 的数据文件。
-- 如果存在内置 FFmpeg / Node.js，则一起打包。
-- macOS 下隐藏外层 PyInstaller Dock 图标，只显示一个 StreamCap 熊猫图标。
-
-> `config` 只打包上述三个随版本分发的默认配置，不能整目录打包。
-> 从源码运行时用户数据目录就是仓库根目录，程序会在 `config/` 下生成
-> `recordings.json`、`cookies.json`、`accounts.json`、`user_settings.json`、
-> `web_auth.json` 等用户数据。这些文件都已 gitignore，`git status` 看不出来，
-> 但整目录打包会把它们带进安装包，安装后覆盖使用者的真实配置。
-> `app/core/runtime/paths.py` 另有一层防御：这几个文件只要目标已存在就不覆盖。
-
-macOS 打包完成后产物为：
-
-```text
-dist/StreamCap.app
+```powershell
+pwsh -NoProfile -File .\scripts\build-release.ps1
 ```
 
-运行：
+仅构建时，脚本先调用同一个 build-frontend.ps1，再构建 Rust shell。直接运行 npm run tauri:build 也会通过 Tauri 的 beforeBuildCommand 重建前端。三个入口不依赖旧 dist。
 
-```bash
-open dist/StreamCap.app
-```
+输出目录为 desktop/src-tauri/target/native-noFF-时间戳/。已有 StreamCap.exe 不会被覆盖。交付文件是 StreamCap.exe 与 StreamCap.exe.sha256，不是安装器。
 
-Windows 打包完成后产物为：
+## 工具和依赖
 
-```text
-dist/StreamCap/
-├─ StreamCap.exe
-└─ _internal/
-   ├─ assets/
-   ├─ config/
-   ├─ locales/
-   └─ ...
-```
+- Rust 1.95.0、wasm32-unknown-unknown、MSVC C++ 工具与 Windows SDK。
+- Node.js 24/npm 用于 Tauri API 资源和 Playwright；不会随 EXE 启动 Node。
+- Trunk 0.21.14、wasm-bindgen-cli 0.2.128 安装在 desktop/target/tools。升级 wasm-bindgen 库时必须同步项目本地 CLI，构建时会检查版本。
+- Tauri 命令权限自动文件由 build.rs 生成，不手动维护；手写权限在 src-tauri/permissions/desktop.toml。
 
-Windows 使用 PyInstaller one-dir 结构：外层保留 `StreamCap.exe` 作为用户入口，运行依赖、资源文件和 DLL 放在 `_internal` 目录中。
+## 验收隔离
 
-GitHub Actions 会自动把上传的 artifact 打成 zip，因此工作流直接上传 `dist` 下的应用目录，不再预先生成内层 zip。下载 `StreamCap-windows.zip` 后解压一次即可得到 `StreamCap` 文件夹。
+native-smoke.ps1 只接受项目 src-tauri/target 内的构建产物，使用新建的数据目录、随机 API/CDP 端口和自己的 WebView2 profile，不启动已部署的程序。源码测试使用模拟平台，本流程不重新扫码或访问真实直播间。
 
-## macOS 架构
+验证产物写入 desktop/tests/artifacts。保留 result.json、日志及最终截图；不能把用户目录当成测试临时目录。回收站测试仅使用新建夹具，回收失败验证必须确认原文件仍存在。
 
-默认按当前 Python 环境和系统架构打包。Apple Silicon 机器通常会打出 arm64 包。
+## 用户数据保护
 
-可显式指定：
+默认用户目录为 %APPDATA%\StreamCap，下载路径由用户配置决定。--data-dir 可以显式指定独立数据目录；--api-port 可以指定本地端口，前端地址由原生启动配置注入。
 
-```bash
-python scripts/build.py --target-arch arm64
-```
+不得整目录打包根 config、用户 profile、下载目录或旧备份。编译使用的默认配置只有 config/default_settings.json、config/language.json、config/version.json；保持既有任务与 Cookie 的持久化契约。不要清空系统 WebView2 数据，也不要因发布 noFF 而移除用户已有 FFmpeg。
 
-不建议随意使用 `universal2`。如果 Python 或第三方 `.so` 依赖不是 universal2，PyInstaller 会报 `is not a fat binary`。
-
-## 内置 FFmpeg
-
-如果希望打包时携带 FFmpeg，先执行：
-
-```bash
-python scripts/download_ffmpeg.py
-```
-
-下载当前平台。下载两个平台：
-
-```bash
-python scripts/download_ffmpeg.py --platform all
-```
-
-文件会保存到：
-
-```text
-vendor/ffmpeg/macos/ffmpeg
-vendor/ffmpeg/windows/ffmpeg.exe
-```
-
-脚本只提取 `ffmpeg` / `ffmpeg.exe`，不会保留 `ffplay`、`ffprobe`。
-
-打包时 `scripts/build.py` 会自动检测这些文件；存在则打进包里。若不想打包 FFmpeg：
-
-```bash
-python scripts/build.py --no-bundle-ffmpeg
-```
-
-运行时逻辑：
-
-- 如果系统 `PATH` 中已经有 `ffmpeg`，不会复制内置版本。
-- 如果系统没有 `ffmpeg`，且包内带了 FFmpeg，则复制到用户数据目录。
-
-目标位置：
-
-```text
-macOS:   ~/Library/Application Support/StreamCap/ffmpeg/ffmpeg
-Windows: %APPDATA%\StreamCap\ffmpeg\ffmpeg.exe
-```
-
-## 内置 Node.js
-
-如果希望打包时携带 Node.js，先执行：
-
-```bash
-python scripts/download_nodejs.py
-```
-
-下载当前平台。下载两个平台：
-
-```bash
-python scripts/download_nodejs.py --platform all
-```
-
-指定版本：
-
-```bash
-python scripts/download_nodejs.py --version 22.12.0
-```
-
-文件会保存到：
-
-```text
-vendor/node/macos/node
-vendor/node/windows/node.exe
-```
-
-脚本只提取 `node` / `node.exe`，不会保留 `npm`、`npx`、headers 或 docs。
-
-打包时 `scripts/build.py` 会自动检测这些文件；存在则打进包里。若不想打包 Node.js：
-
-```bash
-python scripts/build.py --no-bundle-node
-```
-
-运行时逻辑：
-
-- 如果系统 `PATH` 中已经有 `node`，不会复制内置版本。
-- 如果系统没有 `node`，且包内带了 Node.js，则复制到用户数据目录。
-- 如果包内也没有 Node.js，首次启动时 `InstallationManager` 会弹窗，
-  由 `app/scripts/node_install.py` 从 npmmirror 下载并解压，带进度提示。
-
-目标位置：
-
-```text
-macOS:   ~/Library/Application Support/StreamCap/node/node
-Windows: %APPDATA%\StreamCap\node\node.exe
-```
-
-> Node.js 只有 streamget 的 douyin / haixiu / liveme / migu 四个平台需要
-> （用 execjs 执行 JS 签名）。Windows 下 `node.exe` 约 89MB，占包体近三成，
-> 因此可按需用 `--no-bundle-node` 排除，交给运行时下载。
-
-## macOS Flet 说明
-
-StreamCap 使用 Flet 桌面模式。macOS 下 Flet 会使用 `Flet.app` 作为真正的窗口进程。
-
-本项目打包后做了以下处理：
-
-- 外层 `StreamCap.app` 作为后台 agent，不显示 Dock 图标。
-- Flet 官方缓存不会被直接修改。
-- 首次运行时会创建 StreamCap 专属 Flet 副本：
-
-```text
-~/Library/Application Support/StreamCap/flet_client/<版本>/StreamCap Flet.app
-```
-
-- 专属 Flet 副本会替换为 StreamCap 熊猫图标。
-
-因此正常情况下 Dock 只显示一个熊猫图标。
-
-如果升级 Flet 或图标后 macOS 仍显示旧图标，可以删除专属 Flet 缓存并重启 Dock：
-
-```bash
-rm -rf "$HOME/Library/Application Support/StreamCap/flet_client"
-killall Dock
-open dist/StreamCap.app
-```
-
-## 用户数据目录
-
-打包运行时，配置、日志、FFmpeg、Node.js 等可变数据不会写入应用包或安装目录。
-
-位置：
-
-```text
-macOS:   ~/Library/Application Support/StreamCap
-Windows: %APPDATA%\StreamCap
-```
-
-Windows 默认录制保存目录为 `StreamCap.exe` 同级目录下的 `downloads`，避免大文件写入 C 盘用户数据目录。用户在设置页手动选择保存目录后，以用户设置为准。
-
-源码运行时仍使用项目目录，方便开发调试。
-
-## 常用命令
-
-准备可选内置依赖：
-
-```bash
-python scripts/download_ffmpeg.py --platform all
-python scripts/download_nodejs.py --platform all
-```
-
-打包：
-
-```bash
-python scripts/build.py
-```
-
-强制重新下载 Flet desktop 资源：
-
-```bash
-python scripts/build.py --refresh-flet
-```
-
-只打包应用，不内置 FFmpeg / Node.js：
-
-```bash
-python scripts/build.py --no-bundle-ffmpeg --no-bundle-node
-```
+向现有安装位置替换 EXE、提交 Git 或推送不属于构建脚本行为。

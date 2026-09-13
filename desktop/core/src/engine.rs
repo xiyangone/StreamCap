@@ -386,6 +386,7 @@ pub fn with_segment_suffix(save_path: &str, format: &str, segment: bool) -> Stri
 /// 运行中的录制进程句柄。
 pub struct RecorderProcess {
     pub rec_id: String,
+    pub output_path: PathBuf,
     child: Arc<Mutex<Child>>,
 }
 
@@ -444,11 +445,24 @@ pub struct Engine {
     closing: Arc<std::sync::atomic::AtomicBool>,
     active: Arc<Mutex<HashMap<String, Arc<RecorderProcess>>>>,
     log_tasks: tokio_util::task::TaskTracker,
+    filesystem: Arc<Mutex<()>>,
 }
 
 impl Engine {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A recycle operation holds this guard until the OS operation finishes.
+    pub async fn filesystem_guard(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.filesystem.clone().lock_owned().await
+    }
+    pub async fn protects_path(&self, target: &Path) -> bool {
+        self.active
+            .lock()
+            .await
+            .values()
+            .any(|process| output_is_protected(&process.output_path, target))
     }
 
     pub fn begin_shutdown(&self) {
@@ -507,6 +521,7 @@ impl Engine {
         if !SUPPORTED_RECORD_FORMATS.contains(&options.format.to_ascii_uppercase().as_str()) {
             return Err("此录制格式尚未迁移到原生版".into());
         }
+        let _filesystem = self.filesystem_guard().await;
         let mut active = self.active.lock().await;
         if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
             return Err("录制引擎正在关闭".into());
@@ -547,8 +562,16 @@ impl Engine {
             });
         }
 
+        let output = Path::new(&options.save_path);
+        let output_path = output
+            .parent()
+            .ok_or("输出目录无效")?
+            .canonicalize()
+            .map_err(|e| e.to_string())?
+            .join(output.file_name().ok_or("输出文件名无效")?);
         let process = Arc::new(RecorderProcess {
             rec_id: rec_id.to_string(),
+            output_path,
             child: Arc::new(Mutex::new(child)),
         });
         active.insert(rec_id.to_string(), process.clone());
@@ -578,6 +601,27 @@ impl Engine {
     }
 }
 
+fn output_is_protected(output: &Path, target: &Path) -> bool {
+    if output.starts_with(target) {
+        return true;
+    }
+    let Some(parent) = output.parent() else {
+        return true;
+    };
+    if target.parent() != Some(parent) {
+        return false;
+    }
+    let pattern = output.file_name().unwrap_or_default().to_string_lossy();
+    let name = target.file_name().unwrap_or_default().to_string_lossy();
+    if let Some((prefix, suffix)) = pattern.split_once("%03d") {
+        name.strip_prefix(prefix)
+            .and_then(|s| s.strip_suffix(suffix))
+            .is_some_and(|s| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit()))
+    } else {
+        target == output
+    }
+}
+
 fn redact_stream_url(message: &str) -> String {
     static URL: std::sync::LazyLock<regex::Regex> =
         std::sync::LazyLock::new(|| regex::Regex::new(r"https?://\S+").expect("static regex"));
@@ -587,6 +631,34 @@ fn redact_stream_url(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn protects_active_output_patterns_and_ancestors_not_other_files() {
+        let root = Path::new("recordings/author");
+        let pattern = root.join("session_%03d.ts");
+        for target in [
+            root.to_owned(),
+            PathBuf::from("recordings"),
+            root.join("session_001.ts"),
+            root.join("session_1000.ts"),
+        ] {
+            assert!(output_is_protected(&pattern, &target));
+        }
+        for target in [
+            root.join("old.ts"),
+            root.join("session_x.ts"),
+            PathBuf::from("other/session_001.ts"),
+        ] {
+            assert!(!output_is_protected(&pattern, &target));
+        }
+        assert!(output_is_protected(
+            &root.join("one.mp4"),
+            &root.join("one.mp4")
+        ));
+        assert!(!output_is_protected(
+            &root.join("one.mp4"),
+            &root.join("two.mp4")
+        ));
+    }
 
     fn base_options(format: &str) -> RecordOptions {
         RecordOptions {

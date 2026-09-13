@@ -1,117 +1,84 @@
-name: Build Desktop Apps
-
+name: Build native noFF EXE
 on:
   workflow_dispatch:
-    inputs:
-      build_windows:
-        description: Build the Windows package
-        type: boolean
-        default: true
-      build_macos:
-        description: Build the macOS package
-        type: boolean
-        default: true
-      refresh_flet:
-        description: Re-download the Flet desktop archive
-        type: boolean
-        default: false
-
 permissions:
   contents: read
-
-concurrency:
-  group: build-desktop-${{ github.ref }}
-  cancel-in-progress: false
-
+env:
+  PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/desktop/target/playwright
 jobs:
-  build-windows:
-    name: Build Windows
-    if: ${{ inputs.build_windows }}
+  native:
     runs-on: windows-latest
-
+    timeout-minutes: 45
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
-          cache: pip
-          cache-dependency-path: requirements.txt
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyinstaller
-
-      - name: Prepare bundled FFmpeg
-        run: python scripts/download_ffmpeg.py --platform windows
-
-      - name: Prepare bundled Node.js
-        run: python scripts/download_nodejs.py --platform windows --windows-arch x64
-
-      - name: Build app
-        run: |
-          $buildArgs = @("--platform", "windows")
-          if ("${{ inputs.refresh_flet }}" -eq "true") {
-            $buildArgs += "--refresh-flet"
-          }
-          python scripts/build.py @buildArgs
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: StreamCap-windows
-          path: dist/*
-          if-no-files-found: error
-
-  build-macos:
-    name: Build macOS
-    if: ${{ inputs.build_macos }}
-    runs-on: macos-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
-          cache: pip
-          cache-dependency-path: requirements.txt
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyinstaller
-
-      - name: Prepare bundled FFmpeg
-        run: python scripts/download_ffmpeg.py --platform macos
-
-      - name: Prepare bundled Node.js
-        run: python scripts/download_nodejs.py --platform macos
-
-      - name: Build app
-        run: |
-          REFRESH_ARG=""
-          if [ "${{ inputs.refresh_flet }}" = "true" ]; then
-            REFRESH_ARG="--refresh-flet"
-          fi
-          python scripts/build.py --platform macos $REFRESH_ARG
-
-      - name: Package dmg
-        run: |
-          python -c "from pathlib import Path; path = Path('scripts/create_macos_dmg.sh'); path.write_bytes(path.read_bytes().replace(b'\r\n', b'\n'))"
-          bash -n scripts/create_macos_dmg.sh
-          bash scripts/create_macos_dmg.sh "dist/StreamCap.app" "dist/StreamCap-macos.dmg"
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: StreamCap-macos
-          path: dist/StreamCap-macos.dmg
-          if-no-files-found: error
+    - uses: actions/checkout@v7.0.1
+    - uses: actions/setup-node@v7.0.0
+      with:
+        node-version: "24"
+    - uses: actions/cache@v6.1.0
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          desktop/target
+          desktop/core/target
+          desktop/src-tauri/target
+          desktop/build/npm-cache
+        key: native-${{ runner.os }}-rust195-${{ hashFiles('desktop/**/Cargo.lock', 'desktop/package-lock.json') }}
+        restore-keys: native-${{ runner.os }}-rust195-
+    - name: Install Rust toolchain and project tools
+      shell: pwsh
+      working-directory: desktop
+      run: |
+        $ErrorActionPreference = "Stop"
+        rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy --target wasm32-unknown-unknown
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        rustup default 1.95.0
+        cargo install trunk --version 0.21.14 --locked --root target/tools
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        cargo install wasm-bindgen-cli --version 0.2.128 --locked --root target/tools
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+    - name: Restore locked dependencies
+      shell: pwsh
+      working-directory: desktop
+      run: |
+        npm ci --cache build/npm-cache
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        npx playwright install chromium
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        foreach ($manifest in @("Cargo.toml", "core/Cargo.toml", "src-tauri/Cargo.toml")) {
+          cargo fetch --manifest-path $manifest --locked
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        }
+    - name: Prepare FFmpeg test tools
+      shell: pwsh
+      run: |
+        if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
+          choco install ffmpeg -y --no-progress
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        }
+    - name: Full native verification and noFF build
+      id: verify
+      shell: pwsh
+      working-directory: desktop
+      run: npm run verify
+    - name: Upload verification evidence
+      if: always()
+      uses: actions/upload-artifact@v7.0.1
+      with:
+        name: native-verification
+        path: |
+          desktop/tests/artifacts/**/verification.json
+          desktop/tests/artifacts/**/result.json
+          desktop/tests/artifacts/**/ui-result.json
+          desktop/tests/artifacts/**/*.log
+          desktop/tests/artifacts/**/*.png
+        retention-days: 14
+        if-no-files-found: warn
+    - name: Upload verified executable
+      uses: actions/upload-artifact@v7.0.1
+      with:
+        name: StreamCap-windows-x64-noFF
+        path: |
+          ${{ steps.verify.outputs.release-directory }}/StreamCap.exe
+          ${{ steps.verify.outputs.release-directory }}/StreamCap.exe.sha256
+        if-no-files-found: error

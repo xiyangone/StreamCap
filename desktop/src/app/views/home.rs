@@ -37,25 +37,25 @@ pub fn HomeView() -> impl IntoView {
     };
     view! {
         <div class="page home-page">
-            <header class="page-header"><div><span class="eyebrow">"WORKSPACE OVERVIEW"</span><h1>"录制工作台"</h1><p>"从直播到珍藏，把每一个精彩瞬间留下。"</p></div><button class="button primary" on:click=move |_| add.set(true)><Icon name="plus" size=18 />"添加直播间"</button></header>
+            <header class="page-header"><div><h1>"录制工作台"</h1><p>"查看监控、录制和本地文件。"</p></div><button class="button primary" on:click=move |_| add.set(true)><Icon name="plus" size=18 />"添加直播间"</button></header>
             <div class="stats-strip glass">
                 <div class="stat-item"><span class="stat-icon blue"><Icon name="video" /></span><div><span class="stat-label">"全部直播间"</span><strong>{move || state.recordings.get().len()}</strong></div></div>
                 <div class="stat-item"><span class="stat-icon green"><Icon name="signal" /></span><div><span class="stat-label">"正在录制"</span><strong>{active}<small>"路"</small></strong></div></div>
-                <div class="stat-item"><span class="stat-icon cyan"><Icon name="eye" /></span><div><span class="stat-label">"等待开播"</span><strong>{waiting}</strong></div></div>
+                <div class="stat-item"><span class="stat-icon cyan"><Icon name="eye" /></span><div><span class="stat-label">"监控中"</span><strong>{waiting}</strong></div></div>
                 <div class="stat-item"><span class="stat-icon muted"><Icon name="pause" /></span><div><span class="stat-label">"暂停监控"</span><strong>{paused}</strong></div></div>
             </div>
             <div class="overview-grid">
                 <section class="capture-panel glass">
-                    <div class="capture-copy"><span class="live-label"><i class="status-dot" />"CAPTURE YOUR MOMENTS"</span>
-                        <h2>{move || if active() > 0 { format!("{} 路直播，正在记录", active()) } else { "下一份精彩，随时就绪".into() }}</h2>
+                    <div class="capture-copy"><span class="live-label"><i class="status-dot" />"录制概况"</span>
+                        <h2>{move || if active() > 0 { format!("{} 路直播，正在记录", active()) } else { "当前没有正在录制的任务".into() }}</h2>
                         <p>{move || if active() > 0 { "录制在本地持续进行，你可以随时查看状态和文件。" } else { "添加直播间并开启监控，开播时自动开始录制。" }}</p>
                         <a class="button subtle" href="/recordings">"查看录制任务"<Icon name="arrow" size=16 /></a>
                     </div>
                     <div class="capture-art" aria-hidden="true" class:active=move || { active() > 0 }><div class="orbit orbit-outer" /><div class="orbit orbit-inner" /><div class="record-disc"><span /></div><span class="art-chip chip-video"><Icon name="video" size=19 /></span><span class="art-chip chip-wave"><i /><i /><i /><i /><i /></span></div>
                 </section>
-                <section class="health-panel glass"><div class="section-heading compact"><h2>"工作空间状态"</h2><span class="live-mini">"LIVE"</span></div>
+                <section class="health-panel glass"><div class="section-heading compact"><h2>"应用状态"</h2></div>
                     <div class="health-row"><span><Icon name="monitor" size=17 />"本地服务"</span><strong class:healthy=move || state.status.get().ok>{move || if state.status.get().ok { "已连接" } else { "未连接" }}</strong></div>
-                    <div class="health-row"><span><Icon name="link" size=17 />"平台解析"</span><strong class:healthy=move || state.status.get().resolver_ready class:unhealthy=move || !state.status.get().resolver_ready>{move || if state.status.get().resolver_ready { "已就绪" } else { "不可用" }}</strong></div>
+                    <div class="health-row"><span><Icon name="link" size=17 />"解析组件"</span><strong class:healthy=move || state.status.get().resolver_ready class:unhealthy=move || !state.status.get().resolver_ready>{move || if state.status.get().resolver_ready { "已就绪" } else { "不可用" }}</strong></div>
                     <div class="health-divider" />
                     <a class="preference-summary" href="/settings"><span class="preference-icon"><Icon name="settings" size=20 /></span><div><small>"默认录制偏好"</small><strong>{move || format!("{} · {}", quality_label(Some(&state.setting("record_quality", "OD"))), format_label(Some(&state.setting("video_format", "TS"))))}</strong></div><Icon name="chevron" size=15 /></a>
                 </section>

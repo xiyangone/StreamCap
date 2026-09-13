@@ -1,87 +1,33 @@
-name: 🐛 (English)Bug report
-description: Create a bug report to help improve the project.
-title: 🐛[BUG] Please enter a title
-labels: bug
+name: "Native bug report"
+description: "Windows x64 Rust/Tauri edition"
 body:
-  - type: markdown
+  - type: input
+    id: version
     attributes:
-      value: |
-        📝 **Please fill in a concise and clear title in the `title` above**, the format is suggested as: 🐛[Bug] Short description.
-        For example: 🐛[Bug] Unable to record certain TikTok live rooms.
-  - type: checkboxes
-    attributes:
-      label: ⚠️ Confirm if similar issues exist
-      description: >
-        🔍 [Click here to search historical issues](https://github.com/ihmily/StreamCap/issues?q=is%3Aissue)  
-        Please make sure your issue hasn't been reported before.
-      options:
-        - label: I have searched the issues and found no similar problems
-          required: true
-  - type: dropdown
-    attributes:
-      label: 🔧 How did you run the program?
-      description: Please select how you ran the program.
-      options:
-        - Directly running the exe file
-        - Running with source code
+      label: "App version or build commit"
     validations:
       required: true
   - type: dropdown
+    id: operating-system
     attributes:
-      label: 🐍 If running with source code, please select your Python environment version
-      description: Please select the Python version you used to run the program.
-      options:
-        - Python 3.10
-        - Python 3.11
-        - Python 3.12
-        - Python 3.13
-        - Other (please specify in the issue)
+      label: "Windows version"
+      options: ["Windows 10 x64", "Windows 11 x64"]
     validations:
-      required: false
+      required: true
   - type: dropdown
+    id: launch
     attributes:
-      label: 💻 Please select your system environment
-      description: Please select the specific system version you are running the program on.
-      options:
-        - Windows 10
-        - Windows 11
-        - macOS (Intel)
-        - macOS (Apple Silicon)
-        - Other (please specify in the issue)
-    validations:
-      required: true
-  - type: checkboxes
-    attributes:
-      label: ⚠️ Confirm if you have retried multiple times
-      description: >
-        Sometimes it might be due to your device or network issues.
-      options:
-        - label: I have tried multiple times and still encounter the problem
-          required: true
+      label: "How was the app launched?"
+      options: ["noFF EXE", "Tauri development build"]
   - type: textarea
+    id: description
     attributes:
-      label: 🕹 Reproduction steps
-      description: |
-        **⚠️ Issues that cannot be reproduced will be closed.**
-        Please fill in according to the following format:
-        1. The live room address I tried to record is...
-        2. The recording format I used is...
-        3. ...
-      placeholder: |
-        1. ...
-        2. ...
-        3. ...
+      label: "Description and reproduction"
+      description: "Include expected and actual behavior. Never post cookies, tokens or account credentials."
     validations:
       required: true
   - type: textarea
+    id: environment
     attributes:
-      label: 😯 Problem description
-      description: Describe the problem in detail or provide relevant screenshots.
-    validations:
-      required: true
-  - type: textarea
-    attributes:
-      label: 📜 Error information
-      description: If available, please paste the relevant log error information or screenshots.
-    validations:
-      required: false
+      label: "Relevant environment and sanitized logs"
+      description: "WebView2/FFmpeg versions; for source builds include Rust, Node and Trunk versions."
