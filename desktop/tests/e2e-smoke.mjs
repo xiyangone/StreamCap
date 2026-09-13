@@ -22,7 +22,7 @@ try {
   await step('真实 WASM 启动、初始任务与 SSE 连接', async () => {
     await go(page, h.base, '/home');
     await waitState(() => page.locator('.recording-card').count(), (n) => n === 6, '初始任务数量');
-    await visible(page.getByText('实时同步', { exact: true }));
+    await visible(page.getByText('本地实时更新', { exact: true }));
     const layout = await inspectLayout(page);
     assert.equal(layout.dialogs, 0); assert.ok(layout.glass.includes('blur'));
     await h.shot('01-home-light');
@@ -146,12 +146,13 @@ try {
     await hidden(page.locator('.settings-savebar'));
   });
   await step('系统主题随系统实时变化，强调色与持久化', async () => {
-    await page.getByRole('button', { name: '外观', exact: true }).click();
+    await page.getByRole('button', { name: '外观与窗口', exact: true }).click();
     await page.getByRole('button', { name: '跟随系统', exact: true }).click();
     await waitState(() => state.userConfig.theme_mode, (v) => v === 'system', '主题保存');
     await page.emulateMedia({ colorScheme: 'dark' });
     await waitTheme(page, 'dark');
     await visible(page.getByRole('button', { name: '切换到浅色' }));
+    assert.equal(await page.evaluate(()=>typeof window.__TAURI__), 'undefined');
     await page.getByRole('button', { name: '鸢尾紫' }).click();
     await page.waitForFunction(() => document.documentElement.dataset.accent === 'purple');
     await h.shot('08-settings-dark-purple');
@@ -160,6 +161,31 @@ try {
     await page.getByRole('button', { name: '晴空蓝' }).click();
     await page.getByRole('button', { name: '浅色', exact: true }).click();
     await waitState(() => state.userConfig.theme_mode, (v) => v === 'light', '浅色恢复');
+  });
+  await step('窗口一体化、原生按钮、关闭取消与托盘偏好',async()=>{
+    const bounds=await page.locator('.app-shell').boundingBox();assert.equal(bounds.x,0);assert.equal(bounds.y,0);
+    assert.equal(await page.locator('.sidebar').evaluate(el=>getComputedStyle(el).borderRadius),'0px');
+    assert.equal(await page.locator('.device-avatar').count(),0);
+    assert.equal(await page.getByRole('group',{name:'窗口控制'}).getByRole('button').count(),3);
+    await page.getByRole('button',{name:'最大化窗口',exact:true}).click();await visible(page.getByRole('button',{name:'还原窗口',exact:true}));
+    await page.getByRole('button',{name:'还原窗口',exact:true}).click();await visible(page.getByRole('button',{name:'最大化窗口',exact:true}));
+    await page.getByRole('button',{name:'最小化窗口',exact:true}).click();await waitState(()=>state.native.minimized,Boolean,'原生最小化调用');await h.restoreNative();
+    await navigate('偏好设置');await page.getByRole('button',{name:'外观与窗口',exact:true}).click();
+    const preference=page.getByRole('combobox',{name:'关闭窗口时',exact:true});await visible(preference);assert.equal(await preference.inputValue(),'ask');
+    assert.equal(await page.locator('.titlebar-drag-zone').getAttribute('data-tauri-drag-region'),'deep');
+    const close=dialog('关闭 StreamCap');await page.getByRole('button',{name:'关闭窗口',exact:true}).click();await visible(close);
+    await page.reload({waitUntil:'domcontentloaded'});await visible(close);
+    await close.getByRole('button',{name:'取消',exact:true}).click();await hidden(close);assert.equal(state.native.closing,false);assert.equal(state.native.visible,true);
+    await page.getByRole('button',{name:'外观与窗口',exact:true}).click();
+    await page.getByRole('button',{name:'关闭窗口',exact:true}).click();await visible(close);await page.keyboard.press('Escape');await hidden(close);assert.equal(state.native.closing,false);
+    await page.getByRole('button',{name:'关闭窗口',exact:true}).click();await visible(close);await close.getByRole('checkbox',{name:'记住我的选择'}).check();state.native.failRemember=true;
+    await close.getByRole('button',{name:/最小化到托盘/}).click();await visible(close.getByRole('alert'));assert.equal(state.native.visible,true);assert.equal(state.userConfig.close_action,undefined);
+    await close.getByRole('button',{name:/最小化到托盘/}).click();await hidden(close);assert.equal(state.native.visible,false);assert.equal(state.native.closing,false);assert.equal(state.userConfig.close_action,'tray');
+    await h.restoreNative();await page.getByRole('button',{name:'关闭窗口',exact:true}).click();await waitState(()=>state.native.visible,v=>!v,'记住托盘后直接隐藏');await hidden(close);await h.restoreNative();
+    await preference.selectOption('ask');await waitState(()=>state.userConfig.close_action,v=>v==='ask','恢复每次询问');
+    state.native.trayAvailable=false;await page.getByRole('button',{name:'关闭窗口',exact:true}).click();await visible(close);assert.equal(await close.getByRole('button',{name:/最小化到托盘/}).isDisabled(),true);
+    await close.getByRole('button',{name:'取消',exact:true}).click();await hidden(close);state.native.trayAvailable=true;
+    await h.shot('window-preferences');
   });
   await step('登录信息按平台局部保存，扫码仅在隔离服务模拟', async () => {
     await page.getByRole('button', { name: '平台登录', exact: true }).click();
@@ -178,12 +204,34 @@ try {
     await visible(modal.getByText('二维码有效期：120 秒', { exact: true }));
     await modal.getByRole('button', { name: '关闭', exact: true }).click(); await hidden(modal);
     await waitState(() => state.qrCancelled, (n) => n >= 1, '关闭取消模拟扫码');
-    state.qrPhase = 'success';
+    state.qrPhase = 'scanned';
     await page.getByRole('button', { name: '扫码登录' }).click();
-    await waitState(() => input.inputValue(), (v) => v === 'fixture-qr-not-a-credential', '模拟扫码结果填入');
-    assert.equal(state.cookies.kuaishou, undefined, '扫码结果不应自动持久化');
-    await page.getByRole('button', { name: '保存登录信息' }).click();
-    await waitState(() => state.cookies.kuaishou, (v) => v === 'fixture-qr-not-a-credential', '明确保存模拟扫码结果');
+    await visible(modal.getByText('等待手机确认', { exact: true }));
+    assert.equal(await modal.getByRole('img', {name:'快手登录二维码'}).count(),0);
+    state.qrPhase = 'verifying';
+    await visible(modal.getByText('手机已确认', { exact: true }));
+    state.qrPhase = 'error';
+    await visible(modal.getByText('登录未完成', { exact: true }));
+    await visible(modal.getByText(/手机已确认，但直播站未返回/));
+    assert.equal(await modal.getByRole('img', {name:'快手登录二维码'}).count(),0);
+    assert.equal(await modal.getByRole('button', {name:'保存登录信息'}).count(),0);
+    assert.equal(state.cookies.kuaishou,undefined);
+    await h.shot('qr-verification-failure');
+    state.qrPhase = 'success';
+    await modal.getByRole('button', { name: '重新获取' }).click();
+    await visible(modal.getByText('已验证账号：测试快手账号', { exact: true }));
+    assert.equal(state.cookies.kuaishou, undefined, '验证成功也必须等待明确保存');
+    await visible(modal.getByText('登录信息尚未保存，点击下方按钮完成登录。',{exact:true}));
+    assert.equal(await modal.locator('.qr-code-container').count(),0,'终态不保留二维码边框');
+    h.failNext('PUT','/api/cookies','模拟登录信息保存失败',500);
+    await modal.getByRole('button',{name:'保存登录信息',exact:true}).click();
+    await visible(modal.getByRole('alert'));assert.equal(state.cookies.kuaishou,undefined);
+    await modal.getByRole('button',{name:'保存登录信息',exact:true}).click();
+    await hidden(modal);
+    await waitState(() => state.cookies.kuaishou, (v) => v === 'fixture-qr-not-a-credential', '弹窗中明确保存模拟扫码结果');
+    assert.equal(state.cookies.bilibili,untouched);
+    await visible(page.locator('.account-status'));
+    await h.shot('qr-account-saved');
   });
   await step('未实现能力明确禁用，不显示假开关', async () => {
     await page.getByRole('button', { name: '自动化与通知', exact: true }).click();
@@ -245,12 +293,12 @@ try {
     await visible(page.getByRole('button', { name: /^录制说明.txt/ }));
   });
   await step('媒体库删除只修改模拟目录并要求确认', async () => {
-    await page.getByRole('button', { name: '删除录制说明.txt', exact: true }).click();
-    const modal = dialog('永久删除文件'); await visible(modal);
+    await page.getByRole('button', { name: '回收录制说明.txt', exact: true }).click();
+    const modal = dialog('移至回收站'); await visible(modal);
     await modal.getByRole('button', { name: '取消', exact: true }).click();
     assert.ok(state.files.some((f) => f.name === '录制说明.txt'));
-    await page.getByRole('button', { name: '删除录制说明.txt', exact: true }).click();
-    await modal.getByRole('button', { name: '确认删除' }).click(); await hidden(modal);
+    await page.getByRole('button', { name: '回收录制说明.txt', exact: true }).click();
+    await modal.getByRole('button', { name: '移至回收站' }).click(); await hidden(modal);
     await waitState(() => state.files.some((f) => f.name === '录制说明.txt'), (v) => !v, '模拟文件删除');
   });
   await step('异步预览期间切页，不访问已销毁信号', async () => {
@@ -271,7 +319,7 @@ try {
     assert.equal(await page.locator('.recording-card').count(), Math.min(count, 6));
     h.setOffline(false); state.resolverReady = true;
     await hidden(page.locator('.connection-banner'));
-    await visible(page.getByText('实时同步', { exact: true }));
+    await visible(page.getByText('本地实时更新', { exact: true }));
     assert.equal(state.recordings.length, count);
   });
   await step('SSE 更新直接反映在现有卡片', async () => {
@@ -286,6 +334,10 @@ try {
     assert.equal(await page.locator('.skeleton-grid').count(), 0);
     await hidden(page.locator('.connection-banner'));
     await waitState(() => page.locator('.recording-card').count(), (n) => n === Math.min(state.recordings.length, 6), '列表失败自动重试后恢复');
+  });
+  await step('明确退出而非托盘时显示收尾状态',async()=>{
+    await page.getByRole('button',{name:'关闭窗口',exact:true}).click();const close=dialog('关闭 StreamCap');await visible(close);
+    await close.getByRole('button',{name:/退出应用/}).click();await hidden(close);await visible(page.getByText('正在安全退出',{exact:true}));assert.equal(state.native.closing,true);
   });
   await step('最终安全检查：无真实网络、未处理请求或浏览器异常', async () => {
     assert.deepEqual(h.blocked, []); assert.deepEqual(state.unexpected, []); assert.deepEqual(h.runtimeErrors, []);

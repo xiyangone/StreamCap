@@ -1,223 +1,23 @@
-# StreamCap Packaging Guide
+# Native noFF packaging and verification
 
-This document explains how to package the StreamCap desktop app with PyInstaller and how to prepare optional bundled FFmpeg / Node.js executables.
+The only current release target is a Windows x64 StreamCap.exe. It embeds frontend assets and shipped defaults, not Python, Node, FFmpeg or user data. WebView2 is a system runtime; recording uses an existing FFmpeg installation.
 
-## Requirements
+From desktop, run npm run verify for the complete verification/build pipeline, or pwsh -NoProfile -File scripts/build-release.ps1 for a build only. The release script, npm build and the Tauri build hook share build-frontend.ps1, so they cannot silently package stale frontend assets.
 
-- Build on the target platform:
-  - Build macOS packages on macOS.
-  - Build Windows packages on Windows.
-- PyInstaller does not support cross-compiling between macOS and Windows.
-- Install project dependencies first and make sure StreamCap can run in the current Python environment.
+Dependencies must first be fetched with cargo fetch --locked for the frontend, core and src-tauri manifests. Builds use locked/offline mode. Required tools are Rust 1.95.0 with wasm32-unknown-unknown/MSVC/Windows SDK, Node.js 24, Trunk 0.21.14 and wasm-bindgen-cli 0.2.128. Install Trunk and wasm-bindgen into desktop/target/tools; the helper verifies the CLI version against the frontend Cargo.lock.
 
-## One-Command Build
+Output is a new desktop/src-tauri/target/native-noFF-* directory containing StreamCap.exe and StreamCap.exe.sha256. Existing release files are never overwritten; no installer is produced.
 
-Run from the project root:
+## Verification boundaries
 
-```bash
-python scripts/build.py
-```
+Rust format, Clippy and test gates are followed by WASM release compilation, UI/layout regression and actual native close/tray/shutdown smoke. A failed gate returns nonzero. Native smoke only launches build outputs under src-tauri/target with a fresh profile and random loopback ports. No production profile, real QR login or live platform request is used.
 
-The script automatically:
+Test evidence is stored under desktop/tests/artifacts. Preserve logs, result JSON and final visual evidence. Recycle Bin checks use new temporary fixture files, including a locked-file test proving that a failed recycle does not fall back to permanent deletion.
 
-- Prepares the Flet desktop runtime archive.
-- Bundles `config`, `locales`, and `assets`.
-- Bundles `streamget` data files.
-- Bundles optional FFmpeg / Node.js executables when present.
-- On macOS, hides the outer PyInstaller Dock icon so only one StreamCap panda icon is shown.
+## Data protection
 
-macOS output:
+The normal user-data location is %APPDATA%\StreamCap. Downloads follow user settings. --data-dir selects an explicit profile and --api-port selects a local API port; frontend transport is initialized from the bound native address.
 
-```text
-dist/StreamCap.app
-```
+Only config/default_settings.json, config/language.json and config/version.json are compile-time defaults. Never package an entire user config/profile/download/backup directory. Keep the existing task and credential JSON contracts. Do not clear system WebView2 data or remove existing FFmpeg.
 
-Run it with:
-
-```bash
-open dist/StreamCap.app
-```
-
-Windows output:
-
-```text
-dist/StreamCap/
-├─ StreamCap.exe
-└─ _internal/
-   ├─ assets/
-   ├─ config/
-   ├─ locales/
-   └─ ...
-```
-
-Windows uses the PyInstaller one-dir layout: `StreamCap.exe` stays at the top level as the user entry point, while runtime dependencies, resources, and DLLs live under `_internal`.
-
-GitHub Actions automatically zips downloaded artifacts, so the workflow uploads the app directory under `dist` instead of creating an inner zip first. After downloading `StreamCap-windows.zip`, extracting it once gives a `StreamCap` folder.
-
-## macOS Architecture
-
-By default, the package uses the current Python environment and host architecture. Apple Silicon machines usually produce an arm64 package.
-
-You can specify it explicitly:
-
-```bash
-python scripts/build.py --target-arch arm64
-```
-
-Avoid `universal2` unless all Python and native dependencies are universal2. Otherwise PyInstaller may fail with `is not a fat binary`.
-
-## Bundled FFmpeg
-
-To bundle FFmpeg, prepare it first:
-
-```bash
-python scripts/download_ffmpeg.py
-```
-
-Download both supported platforms:
-
-```bash
-python scripts/download_ffmpeg.py --platform all
-```
-
-Files are saved to:
-
-```text
-vendor/ffmpeg/macos/ffmpeg
-vendor/ffmpeg/windows/ffmpeg.exe
-```
-
-The script extracts only `ffmpeg` / `ffmpeg.exe`; it does not keep `ffplay` or `ffprobe`.
-
-`scripts/build.py` automatically bundles the matching file when it exists. To skip bundled FFmpeg:
-
-```bash
-python scripts/build.py --no-bundle-ffmpeg
-```
-
-Runtime behavior:
-
-- If `ffmpeg` is already available on `PATH`, the bundled version is not copied.
-- If `ffmpeg` is not available and a bundled executable exists, it is copied to the user data directory.
-
-Destination:
-
-```text
-macOS:   ~/Library/Application Support/StreamCap/ffmpeg/ffmpeg
-Windows: %APPDATA%\StreamCap\ffmpeg\ffmpeg.exe
-```
-
-## Bundled Node.js
-
-To bundle Node.js, prepare it first:
-
-```bash
-python scripts/download_nodejs.py
-```
-
-Download both supported platforms:
-
-```bash
-python scripts/download_nodejs.py --platform all
-```
-
-Specify a version:
-
-```bash
-python scripts/download_nodejs.py --version 22.12.0
-```
-
-Files are saved to:
-
-```text
-vendor/node/macos/node
-vendor/node/windows/node.exe
-```
-
-The script extracts only `node` / `node.exe`; it does not keep `npm`, `npx`, headers, docs, or other files.
-
-`scripts/build.py` automatically bundles the matching file when it exists. To skip bundled Node.js:
-
-```bash
-python scripts/build.py --no-bundle-node
-```
-
-Runtime behavior:
-
-- If `node` is already available on `PATH`, the bundled version is not copied.
-- If `node` is not available and a bundled executable exists, it is copied to the user data directory.
-
-Destination:
-
-```text
-macOS:   ~/Library/Application Support/StreamCap/node/node
-Windows: %APPDATA%\StreamCap\node\node.exe
-```
-
-## macOS Flet Notes
-
-StreamCap uses Flet desktop mode. On macOS, Flet uses `Flet.app` as the actual window process.
-
-The packaged app applies the following handling:
-
-- The outer `StreamCap.app` runs as a background agent and does not show a Dock icon.
-- The global Flet cache is not modified directly.
-- On first launch, StreamCap creates its own Flet app copy:
-
-```text
-~/Library/Application Support/StreamCap/flet_client/<version>/StreamCap Flet.app
-```
-
-- The dedicated Flet copy uses the StreamCap panda icon.
-
-In normal use, the Dock should show only one panda icon.
-
-If macOS keeps showing an old icon after upgrading Flet or changing icons, delete the dedicated Flet cache and restart Dock:
-
-```bash
-rm -rf "$HOME/Library/Application Support/StreamCap/flet_client"
-killall Dock
-open dist/StreamCap.app
-```
-
-## User Data Directory
-
-In packaged builds, mutable files such as config, logs, FFmpeg, and Node.js are not written into the app bundle or installation directory.
-
-Locations:
-
-```text
-macOS:   ~/Library/Application Support/StreamCap
-Windows: %APPDATA%\StreamCap
-```
-
-On Windows, the default recording directory is `downloads` next to `StreamCap.exe`, so large videos are not written to the C drive user data directory by default. If the user chooses a save directory in Settings, that value takes precedence.
-
-When running from source, StreamCap still uses the project directory for easier development and debugging.
-
-## Common Commands
-
-Prepare optional bundled dependencies:
-
-```bash
-python scripts/download_ffmpeg.py --platform all
-python scripts/download_nodejs.py --platform all
-```
-
-Build:
-
-```bash
-python scripts/build.py
-```
-
-Force re-download of the Flet desktop runtime archive:
-
-```bash
-python scripts/build.py --refresh-flet
-```
-
-Build without bundled FFmpeg / Node.js:
-
-```bash
-python scripts/build.py --no-bundle-ffmpeg --no-bundle-node
-```
+Custom command ACL is generated by build.rs with handwritten permissions in src-tauri/permissions/desktop.toml. The native verification gate requires the former Python/Flet/Docker entrypoints to be absent. Git commits, pushes and deployment overwrites are not performed by the build scripts.

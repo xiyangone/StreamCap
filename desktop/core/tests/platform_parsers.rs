@@ -103,7 +103,7 @@ async fn qr_cookie_exchange_and_cancel_are_in_process() {
         .route("/rest/c/infra/ks/qr/scanResult",post(||async{Json(json!({"result":1}))}))
         .route("/rest/c/infra/ks/qr/acceptResult",post(||async{Json(json!({"result":1,"qrToken":"fixture-accepted"}))}))
         .route("/pass/kuaishou/login/qr/callback",post(||async{let mut headers=HeaderMap::new();headers.insert("set-cookie",HeaderValue::from_static("fixture_pass=demo; Path=/"));(headers,Json(json!({"result":1})))}))
-        .route("/pass/kuaishou/login/passToken",post(||async{Json(json!({"result":1,"userId":"fixture-user","kuaishou.live.web_st":"fixture-session"}))}))
+        .route("/pass/kuaishou/login/passToken",post(||async{Json(json!({"result":1,"userId":"fixture-user","kuaishou.live.web_st":"fixture-session","kuaishou.live.web_ph":"fixture-proof"}))}))
         .route("/",get(||async{"<script>window.__INITIAL_STATE__={\"currentUser\":{\"userId\":\"fixture-user\",\"name\":\"Fixture\"}};</script>"}));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}/", listener.local_addr().unwrap());
@@ -125,7 +125,29 @@ async fn qr_cookie_exchange_and_cancel_are_in_process() {
     assert_eq!(snapshot.state, "success");
     let cookie = snapshot.cookies.unwrap();
     assert!(cookie.contains("kuaishou.live.web_st=fixture-session"));
+    assert!(cookie.contains("kuaishou.live.web_ph=fixture-proof"));
     assert!(cookie.contains("fixture_pass=demo"));
+    let mut completed = Vec::new();
+    for _ in 0..6 {
+        let mut next = manager.start(None).await.unwrap();
+        for _ in 0..100 {
+            if next.is_terminal() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            next = manager.status(&next.session_id).await.unwrap();
+        }
+        assert_eq!(next.state, "success", "终态不应占满四个活动会话名额");
+        assert_eq!(
+            manager.status(&next.session_id).await.unwrap().state,
+            "success",
+            "终态读取可重试"
+        );
+        completed.push(next.session_id);
+    }
+    for id in completed {
+        manager.cancel(&id).await.unwrap();
+    }
     manager.cancel(&snapshot.session_id).await.unwrap();
     assert!(manager.status(&snapshot.session_id).await.is_err());
     manager.shutdown().await;
@@ -293,4 +315,123 @@ async fn qr_concurrent_start_and_shutdown_leave_no_workers() {
     }
     assert_eq!(manager.active_tasks(), 0);
     assert!(manager.start(None).await.is_err());
+}
+
+#[test]
+fn qr_account_verification_handles_identity_shapes_without_matching_recommendations() {
+    use streamcap_core::platforms::kuaishou_login::verify_login_page;
+    for state in [
+        json!({"currentUser":{"userId":"42","name":"Fixture"}}),
+        json!({"global":{"loginUser":{"id":42,"nickname":"Fixture"}}}),
+        json!({"userStore":{"userInfo":{"principalId":"42","user_name":"Fixture"}}}),
+        json!({"user":{"userInfoQuery":{"ownerInfo":{"originUserId":42,"name":"Fixture"}}}}),
+    ] {
+        let page = format!("<script>window.__INITIAL_STATE__ = {};</script>", state);
+        assert_eq!(
+            verify_login_page(&page, "42").unwrap(),
+            Some("Fixture".into())
+        );
+    }
+    for state in [
+        json!({"recommendations":[{"author":{"userId":"42","name":"Unrelated"}}]}),
+        json!({"currentUser":{"userId":"142","name":"Different"}}),
+        json!({"currentUser":{"userId":"42","isLogin":false}}),
+        json!({"isLoggedIn":false,"currentUser":{"userId":"42"}}),
+        json!({"userStore":{"isLogin":false,"userInfo":{"userId":"42"}}}),
+    ] {
+        let page = format!("window.__INITIAL_STATE__={};", state);
+        let error = verify_login_page(&page, "42").unwrap_err();
+        assert!(error.contains("手机已确认"));
+        assert!(error.contains("未保存"));
+    }
+    assert!(verify_login_page("<html>login challenge</html>", "42").is_err());
+    assert!(verify_login_page(
+        r#"window.__INITIAL_STATE__={"currentUser":{"userId":""}};"#,
+        ""
+    )
+    .is_err());
+    assert_eq!(
+        verify_login_page(
+            r#"<script>window.__BOOTSTRAP__={'isLoggedIn':true,'profile':{'userId':'42'}};</script>"#,
+            "42"
+        )
+        .unwrap(),
+        Some("42".into())
+    );
+    assert_eq!(
+        verify_login_page(r#"<html>{"userId":"42"}</html>"#, "42").unwrap(),
+        Some("42".into())
+    );
+    assert_eq!(
+        verify_login_page(
+            r#"window.__INITIAL_STATE__={"bootstrap":{"uid":"42"}};"#,
+            "42"
+        )
+        .unwrap(),
+        Some("42".into())
+    );
+    assert!(verify_login_page(
+        r#"window.__INITIAL_STATE__={"recommendations":[{"uid":"42"}]};"#,
+        "42"
+    )
+    .is_err());
+    assert!(verify_login_page(
+        r#"window.__INITIAL_STATE__={"home":{"homeLiveStream":[{"author":{"originUserId":42}}]}};"#,
+        "42"
+    )
+    .is_err());
+    assert_eq!(
+        verify_login_page(
+            r#"<script>window.__INITIAL_STATE__ = JSON.parse('{"auth":{"isLoggedIn":true,"profile":{"userId":"42"}}}');</script>"#,
+            "42"
+        )
+        .unwrap(),
+        Some("42".into())
+    );
+    assert!(verify_login_page(
+        r#"<script>window.__BOOTSTRAP__={'recommendations':[{'author':{'userId':'42'}}]};</script>"#,
+        "42"
+    )
+    .is_err());
+}
+#[tokio::test]
+async fn qr_confirmed_but_unverified_never_exposes_or_saves_cookies() {
+    use axum::{
+        routing::{get, post},
+        Json, Router,
+    };
+    let png="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aK9sAAAAASUVORK5CYII=";
+    let app=Router::new()
+        .route("/rest/c/infra/ks/qr/start",post(move||async move{Json(json!({"result":1,"qrLoginToken":"fixture-token","qrLoginSignature":"fixture-sign","imageData":png}))}))
+        .route("/rest/c/infra/ks/qr/scanResult",post(||async{Json(json!({"result":1}))}))
+        .route("/rest/c/infra/ks/qr/acceptResult",post(||async{Json(json!({"result":1,"qrToken":"fixture-accepted"}))}))
+        .route("/pass/kuaishou/login/qr/callback",post(||async{Json(json!({"result":1}))}))
+        .route("/pass/kuaishou/login/passToken",post(||async{Json(json!({"result":1,"userId":"fixture-user","kuaishou.live.web_st":"fixture-session","kuaishou.live.web_ph":"fixture-proof"}))}))
+        .route("/",get(||async{r#"<script>window.__INITIAL_STATE__={"room":{"author":{"userId":"fixture-user","name":"Fixture"}}};</script>"#}));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}/", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let manager = LoginManager::with_endpoints(
+        CancellationToken::new(),
+        LoginEndpoints::loopback(&base).unwrap(),
+    );
+    let mut snapshot = manager.start(None).await.unwrap();
+    for _ in 0..40 {
+        if snapshot.is_terminal() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        snapshot = manager.status(&snapshot.session_id).await.unwrap();
+    }
+    assert_eq!(snapshot.state, "error");
+    assert!(snapshot.message.contains("手机已确认"));
+    assert!(snapshot.cookies.is_none());
+    assert!(snapshot.username.is_none());
+    assert!(snapshot.image_base64.is_empty());
+    assert_eq!(snapshot.seconds_left, 0);
+    manager.shutdown().await;
+    assert_eq!(manager.active_tasks(), 0);
+    server.abort();
 }

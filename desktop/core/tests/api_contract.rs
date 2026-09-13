@@ -706,3 +706,55 @@ async fn native_settings_reject_unsupported_features_and_formats() {
         assert_eq!(response.status(), 400);
     }
 }
+
+#[tokio::test]
+async fn native_close_preference_defaults_to_ask_and_validates_saved_values() {
+    let (base, _guard) = start_backend().await;
+    let client = reqwest::Client::new();
+    let defaults = get_json(&format!("{base}/api/settings")).await;
+    assert_eq!(defaults["defaultConfig"]["close_action"], "ask");
+    for action in ["tray", "exit", "ask"] {
+        let result = client
+            .put(format!("{base}/api/settings"))
+            .json(&json!({"userConfig":{"close_action":action}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(result.status(), 200);
+        let settings = get_json(&format!("{base}/api/settings")).await;
+        assert_eq!(settings["userConfig"]["close_action"], action);
+    }
+    for invalid in [json!(true), json!("always_kill"), Value::Null] {
+        let result = client
+            .put(format!("{base}/api/settings"))
+            .json(&json!({"userConfig":{"close_action":invalid}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(result.status(), 400);
+    }
+    let settings = get_json(&format!("{base}/api/settings")).await;
+    assert_eq!(settings["userConfig"]["close_action"], "ask");
+}
+
+#[tokio::test]
+async fn interval_updates_are_committed_and_invalid_changes_do_not_publish() {
+    let (base, _guard) = start_backend().await;
+    let client = reqwest::Client::new();
+    let result = client
+        .put(format!("{base}/api/settings"))
+        .json(&json!({"userConfig":{"loop_time_seconds":"4500"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(result.status(), 200);
+    let result = client
+        .put(format!("{base}/api/settings"))
+        .json(&json!({"userConfig":{"loop_time_seconds":"0"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(result.status(), 400);
+    let settings = get_json(&format!("{base}/api/settings")).await;
+    assert_eq!(settings["userConfig"]["loop_time_seconds"], "4500");
+}

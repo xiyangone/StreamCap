@@ -44,7 +44,9 @@ async fn main() {
                             streamcap_core::Workspace::from_repo_root(PathBuf::from(&dir)),
                         );
                         match reopened.load().await {
-                            Ok(n) if n == count => println!("[OK] 回写后重新载入仍为 {n} 条，数据完整"),
+                            Ok(n) if n == count => {
+                                println!("[OK] 回写后重新载入仍为 {n} 条，数据完整")
+                            }
                             Ok(n) => {
                                 println!("[FAIL] 回写后条数变为 {n}（原为 {count}）");
                                 std::process::exit(1);

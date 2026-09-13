@@ -55,14 +55,17 @@ pub fn ConfirmDialog(
     #[prop(into)] description: Signal<String>,
     busy: RwSignal<bool>,
     on_confirm: Callback<()>,
+    #[prop(default = "确认删除")] confirm_text: &'static str,
+    #[prop(default = "正在删除…")] busy_text: &'static str,
+    #[prop(default = "此操作无法撤销，请确认选择范围。")] hint: &'static str,
 ) -> impl IntoView {
     view! {
         <Dialog open=Signal::derive(move || open.get()) title=title busy=busy on_close=Callback::new(move |_| open.set(false))>
             <div class="confirm-symbol"><Icon name="trash" size=26 /></div>
             <p class="dialog-description">{move || description.get()}</p>
-            <p class="field-hint">"此操作无法撤销，请确认选择范围。"</p>
+            <p class="field-hint">{hint}</p>
             <footer class="modal-actions"><button class="button secondary" disabled=move || busy.get() on:click=move |_| open.set(false)>"取消"</button>
-                <button class="button danger" disabled=move || busy.get() on:click=move |_| on_confirm.run(())>{move || if busy.get() { "正在删除…" } else { "确认删除" }}</button>
+                <button class="button danger" disabled=move || busy.get() on:click=move |_| on_confirm.run(())>{move || if busy.get() { busy_text } else { confirm_text }}</button>
             </footer>
         </Dialog>
     }

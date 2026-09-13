@@ -1,59 +1,33 @@
-name: ❓ Question
-description: 对程序使用有疑问？在这里提出你的问题。
-title: ❓[Question] 请输入标题
-labels: question
+name: "原生版使用咨询"
+description: "Windows x64 Rust/Tauri 原生版"
 body:
-  - type: markdown
+  - type: input
+    id: version
     attributes:
-      value: |
-        📝 **请在上方的`title`中填写一个简洁明了的问题标题**。这将帮助其他人快速理解你的问题。
-        例如：❓[Question] 如果设置单个直播间的录制清晰度。
-  - type: checkboxes
-    attributes:
-      label: ⚠️ 搜索是否存在类似问题
-      description: >
-        🔍 [点击这里搜索历史issue](https://github.com/ihmily/StreamCap/issues?q=is%3Aissue) 使用关键词搜索，看看是否已经有人问过类似的问题。
-      options:
-        - label: 我已经搜索过issues，没有找到相似的问题
-          required: true
-  - type: dropdown
-    attributes:
-      label: 🔧 运行方式
-      description: 请选择你是如何运行程序的。
-      options:
-        - 直接运行的exe文件
-        - 使用源代码运行
+      label: "程序版本或构建提交"
     validations:
       required: true
   - type: dropdown
+    id: operating-system
     attributes:
-      label: 🐍 如果是使用源代码运行，请选择你的Python环境版本
-      description: 请选择你运行程序的Python版本。
-      options:
-        - Python 3.10
-        - Python 3.11
-        - Python 3.12
-        - Python 3.13
-        - Other (请在问题中说明)
+      label: "Windows 版本"
+      options: ["Windows 10 x64", "Windows 11 x64"]
     validations:
-      required: false
+      required: true
   - type: dropdown
+    id: launch
     attributes:
-      label: 💻 请选择你的系统环境
-      description: 请选择你运行程序的具体系统版本。
-      options:
-        - Windows 10
-        - Windows 11
-        - macOS (Intel)
-        - macOS (Apple Silicon)
-        - Other (请在问题中说明)
+      label: "启动方式"
+      options: ["noFF EXE", "Tauri development build"]
+  - type: textarea
+    id: description
+    attributes:
+      label: "问题描述和复现步骤"
+      description: "请描述预期与实际行为，不要提交 Cookie、Token 或账号凭证。"
     validations:
       required: true
   - type: textarea
+    id: environment
     attributes:
-      label: 🤔 问题详情
-      description: 请提供与你的问题相关的所有详细信息。
-      placeholder: |
-        你的问题具体是关于什么？
-    validations:
-      required: true
+      label: "相关环境与脱敏日志"
+      description: "WebView2、FFmpeg 版本；源码构建请附 Rust、Node、Trunk 版本。"

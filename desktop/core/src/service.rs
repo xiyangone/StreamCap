@@ -85,8 +85,11 @@ impl Server {
         };
         self.request_shutdown();
         let core_result = api::shutdown(&self.state).await;
+        let mut background_error = None;
         for task in running.background {
-            task.await.map_err(io::Error::other)?;
+            if let Err(error) = task.await {
+                background_error.get_or_insert_with(|| io::Error::other(error));
+            }
         }
         match tokio::time::timeout(Duration::from_secs(5), &mut running.http).await {
             Ok(result) => result.map_err(io::Error::other)??,
@@ -96,7 +99,10 @@ impl Server {
                 log::warn!("已关闭仍未完成的本地 HTTP 连接");
             }
         }
-        core_result
+        core_result.and(match background_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        })
     }
 }
 impl Drop for Server {

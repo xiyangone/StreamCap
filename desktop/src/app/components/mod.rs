@@ -1,6 +1,7 @@
 mod add_dialog;
 mod batch_edit_dialog;
 mod card_info_dialog;
+mod close_dialog;
 mod dialog;
 mod edit_dialog;
 mod icons;
@@ -12,6 +13,7 @@ mod toast;
 pub use add_dialog::AddRecordingDialog;
 pub use batch_edit_dialog::BatchEditDialog;
 pub use card_info_dialog::CardInfoDialog;
+pub use close_dialog::CloseDialog;
 pub use dialog::{ConfirmDialog, Dialog, EmptyState};
 pub use edit_dialog::EditRecordingDialog;
 pub use icons::Icon;

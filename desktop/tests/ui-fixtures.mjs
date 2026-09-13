@@ -14,7 +14,7 @@ const defaults = {
   segmented_recording_enabled: false, loop_time_seconds: '600',
   live_save_path: 'X:/Fixture/Recordings', recording_space_threshold: '1.0',
   folder_name_platform: true, folder_name_author: true, folder_name_time: false,
-  filename_includes_title: true, theme_mode: 'light', theme_color: 'blue', is_grid_view: true,
+  filename_includes_title: true, theme_mode: 'light', theme_color: 'blue', is_grid_view: true, close_action: 'ask',
 };
 const inheritance = {
   quality: ['quality', 'record_quality'], record_format: ['recordFormat', 'video_format'],
@@ -47,6 +47,7 @@ function initialState({ empty = false, offline = false } = {}) {
     cookies: { douyin: 'fixture-douyin-not-a-credential', bilibili: 'fixture-bilibili-not-a-credential' },
     offline, resolverReady: true, requests: [], unexpected: [], nextId: 7,
     failures: [], delays: [], qrPhase: 'waiting', qrCancelled: 0,
+    native: { maximized: false, visible: true, closing: false, trayAvailable: true, pending: false, calls: [], failRemember: false },
     files: [
       { name: '云间电台', isDir: true, size: 734003200, path: '云间电台', modified: sampleDate },
       { name: '海边日落.ts', isDir: false, size: 128450560, path: '海边日落.ts', modified: sampleDate },
@@ -70,7 +71,9 @@ function wave() {
 export async function createHarness(label, options = {}) {
   // No production backend, resolver, user configuration or recording files are opened.
   await readFile(join(dist, 'index.html'));
-  const artifactsRoot = join(desktop, 'tests', 'artifacts');
+  const allowedArtifacts = join(desktop, 'tests', 'artifacts');
+  const artifactsRoot = resolve(process.env.STREAMCAP_TEST_ARTIFACTS || allowedArtifacts);
+  assert.ok(artifactsRoot === allowedArtifacts || artifactsRoot.startsWith(allowedArtifacts + sep), 'Artifacts must remain under tests/artifacts');
   await mkdir(artifactsRoot, { recursive: true });
   const runDir = await mkdtemp(join(artifactsRoot, label + '-'));
   const temp = join(runDir, 'tmp');
@@ -219,7 +222,8 @@ export async function createHarness(label, options = {}) {
       }
       if (path.startsWith('/api/qr/kuaishou/')) {
         if (path.endsWith('/cancel')) { state.qrCancelled++; json(res, { ok: true }); return; }
-        json(res, { sessionId: 'fixture-qr-session', state: state.qrPhase, message: state.qrPhase === 'success' ? '模拟登录成功' : '请使用快手扫码', imageBase64: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aK9sAAAAASUVORK5CYII=', secondsLeft: 120, cookies: state.qrPhase === 'success' ? 'fixture-qr-not-a-credential' : null }); return;
+        const messages={waiting:'请使用快手扫码',scanned:'已扫码，请在手机上确认登录',verifying:'手机已确认，正在验证直播站登录状态',success:'已验证账号：测试快手账号',error:'手机已确认，但直播站未返回可验证的登录状态。登录信息未保存，请稍后重试。',expired:'二维码已过期'};
+        json(res, { sessionId: 'fixture-qr-session', state: state.qrPhase, message: messages[state.qrPhase], imageBase64: state.qrPhase==='waiting'?'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aK9sAAAAASUVORK5CYII=':'', secondsLeft: state.qrPhase==='waiting'?120:0, cookies: state.qrPhase === 'success' ? 'fixture-qr-not-a-credential' : null }); return;
       }
       state.unexpected.push(method + ' ' + path);
       json(res, { detail: 'Unexpected isolated fixture request' }, 501);
@@ -244,16 +248,59 @@ export async function createHarness(label, options = {}) {
     if (url.origin === apiOrigin && url.pathname.startsWith('/api/')) {
       await route.continue({ url: base + url.pathname + url.search }); return;
     }
+    if (url.origin === base && url.pathname === '/tauri-api/core.js') {
+      await route.fulfill({contentType:'text/javascript',body:"export function isTauri(){return true} export const invoke=(...args)=>window.__streamcapNativeMock.core.invoke(...args);"}); return;
+    }
+    if (url.origin === base && url.pathname === '/tauri-api/event.js') {
+      await route.fulfill({contentType:'text/javascript',body:"export const listen=(...args)=>window.__streamcapNativeMock.event.listen(...args);"}); return;
+    }
     if (url.origin === base) { await route.continue(); return; }
     blocked.push(url.origin + url.pathname);
     await route.abort('blockedbyclient');
   });
+  const nativeStatus=()=>({maximized:state.native.maximized,visible:state.native.visible,closing:state.native.closing,trayAvailable:state.native.trayAvailable});
+  await context.exposeBinding('__streamcapNativeFixture',async(_source,command,args={})=>{
+    const native=state.native;native.calls.push({command,args:structuredClone(args)});let closeRequest;
+    if(command==='desktop_ready')return {value:nativeStatus(),closeRequest:native.pending?{activeRecordings:state.recordings.filter(r=>r.isRecording).length,trayAvailable:native.trayAvailable}:undefined};
+    if(command==='desktop_theme'){native.theme=args.theme;return {value:null};}
+    if(command==='desktop_window_action'){
+      if(args.action==='maximize')native.maximized=!native.maximized;
+      else if(args.action==='minimize')native.minimized=true;
+      else if(args.action==='close'){
+        const policy=config().close_action;
+        if(policy==='exit')native.closing=true;
+        else if(policy==='tray'&&native.trayAvailable)native.visible=false;
+        else{native.pending=true;closeRequest={activeRecordings:state.recordings.filter(r=>r.isRecording).length,trayAvailable:native.trayAvailable};}
+      }else if(args.action!=='drag')throw Error('Unexpected native fixture action');
+    }else if(command==='desktop_close_choice'){
+      if(!native.pending)throw Error('没有待处理的关闭请求');
+      if(args.choice==='cancel')native.pending=false;
+      else{
+        if(args.choice==='tray'&&!native.trayAvailable)throw Error('系统托盘不可用');
+        if(args.remember&&native.failRemember){native.failRemember=false;throw Error('关闭偏好保存失败，窗口保持打开，请重试');}
+        if(args.remember){state.userConfig.close_action=args.choice;emit('settings',{});}
+        if(args.choice==='tray')native.visible=false;else if(args.choice==='exit')native.closing=true;else throw Error('Unexpected native fixture choice');
+        native.pending=false;
+      }
+    }else{state.unexpected.push('NATIVE '+command);throw Error('Unexpected native fixture command');}
+    return {value:nativeStatus(),windowState:nativeStatus(),closeRequest};
+  });
+  await context.addInitScript(apiOrigin=>{
+    Object.defineProperty(window,'__STREAMCAP_RUNTIME__',{value:Object.freeze({apiOrigin})});
+    const events=new Map();
+    const emit=(name,payload)=>{for(const callback of events.get(name)??[])callback({event:name,payload});};
+    window.__streamcapNativeFixtureEmit=emit;
+    window.__streamcapNativeMock={event:{listen:async(name,callback)=>{let callbacks=events.get(name);if(!callbacks){callbacks=new Set();events.set(name,callbacks);}callbacks.add(callback);return ()=>callbacks.delete(callback);}},core:{invoke:async(command,args={})=>{
+      const result=await window.__streamcapNativeFixture(command,args);if(result.windowState)emit('streamcap:window-state',result.windowState);if(result.closeRequest)emit('streamcap:close-requested',result.closeRequest);return result.value;
+    }}};
+  }, apiOrigin);
   const page = await context.newPage();
   page.setDefaultTimeout(7000);
   page.on('pageerror', (error) => runtimeErrors.push(error.stack ?? error.message));
   page.on('console', (message) => { if (message.type() === 'error') consoleErrors.push(message.text()); });
   return {
     base, state, page, context, runDir, blocked, runtimeErrors, consoleErrors, emit,
+    async restoreNative() {state.native.visible=true;state.native.minimized=false;await page.evaluate(value=>window.__streamcapNativeFixtureEmit("streamcap:window-state",value),nativeStatus());},
     failNext(method, path, message = '模拟操作失败', status = 409) { state.failures.push({ method, path, message, status }); },
     delayNext(method, path, ms = 700) { state.delays.push({ method, path, ms }); },
     setOffline(value) { state.offline = value; if (value) { for (const stream of streams) stream.end(); streams.clear(); } },

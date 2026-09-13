@@ -1,5 +1,5 @@
 use crate::{
-    api::gateway,
+    api::{desktop, gateway},
     app::{
         components::{Icon, QrLoginDialog},
         labels::{platform_label, FORMAT_OPTIONS, PLATFORMS, QUALITY_OPTIONS},
@@ -43,6 +43,9 @@ pub fn SettingsView() -> impl IntoView {
     let reveal = RwSignal::new(false);
     let qr_open = RwSignal::new(false);
     let appearance_busy = RwSignal::new(false);
+    let window_busy = RwSignal::new(false);
+    let qr_account = RwSignal::new(None::<String>);
+    let desktop = desktop::state();
 
     Effect::new(move |_| {
         let _ = state.settings_version.get();
@@ -148,7 +151,7 @@ pub fn SettingsView() -> impl IntoView {
                         }
                     });
                     state.notify(if interval_changed {
-                        "设置已保存；新的检测间隔将在重启应用后生效"
+                        "设置已保存；已按新的检测间隔重新计时"
                     } else {
                         "偏好设置已保存"
                     });
@@ -192,6 +195,24 @@ pub fn SettingsView() -> impl IntoView {
             let _ = busy.try_set(false);
         });
     };
+    let choose_close_action = Callback::new(move |choice: String| {
+        if window_busy.get_untracked() {
+            return;
+        }
+        window_busy.set(true);
+        leptos::task::spawn_local(async move {
+            match gateway::save_settings(json!({"close_action":choice})).await {
+                Ok(()) => {
+                    if let Ok(settings) = gateway::fetch_settings().await {
+                        state.apply_settings(settings);
+                    }
+                    state.notify("关闭窗口行为已保存");
+                }
+                Err(error) => state.fail(error),
+            }
+            let _ = window_busy.try_set(false);
+        });
+    });
     let choose_theme = Callback::new(move |theme: &'static str| {
         state.theme.set(theme.into());
         gateway::save_appearance(state);
@@ -223,6 +244,9 @@ pub fn SettingsView() -> impl IntoView {
     });
     let set_cookie = Callback::new(move |value: String| {
         let key = cookie_platform.get_untracked();
+        if key == "kuaishou" {
+            qr_account.set(None);
+        }
         cookies.update(|map| {
             map.insert(key.clone(), Value::String(value.clone()));
         });
@@ -256,7 +280,7 @@ pub fn SettingsView() -> impl IntoView {
             </header>
             <div class="settings-layout">
                 <nav class="settings-nav" aria-label="设置分类">
-                    {[(Tab::Recording,"video","录制与存储"),(Tab::Appearance,"sun","外观"),(Tab::Network,"signal","网络与检测"),(Tab::Accounts,"lock","平台登录"),(Tab::Automation,"clock","自动化与通知")].into_iter().map(|(mode,icon,label)| view! {
+                    {[(Tab::Recording,"video","录制与存储"),(Tab::Appearance,"sun","外观与窗口"),(Tab::Network,"signal","网络与检测"),(Tab::Accounts,"lock","平台登录"),(Tab::Automation,"clock","自动化与通知")].into_iter().map(|(mode,icon,label)| view! {
                         <button class="settings-nav-item" class:active=move || tab.get() == mode aria-pressed=move || (tab.get() == mode).to_string() on:click=move |_| tab.set(mode)><Icon name=icon size=18 /><span>{label}</span><Icon name="chevron" size=13 /></button>
                     }).collect_view()}
                     <div class="settings-local-note"><Icon name="shield" size=18 /><p>"设置和登录信息仅保存在此设备。"</p></div>
@@ -284,7 +308,7 @@ pub fn SettingsView() -> impl IntoView {
                                 </Show>
                                 <Show when=move || tab.get() == Tab::Network>
                                     <SettingsGroup title="直播检测" subtitle="定期查询直播间状态，发现开播后启动录制。" icon="refresh">
-                                        <SettingText label="检测间隔" hint="单位：秒，至少 30 秒；修改后重启应用生效。" setting="loop_time_seconds" draft=draft on_change=change numeric=true />
+                                        <SettingText label="检测间隔" hint="单位：秒，至少 30 秒；保存后立即重新计时。" setting="loop_time_seconds" draft=draft on_change=change numeric=true />
                                         <div class="capability-note"><Icon name="info" size=17 /><p>"平台独立限流和并发设置暂不可用。"</p></div>
                                     </SettingsGroup>
                                     <SettingsGroup title="解析代理" subtitle="仅用于查询直播信息，不代表录制流量已使用代理。" icon="signal">
@@ -297,7 +321,7 @@ pub fn SettingsView() -> impl IntoView {
                         </Show>
                     </Show>
                     <Show when=move || tab.get() == Tab::Appearance>
-                        <SettingsGroup title="外观" subtitle="柔和光影与清晰层次，在明暗之间找到舒适的工作状态。" icon="sun">
+                        <SettingsGroup title="外观" subtitle="窗口和内容使用同一套主题。" icon="sun">
                             <div class="theme-options" role="group" aria-label="主题模式">
                                 {[("light","浅色","sun"),("dark","深色","moon"),("system","跟随系统","monitor")].into_iter().map(|(mode,label,icon)| view! {
                                     <button class="theme-option" class:active=move || state.theme.get() == mode aria-pressed=move || (state.theme.get() == mode).to_string() on:click=move |_| choose_theme.run(mode)><span class="theme-preview" data-preview=mode><i /><i /><i /></span><span><Icon name=icon size=17 />{label}<span class="theme-check"><Icon name="check" size=16 /></span></span></button>
@@ -312,6 +336,15 @@ pub fn SettingsView() -> impl IntoView {
                             <div class="settings-row"><div><strong>"默认任务视图"</strong><p>"在网格卡片和紧凑列表之间切换。"</p></div><div class="view-switch"><button class:active=move || state.grid_view.get() aria-label="默认网格视图" disabled=move || appearance_busy.get() on:click=move |_| { state.grid_view.set(true); appearance_busy.set(true); leptos::task::spawn_local(async move { if let Err(error) = gateway::save_settings(json!({"is_grid_view":true})).await { state.fail(error); } let _ = appearance_busy.try_set(false); }); }><Icon name="grid" size=18 /></button><button class:active=move || !state.grid_view.get() aria-label="默认列表视图" disabled=move || appearance_busy.get() on:click=move |_| { state.grid_view.set(false); appearance_busy.set(true); leptos::task::spawn_local(async move { if let Err(error) = gateway::save_settings(json!({"is_grid_view":false})).await { state.fail(error); } let _ = appearance_busy.try_set(false); }); }><Icon name="list" size=18 /></button></div></div>
                         </SettingsGroup>
                     </Show>
+                    <Show when=move || tab.get() == Tab::Appearance && desktop.available>
+                        <SettingsGroup title="窗口行为" subtitle="选择点击窗口关闭按钮或按 Alt+F4 后的行为。" icon="monitor">
+                            <div class="settings-row"><div><strong>"关闭窗口时"</strong><p>"退出会停止录制；托盘模式继续在后台运行。"</p></div>
+                                <select class="input" aria-label="关闭窗口时" prop:value=move||state.setting("close_action","ask") disabled=move||window_busy.get() on:change=move|event|choose_close_action.run(event_target_value(&event))>
+                                    <option value="ask">"每次询问"</option><option value="exit">"退出应用"</option><option value="tray">"最小化到托盘"</option>
+                                </select>
+                            </div>
+                        </SettingsGroup>
+                    </Show>
                     <Show when=move || tab.get() == Tab::Accounts>
                         <SettingsGroup title="平台登录" subtitle="部分平台需要 Cookie 才能获取直播信息。仅保存明确编辑的项目。" icon="lock">
                             <div class="scope-notice"><Icon name="shield" size=19 /><p>"Cookie 属于敏感登录信息，请勿分享或提交到代码仓库。"</p></div>
@@ -324,6 +357,7 @@ pub fn SettingsView() -> impl IntoView {
                                     <label class="field"><span>"登录信息"</span><input class="input cookie-input" type=move || if reveal.get() { "text" } else { "password" } autocomplete="off" spellcheck="false" aria-label="平台 Cookie" placeholder="粘贴该平台的 Cookie" disabled=move || busy.get()
                                         prop:value=move || cookies.with(|values| values.get(&cookie_platform.get()).and_then(Value::as_str).unwrap_or("").to_string()) on:input=move |e| set_cookie.run(event_target_value(&e)) /></label>
                                     <div class="cookie-tools"><button class="text-button" on:click=move |_| reveal.update(|v| *v = !*v)><Icon name="eye" size=15 />{move || if reveal.get() { "隐藏内容" } else { "显示内容" }}</button><button class="text-button danger-text" disabled=move || busy.get() on:click=move |_| set_cookie.run(String::new())>"清空此平台"</button></div>
+                                    <Show when=move||cookie_platform.get()=="kuaishou"&&qr_account.get().is_some()><div class="account-status" role="status"><Icon name="check" size=17/><span>{move||qr_account.get().unwrap_or_default()}" · 已保存"</span></div></Show>
                                     <p class="field-hint">"清空后需要保存才会移除登录信息。其他平台不受影响。"</p>
                                     <div class="cookie-save"><span>{move || format!("{} 个平台待保存", cookie_changes.get().len())}</span><button class="button primary" disabled=move || busy.get() || cookie_changes.get().is_empty() on:click=save_cookies>{move || if busy.get() { "保存中…" } else { "保存登录信息" }}</button></div>
                                 </div></div>
@@ -340,10 +374,11 @@ pub fn SettingsView() -> impl IntoView {
                 </div>
             </div>
         </div>
-        <QrLoginDialog open=qr_open on_success=Callback::new(move |cookie: String| {
-            cookies.update(|values| { values.insert("kuaishou".into(), Value::String(cookie.clone())); });
-            cookie_changes.update(|values| { values.insert("kuaishou".into(), Value::String(cookie)); });
-            qr_open.set(false); state.notify("快手登录信息已填入，请点击保存登录信息");
+        <QrLoginDialog open=qr_open on_success=Callback::new(move |result: gateway::QrSnapshot| {
+            if let Some(cookie)=result.cookies{cookies.update(|values|{values.insert("kuaishou".into(),Value::String(cookie));});}
+            cookie_changes.update(|values|{values.remove("kuaishou");});
+            qr_account.set(Some(result.message));cookie_platform.set("kuaishou".into());
+            qr_open.set(false);state.notify("快手登录信息已保存，账号验证通过");
         }) />
     }
 }

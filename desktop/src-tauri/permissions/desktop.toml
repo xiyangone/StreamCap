@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "desktop-controls"
+description = "Typed main-window lifecycle operations. The smoke command additionally requires an isolated smoke runtime."
+commands.allow = ["desktop_ready", "desktop_window_action", "desktop_close_choice", "desktop_theme", "desktop_smoke_tray_quit"]

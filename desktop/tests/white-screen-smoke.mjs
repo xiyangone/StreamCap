@@ -22,6 +22,10 @@ try {
         assert.equal(layout.contentOverflow, false, '主内容不能横向溢出');
         assert.deepEqual(layout.overflow, [], '组件不能溢出窗口');
         assert.equal(layout.dialogs, 0, '闭合弹窗不能覆盖页面');
+        assert.equal(await page.evaluate(()=>typeof window.__TAURI__),'undefined','不公开整套 Tauri 全局 API');
+        const shell=await page.locator('.app-shell').boundingBox();assert.equal(shell.x,0);assert.equal(shell.y,0);
+        assert.equal(await page.locator('.device-avatar').count(),0);
+        assert.equal(await page.getByRole('group',{name:'窗口控制'}).getByRole('button').count(),3);
         assert.ok(layout.glass.includes('blur'), '玻璃态样式必须实际加载');
         if (width === 1280 || path === '/recordings') await h.shot(theme + '-' + width + path.replaceAll('/', '-'));
         cases.push({ width, theme, path, layout });

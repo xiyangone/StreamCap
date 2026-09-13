@@ -39,7 +39,23 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .target(env_logger::Target::Pipe(Box::new(log)))
         .try_init();
+    let state = tauri::async_runtime::block_on(streamcap_core::api::bootstrap(workspace.clone()))?;
+    let theme = tauri::async_runtime::block_on(async {
+        state.config.read().await.get_str("theme_mode", "system")
+    });
+    let server = tauri::async_runtime::block_on(Server::start(
+        state,
+        ServerOptions {
+            port: options.port,
+            monitoring: options.smoke_seconds.is_none(),
+        },
+    ))?;
+    let address = server.address();
+    let smoke = options.smoke_seconds.is_some();
     let mut context = tauri::generate_context!();
+    let csp = lifecycle::content_security_policy(address, cfg!(debug_assertions));
+    context.config_mut().app.security.csp = Some(tauri::utils::config::Csp::Policy(csp.clone()));
+    context.config_mut().app.security.dev_csp = Some(tauri::utils::config::Csp::Policy(csp));
     for window in &mut context.config_mut().app.windows {
         window.data_directory = Some(workspace.user_data_dir.join("webview"));
         if options.smoke_seconds.is_some() {
@@ -48,30 +64,35 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     }
     let window_configs = std::mem::take(&mut context.config_mut().app.windows);
     let app=tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![desktop_ready,desktop_window_action,desktop_close_choice,desktop_theme,desktop_smoke_tray_quit])
         .setup(move |app|{
-            let state=tauri::async_runtime::block_on(streamcap_core::api::bootstrap(workspace.clone()))?;
-            let server=tauri::async_runtime::block_on(Server::start(state,ServerOptions{port:options.port,monitoring:options.smoke_seconds.is_none()}))?;
             log::info!("原生后端已启动：{}；无需 Python/Node",server.address());
-            let address=server.address();
-            let smoke=options.smoke_seconds.is_some();
-            let report=smoke.then(||workspace.user_data_dir.join("shutdown.json"));
-            app.manage(lifecycle::Lifecycle::new(server,report));
-            for window_config in &window_configs {
-                let mut window=tauri::WebviewWindowBuilder::from_config(app,window_config)?;
-                if smoke {window=window.initialization_script(lifecycle::smoke_transport_script(address));}
+            app.manage(lifecycle::Lifecycle::new(server,smoke.then(||workspace.user_data_dir.join("shutdown.json"))));
+            for window_config in &window_configs{
+                let mut window=tauri::WebviewWindowBuilder::from_config(app,window_config)?.theme(match theme.as_str(){"light"=>Some(tauri::Theme::Light),"dark"=>Some(tauri::Theme::Dark),_=>None});
+                window=window.initialization_script(lifecycle::runtime_script(address));
+                if smoke{window=window.initialization_script(lifecycle::smoke_transport_script(address));}
                 window.build()?;
             }
-            if smoke {
+            match setup_tray(app){Ok(())=>app.state::<lifecycle::Lifecycle>().set_tray_available(true),Err(error)=>log::warn!("托盘不可用: {error}")}
+            if smoke{
                 std::fs::write(workspace.user_data_dir.join("ready.json"),serde_json::to_vec_pretty(&serde_json::json!({"pid":std::process::id(),"address":address.to_string(),"dataDirectory":workspace.user_data_dir,"resolver":"native"}))?)?;
             }
-            if let Err(error)=setup_tray(app){log::warn!("托盘不可用: {error}");}
-            if let Some(seconds)=options.smoke_seconds {
+            if let Some(seconds)=options.smoke_seconds{
                 let handle=app.handle().clone();
-                tauri::async_runtime::spawn(async move{tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;if let Some(window)=handle.get_webview_window("main"){let _=window.close();}else{lifecycle::request_exit(&handle);}});
+                tauri::async_runtime::spawn(async move{tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;log::warn!("隔离验收看门狗触发退出");lifecycle::request_exit(&handle);});
             }
             Ok(())
         })
-        .on_window_event(|window,event|{if let WindowEvent::CloseRequested{api,..}=event{api.prevent_close();lifecycle::request_exit(window.app_handle());}})
+        .on_window_event(|window,event|{
+            if let Some(webview)=window.app_handle().get_webview_window(window.label()){
+                match event{
+                    WindowEvent::CloseRequested{api,..}=>{api.prevent_close();lifecycle::on_close_requested(&webview);},
+                    WindowEvent::Resized(_)|WindowEvent::Focused(_)=>lifecycle::emit_window_status(&webview),
+                    _=>{},
+                }
+            }
+        })
         .build(context)?;
     app.run(|handle, event| match event {
         RunEvent::ExitRequested { api, .. } => {
@@ -97,9 +118,8 @@ fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.set_focus();
+                if let Err(error) = lifecycle::show_main(app) {
+                    log::warn!("{error}");
                 }
             }
             "quit" => lifecycle::request_exit(app),
@@ -112,9 +132,8 @@ fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
                 ..
             } = event
             {
-                if let Some(window) = tray.app_handle().get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.set_focus();
+                if let Err(error) = lifecycle::show_main(tray.app_handle()) {
+                    log::warn!("{error}");
                 }
             }
         });
@@ -122,5 +141,74 @@ fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
         builder = builder.icon(icon.clone());
     }
     builder.build(app)?;
+    Ok(())
+}
+
+fn require_main(window: &tauri::WebviewWindow) -> Result<(), String> {
+    if window.label() == "main" {
+        Ok(())
+    } else {
+        Err("仅主窗口可执行此操作".into())
+    }
+}
+#[tauri::command]
+async fn desktop_ready(window: tauri::WebviewWindow) -> Result<lifecycle::WindowStatus, String> {
+    require_main(&window)?;
+    window.state::<lifecycle::Lifecycle>().ready(&window).await;
+    Ok(lifecycle::window_status(&window))
+}
+#[tauri::command]
+fn desktop_window_action(
+    window: tauri::WebviewWindow,
+    action: String,
+) -> Result<lifecycle::WindowStatus, String> {
+    require_main(&window)?;
+    let result = match action.as_str() {
+        "minimize" => window.minimize(),
+        "maximize" => {
+            if window.is_maximized().map_err(|_| "无法读取窗口状态")? {
+                window.unmaximize()
+            } else {
+                window.maximize()
+            }
+        }
+        "close" => window.close(),
+        _ => return Err("窗口操作无效".into()),
+    };
+    result.map_err(|_| "窗口操作失败，请重试")?;
+    lifecycle::emit_window_status(&window);
+    Ok(lifecycle::window_status(&window))
+}
+#[tauri::command]
+async fn desktop_close_choice(
+    window: tauri::WebviewWindow,
+    choice: String,
+    remember: bool,
+) -> Result<lifecycle::WindowStatus, String> {
+    require_main(&window)?;
+    lifecycle::resolve_close(&window, &choice, remember).await
+}
+#[tauri::command]
+fn desktop_theme(window: tauri::WebviewWindow, theme: String) -> Result<(), String> {
+    require_main(&window)?;
+    let theme = match theme.as_str() {
+        "light" => Some(tauri::Theme::Light),
+        "dark" => Some(tauri::Theme::Dark),
+        "system" => None,
+        _ => return Err("窗口主题无效".into()),
+    };
+    window
+        .set_theme(theme)
+        .map_err(|_| "无法更新窗口主题".into())
+}
+
+#[tauri::command]
+fn desktop_smoke_tray_quit(window: tauri::WebviewWindow) -> Result<(), String> {
+    require_main(&window)?;
+    if !window.state::<lifecycle::Lifecycle>().is_smoke() {
+        return Err("仅隔离验收可调用".into());
+    }
+    // Same exit path as the tray menu. No global process or window operations.
+    lifecycle::request_exit(window.app_handle());
     Ok(())
 }

@@ -1,33 +1,79 @@
-name: Test
-
+name: Native validation
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
-
+permissions:
+  contents: read
+env:
+  PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/desktop/target/playwright
 jobs:
-  build:
-    runs-on: ubuntu-latest
-
+  native:
+    runs-on: windows-latest
+    timeout-minutes: 45
     steps:
-    - uses: actions/checkout@v4
-    - name: Set up Python
-      uses: actions/setup-python@v5
+    - uses: actions/checkout@v7.0.1
+    - uses: actions/setup-node@v7.0.0
       with:
-        python-version: '3.10'
-    - name: Install dependencies
+        node-version: "24"
+    - uses: actions/cache@v6.1.0
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          desktop/target
+          desktop/core/target
+          desktop/src-tauri/target
+          desktop/build/npm-cache
+        key: native-${{ runner.os }}-rust195-${{ hashFiles('desktop/**/Cargo.lock', 'desktop/package-lock.json') }}
+        restore-keys: native-${{ runner.os }}-rust195-
+    - name: Install Rust toolchain and project tools
+      shell: pwsh
+      working-directory: desktop
       run: |
-        python -m venv .venv
-        .venv/bin/python -m pip install --upgrade pip
-        .venv/bin/python -m pip install -r requirements.txt
-        .venv/bin/python -m pip install pyright==1.1.411 ruff==0.16.2 types-cachetools
-    - name: Run tests
+        $ErrorActionPreference = "Stop"
+        rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy --target wasm32-unknown-unknown
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        rustup default 1.95.0
+        cargo install trunk --version 0.21.14 --locked --root target/tools
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        cargo install wasm-bindgen-cli --version 0.2.128 --locked --root target/tools
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+    - name: Restore locked dependencies
+      shell: pwsh
+      working-directory: desktop
       run: |
-        .venv/bin/python -m unittest discover
-    - name: Run Pyright
+        npm ci --cache build/npm-cache
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        npx playwright install chromium
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        foreach ($manifest in @("Cargo.toml", "core/Cargo.toml", "src-tauri/Cargo.toml")) {
+          cargo fetch --manifest-path $manifest --locked
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        }
+    - name: Prepare FFmpeg test tools
+      shell: pwsh
       run: |
-        .venv/bin/python -m pyright
-    - name: Run Ruff
-      run: |
-        .venv/bin/python -m ruff check .
+        if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
+          choco install ffmpeg -y --no-progress
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        }
+    - name: Full native verification and noFF build
+      id: verify
+      shell: pwsh
+      working-directory: desktop
+      run: npm run verify
+    - name: Upload verification evidence
+      if: always()
+      uses: actions/upload-artifact@v7.0.1
+      with:
+        name: native-verification
+        path: |
+          desktop/tests/artifacts/**/verification.json
+          desktop/tests/artifacts/**/result.json
+          desktop/tests/artifacts/**/ui-result.json
+          desktop/tests/artifacts/**/*.log
+          desktop/tests/artifacts/**/*.png
+        retention-days: 14
+        if-no-files-found: warn

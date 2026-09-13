@@ -1,87 +1,33 @@
-name: 🐛 Bug report
-description: 创建Bug报告以帮助项目改进。
-title: 🐛[BUG] 请输入标题
-labels: bug
+name: "原生版问题反馈"
+description: "Windows x64 Rust/Tauri 原生版"
 body:
-  - type: markdown
+  - type: input
+    id: version
     attributes:
-      value: |
-        📝 **请在上方的`title`中填写一个简洁明了的标题**，格式建议为：🐛[Bug] 简短描述。
-        例如：🐛[Bug] B站某些直播间无法录制。
-  - type: checkboxes
-    attributes:
-      label: ⚠️ 确认是否已存在类似问题
-      description: >
-        🔍 [点击这里搜索历史issue](https://github.com/ihmily/StreamCap/issues?q=is%3Aissue) 
-        请确保你的问题没有被报告过。
-      options:
-        - label: 我已经搜索过issues，没有找到类似问题
-          required: true
-  - type: dropdown
-    attributes:
-      label: 🔧 运行方式
-      description: 请选择你是如何运行程序的。
-      options:
-        - 直接运行预构建的程序
-        - 使用源代码运行
+      label: "程序版本或构建提交"
     validations:
       required: true
   - type: dropdown
+    id: operating-system
     attributes:
-      label: 🐍 如果是使用源代码运行，请选择你的Python环境版本
-      description: 请选择你运行程序的Python版本。
-      options:
-        - Python 3.10
-        - Python 3.11
-        - Python 3.12
-        - Python 3.13
-        - Other (请在问题中说明)
+      label: "Windows 版本"
+      options: ["Windows 10 x64", "Windows 11 x64"]
     validations:
-      required: false
+      required: true
   - type: dropdown
+    id: launch
     attributes:
-      label: 💻 请选择你的系统环境
-      description: 请选择你运行程序的具体系统版本。
-      options:
-        - Windows 10
-        - Windows 11
-        - macOS (Intel)
-        - macOS (Apple Silicon)
-        - Other (请在问题中说明)
-    validations:
-      required: true
-  - type: checkboxes
-    attributes:
-      label: ⚠️ 确认是否已经重试多次
-      description: >
-        有时可能是你的设备或者网络问题导致的。
-      options:
-        - label: 我已经尝试过多次，仍然出现问题
-          required: true
+      label: "启动方式"
+      options: ["noFF EXE", "Tauri development build"]
   - type: textarea
+    id: description
     attributes:
-      label: 🕹 复现步骤
-      description: |
-        **⚠️ 不能复现将会关闭issue.**
-        请按照以下格式填写：
-        1. 录制的直播间地址是...
-        2. 使用的录制格式是...
-        3. ...
-      placeholder: |
-        1. ...
-        2. ...
-        3. ...
+      label: "问题描述和复现步骤"
+      description: "请描述预期与实际行为，不要提交 Cookie、Token 或账号凭证。"
     validations:
       required: true
   - type: textarea
+    id: environment
     attributes:
-      label: 😯 问题描述
-      description: 详细描述出现的问题，或提供有关截图。
-    validations:
-      required: true
-  - type: textarea
-    attributes:
-      label: 📜 错误信息
-      description: 如果有，请贴出相关的日志错误信息或者截图。
-    validations:
-      required: false
+      label: "相关环境与脱敏日志"
+      description: "WebView2、FFmpeg 版本；源码构建请附 Rust、Node、Trunk 版本。"

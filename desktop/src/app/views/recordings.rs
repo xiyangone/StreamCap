@@ -137,7 +137,7 @@ pub fn RecordingsView() -> impl IntoView {
         busy.set(true);
         leptos::task::spawn_local(async move {
             match gateway::refresh_recordings(state).await {
-                Ok(()) => state.notify("任务列表已同步"),
+                Ok(()) => state.notify("任务列表已刷新"),
                 Err(message) => state.fail(message),
             }
             let _ = busy.try_set(false);
@@ -222,7 +222,7 @@ pub fn RecordingsView() -> impl IntoView {
     });
     view! {
         <div class="page recordings-page">
-            <header class="page-header"><div><span class="eyebrow">"LIVE COLLECTION"</span><h1>"录制任务"<span class="heading-count">{move || state.recordings.get().len()}</span></h1><p>"管理你的直播间，让录制井然有序。"</p></div><div class="header-actions"><button class="button secondary" disabled=move || busy.get() on:click=refresh><Icon name="refresh" size=17 />"同步"</button><button class="button primary" on:click=move |_| add.set(true)><Icon name="plus" size=18 />"添加直播间"</button></div></header>
+            <header class="page-header"><div><h1>"录制任务"<span class="heading-count">{move || state.recordings.get().len()}</span></h1><p>"管理你的直播间，让录制井然有序。"</p></div><div class="header-actions"><button class="button secondary" disabled=move || busy.get() on:click=refresh><Icon name="refresh" size=17 />"刷新列表"</button><button class="button primary" on:click=move |_| add.set(true)><Icon name="plus" size=18 />"添加直播间"</button></div></header>
             <section class="task-toolbar glass" aria-label="任务筛选">
                 <div class="filter-tabs" role="group" aria-label="状态筛选">
                     {[(Filter::All,"全部"),(Filter::Recording,"录制中"),(Filter::Live,"直播中"),(Filter::Monitoring,"监控中"),(Filter::Paused,"已暂停")].into_iter().map(|(mode,label)| view! {

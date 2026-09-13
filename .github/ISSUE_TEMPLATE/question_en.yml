@@ -1,59 +1,33 @@
-name: ❓ (English)Question
-description: Have questions about using the program? Ask them here.
-title: ❓[Question] Please enter a title
-labels: question
+name: "Native usage question"
+description: "Windows x64 Rust/Tauri edition"
 body:
-  - type: markdown
+  - type: input
+    id: version
     attributes:
-      value: |
-        📝 **Please fill in a concise and clear question title in the `title` above**. This will help others quickly understand your question.
-        For example: ❓[Question] How to set the recording quality for a single live room.
-  - type: checkboxes
-    attributes:
-      label: ⚠️ Search for similar issues
-      description: >
-        🔍 [Click here to search historical issues](https://github.com/ihmily/StreamCap/issues?q=is%3Aissue) see if your question has already been asked.
-      options:
-        - label: I have searched the issues and found no similar questions
-          required: true
-  - type: dropdown
-    attributes:
-      label: 🔧 How did you run the program?
-      description: Please select how you ran the program.
-      options:
-        - Executable file run directly
-        - Running with source code
+      label: "App version or build commit"
     validations:
       required: true
   - type: dropdown
+    id: operating-system
     attributes:
-      label: 🐍 If running with source code, please select your Python environment version
-      description: Please select the Python version you used to run the program.
-      options:
-        - Python 3.10
-        - Python 3.11
-        - Python 3.12
-        - Python 3.13
-        - Other (please specify in the question)
+      label: "Windows version"
+      options: ["Windows 10 x64", "Windows 11 x64"]
     validations:
-      required: false
+      required: true
   - type: dropdown
+    id: launch
     attributes:
-      label: 💻 Please select your system environment
-      description: Please select the specific system version you are running the program on.
-      options:
-        - Windows 10
-        - Windows 11
-        - macOS (Intel)
-        - macOS (Apple Silicon)
-        - Other (please specify in the question)
+      label: "How was the app launched?"
+      options: ["noFF EXE", "Tauri development build"]
+  - type: textarea
+    id: description
+    attributes:
+      label: "Description and reproduction"
+      description: "Include expected and actual behavior. Never post cookies, tokens or account credentials."
     validations:
       required: true
   - type: textarea
+    id: environment
     attributes:
-      label: 🤔 Question details
-      description: Please provide all the details relevant to your question.
-      placeholder: |
-        What is your question about?
-    validations:
-      required: true
+      label: "Relevant environment and sanitized logs"
+      description: "WebView2/FFmpeg versions; for source builds include Rust, Node and Trunk versions."

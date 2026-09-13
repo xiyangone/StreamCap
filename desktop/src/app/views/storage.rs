@@ -98,7 +98,7 @@ pub fn StorageView() -> impl IntoView {
                 Ok(()) => {
                     let _ = confirm.try_set(false);
                     let _ = deleting.try_set(None);
-                    state.notify("文件已删除");
+                    state.notify("文件已移至回收站");
                     let _ = reload.try_update(|n| *n = n.wrapping_add(1));
                 }
                 Err(message) => state.fail(message),
@@ -135,7 +135,7 @@ pub fn StorageView() -> impl IntoView {
                             {move || visible().into_iter().map(|item| {
                                 let open_item = item.clone(); let delete_item = item.clone(); let row_name = item.name.clone();
                                 let icon = match kind(&item) { "folder" => "folder", "audio" => "volume", "video" => "video", _ => "file" };
-                                view! { <tr><td><button class="file-name" on:click=move |_| enter.run(open_item.clone())><span class="file-symbol" data-kind=kind(&item)><Icon name=icon size=21 /></span><span><strong>{item.name.clone()}</strong><small>{if item.is_dir { "文件夹".into() } else { item.name.rsplit('.').next().unwrap_or("文件").to_ascii_uppercase() }}</small></span></button></td><td class="file-size">{human_size(item.size)}</td><td class="file-date">{modified_time(item.modified)}</td><td class="file-actions"><button class="icon-button danger-text" aria-label=format!("删除{}",row_name) title="删除文件" disabled=move || busy.get() on:click=move |_| { deleting.set(Some(delete_item.clone())); confirm.set(true); }><Icon name="trash" size=17 /></button></td></tr> }
+                                view! { <tr><td><button class="file-name" on:click=move |_| enter.run(open_item.clone())><span class="file-symbol" data-kind=kind(&item)><Icon name=icon size=21 /></span><span><strong>{item.name.clone()}</strong><small>{if item.is_dir { "文件夹".into() } else { item.name.rsplit('.').next().unwrap_or("文件").to_ascii_uppercase() }}</small></span></button></td><td class="file-size">{human_size(item.size)}</td><td class="file-date">{modified_time(item.modified)}</td><td class="file-actions"><button class="icon-button danger-text" aria-label=format!("回收{}",row_name) title="移至回收站" disabled=move || busy.get() on:click=move |_| { deleting.set(Some(delete_item.clone())); confirm.set(true); }><Icon name="trash" size=17 /></button></td></tr> }
                             }).collect_view()}
                         </tbody></table></div>
                     </Show>
@@ -147,6 +147,6 @@ pub fn StorageView() -> impl IntoView {
             <Show when=move || playing.get().is_some()><MediaPlayer path=Signal::derive(move || playing.get().map(|item| item.path).unwrap_or_default()) /></Show>
             <footer class="modal-actions"><button class="button secondary" on:click=move |_| { if let Some(item) = playing.get_untracked() { copy_path.run(format!("{}/{}", listing.get_untracked().root.trim_end_matches(['/', '\\']), item.path)); } }><Icon name="copy" size=16 />"复制文件路径"</button><button class="button primary" on:click=move |_| playing.set(None)>"关闭预览"</button></footer>
         </Dialog>
-        <ConfirmDialog open=confirm title="永久删除文件" description=Signal::derive(move || deleting.get().map(|item| if item.is_dir { format!("将永久删除“{}”及目录内的所有文件。",item.name) } else { format!("将永久删除“{}”（{}）。",item.name,human_size(item.size)) }).unwrap_or_default()) busy=busy on_confirm=remove />
+        <ConfirmDialog open=confirm title="移至回收站" confirm_text="移至回收站" busy_text="正在回收…" hint="可在系统回收站恢复。无法回收时，原文件会保留。" description=Signal::derive(move || deleting.get().map(|item| if item.is_dir { format!("将移至回收站：“{}”及其目录内容。",item.name) } else { format!("将移至回收站：“{}”（{}）。",item.name,human_size(item.size)) }).unwrap_or_default()) busy=busy on_confirm=remove />
     }
 }

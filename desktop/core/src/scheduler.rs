@@ -50,6 +50,8 @@ pub struct Scheduler {
     stopping: tokio_util::sync::CancellationToken,
     background: tokio_util::task::TaskTracker,
     starting: tokio::sync::Mutex<()>,
+    interval_changed: tokio::sync::watch::Sender<u64>,
+    storage: crate::storage::Storage,
 }
 
 impl Scheduler {
@@ -69,33 +71,35 @@ impl Scheduler {
             resolver,
             ffmpeg,
             recording_enabled,
+            storage: crate::storage::Storage::new(stopping.clone()),
+            interval_changed: tokio::sync::watch::channel(0).0,
             stopping,
             background: tokio_util::task::TaskTracker::new(),
             starting: tokio::sync::Mutex::new(()),
         }
     }
 
-    /// 后台循环：按 loop_time_seconds 周期检测所有开启监控的任务。
+    /// Only committed interval changes re-arm the timer; no immediate platform request is sent.
+    pub fn refresh_interval(&self) {
+        self.interval_changed
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+    }
     pub async fn run(self: Arc<Self>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
-        let interval = {
-            let config = self.config.read().await;
-            config.get_i64("loop_time_seconds", 300).max(30) as u64
-        };
-        log::info!("监控调度启动，检测间隔 {interval}s");
-
+        let mut changed = self.interval_changed.subscribe();
         loop {
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(interval)) => {}
-                _ = shutdown.changed() => {
-                    log::info!("监控调度停止");
-                    return;
-                }
+            let interval = {
+                let config = self.config.read().await;
+                config.get_i64("loop_time_seconds", 300).max(30) as u64
+            };
+            tokio::select! { biased;
+                _=self.stopping.cancelled()=>return,
+                _=shutdown.changed()=>return,
+                _=changed.changed()=>{log::info!("检测间隔已更新，重新计时");continue},
+                _=tokio::time::sleep(Duration::from_secs(interval))=>{},
             }
-
             if !self.recording_enabled.load(Ordering::Relaxed) {
                 continue;
             }
-
             for rec in self.store.all().await {
                 if self.stopping.is_cancelled() {
                     return;
@@ -103,8 +107,8 @@ impl Scheduler {
                 if !rec.monitor_status {
                     continue;
                 }
-                if let Err(err) = self.check(rec.rec_id.clone()).await {
-                    log::debug!("检测 {} 失败: {err}", rec.streamer_name);
+                if let Err(error) = self.check(rec.rec_id.clone()).await {
+                    log::debug!("检测 {} 失败: {error}", rec.streamer_name);
                 }
             }
         }
@@ -358,8 +362,10 @@ impl Scheduler {
         let engine = self.engine.clone();
 
         let stopping = self.stopping.clone();
+        let storage = self.storage.clone();
         self.background.spawn(async move {
-            let mut previous = dir_size_bytes(&output_dir);
+            let Ok(mut previous) = storage.size(output_dir.clone()).await else {return};
+            let mut sampled_at=tokio::time::Instant::now();
             loop {
                 tokio::select!{_=stopping.cancelled()=>return,_=tokio::time::sleep(Duration::from_secs(2))=>{}}
 
@@ -367,11 +373,13 @@ impl Scheduler {
                     return;
                 }
 
-                let current = dir_size_bytes(&output_dir);
+                let current=match storage.size(output_dir.clone()).await {Ok(size)=>size,Err(error)=>{if !stopping.is_cancelled(){log::warn!("统计录制目录失败: {error}");}return}};
                 let delta = current.saturating_sub(previous);
                 previous = current;
 
-                let speed = format!("{:.0} KB/s", delta as f64 / 2.0 / 1024.0);
+                let elapsed=sampled_at.elapsed().as_secs_f64().max(0.001);
+                sampled_at=tokio::time::Instant::now();
+                let speed = format!("{:.0} KB/s", delta as f64 / elapsed / 1024.0);
                 store
                     .update(&rec_id, move |r| {
                         r.speed = Some(speed.clone());
@@ -462,6 +470,7 @@ impl Scheduler {
         let _starting = self.starting.lock().await;
         self.background.close();
         self.background.wait().await;
+        self.storage.shutdown().await;
     }
 
     fn cookie_for(&self, platform_key: &str) -> Option<String> {
@@ -501,22 +510,6 @@ impl Scheduler {
         self.recording_enabled.store(true, Ordering::Relaxed);
         Ok(())
     }
-}
-
-/// 递归统计目录字节数（速度采样用）。
-fn dir_size_bytes(path: &std::path::Path) -> u64 {
-    let mut total = 0;
-    if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.flatten() {
-            let child = entry.path();
-            if child.is_dir() {
-                total += dir_size_bytes(&child);
-            } else if let Ok(meta) = entry.metadata() {
-                total += meta.len();
-            }
-        }
-    }
-    total
 }
 
 /// 海外平台使用更大的缓冲配置（与 Python is_overseas 取向一致）。

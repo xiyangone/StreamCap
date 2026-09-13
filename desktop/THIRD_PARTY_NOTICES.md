@@ -26,3 +26,11 @@ SOFTWARE.
 
 
 Other Rust and frontend dependencies retain their respective licenses; dependency versions are recorded in Cargo.lock.
+
+## Windows API bindings
+
+The Windows Recycle Bin integration uses Microsoft's windows and windows-core Rust crates (0.61 series), licensed under MIT OR Apache-2.0. Source and license: https://github.com/microsoft/windows-rs . No Python recycler or permanent-delete fallback is distributed.
+
+## Tauri JavaScript API
+
+Bundled JavaScript modules from @tauri-apps/api retain their MIT / Apache-2.0 licensing and copyright notices. Copyright 2019-2024 Tauri Programme within The Commons Conservancy. Source: https://github.com/tauri-apps/tauri . These are local frontend assets; no Node.js process is required at runtime.

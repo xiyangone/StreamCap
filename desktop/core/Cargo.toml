@@ -18,7 +18,7 @@ base64 = "0.22"
 regex = "1"
 sm3 = "0.4"
 percent-encoding = "2"
-tokio-util = { version = "0.7", features = ["rt"] }
+tokio-util = { version = "0.7", features = ["rt", "io"] }
 uuid = { version = "1", features = ["v4"] }
 log = "0.4"
 anyhow = "1"
@@ -27,7 +27,11 @@ dirs = "6"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
+windows = { version = "0.61.3", features = ["Win32_UI_Shell", "Win32_System_Com", "Win32_Foundation"] }
+windows-core = "0.61"
+
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 futures = "0.3"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 tempfile = "3"

@@ -11,7 +11,9 @@ pub mod paths;
 pub mod platforms;
 pub mod resolver;
 pub mod scheduler;
+pub mod security;
 pub mod service;
+pub mod storage;
 pub mod store;
 
 pub use api::ApiState;

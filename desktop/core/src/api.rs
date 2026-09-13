@@ -21,7 +21,6 @@ use futures::Stream;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::convert::Infallible;
-use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
@@ -35,6 +34,7 @@ pub struct ApiState {
     pub resolver: Resolver,
     pub workspace: Workspace,
     pub recording_enabled: Arc<AtomicBool>,
+    pub storage: crate::storage::Storage,
 }
 
 pub fn router(state: ApiState) -> Router {
@@ -63,20 +63,17 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/qr/kuaishou/status", get(qr_status))
         .route("/api/qr/kuaishou/cancel", post(qr_cancel))
         .route("/api/events", get(events))
-        .layer(axum::middleware::from_fn_with_state(
-            state.resolver.cancellation(),
-            reject_when_stopping,
-        ))
         .layer(
             tower_http::cors::CorsLayer::new()
                 .allow_origin(
-                    TRUSTED_UI_ORIGINS
+                    crate::security::TRUSTED_UI_ORIGINS
                         .iter()
                         .map(|value| header::HeaderValue::from_static(value))
                         .collect::<Vec<_>>(),
                 )
                 .allow_methods([
                     axum::http::Method::GET,
+                    axum::http::Method::HEAD,
                     axum::http::Method::POST,
                     axum::http::Method::PUT,
                     axum::http::Method::DELETE,
@@ -89,38 +86,11 @@ pub fn router(state: ApiState) -> Router {
                     header::ACCEPT_RANGES,
                 ]),
         )
+        .layer(axum::middleware::from_fn_with_state(
+            state.resolver.cancellation(),
+            crate::security::guard,
+        ))
         .with_state(state)
-}
-
-const TRUSTED_UI_ORIGINS: &[&str] = &[
-    "http://tauri.localhost",
-    "https://tauri.localhost",
-    "tauri://localhost",
-    "http://localhost:1420",
-    "http://127.0.0.1:1420",
-];
-
-async fn reject_when_stopping(
-    State(stop): State<tokio_util::sync::CancellationToken>,
-    request: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> Response {
-    if request.headers().get(header::ORIGIN).is_some_and(|origin| {
-        !origin
-            .to_str()
-            .ok()
-            .is_some_and(|value| TRUSTED_UI_ORIGINS.contains(&value))
-    }) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({"detail":"不允许此网页访问本地 StreamCap 服务"})),
-        )
-            .into_response();
-    }
-    tokio::select! {biased;
-        _=stop.cancelled()=>(StatusCode::SERVICE_UNAVAILABLE,Json(json!({"detail":"应用正在退出"}))).into_response(),
-        response=next.run(request)=>response,
-    }
 }
 
 type ApiResult = Result<Json<Value>, ApiError>;
@@ -366,65 +336,36 @@ async fn list_recording_files(
     State(state): State<ApiState>,
     AxumPath(rec_id): AxumPath<String>,
 ) -> ApiResult {
-    let Some(rec) = state.store.get(&rec_id).await else {
-        return Err(ApiError::not_found(format!(
-            "recording not found: {rec_id}"
-        )));
+    let rec = state
+        .store
+        .get(&rec_id)
+        .await
+        .ok_or_else(|| ApiError::not_found("recording not found"))?;
+    let Some(dir) = rec.recording_dir else {
+        return Ok(Json(json!({"dir":Value::Null,"files":[]})));
     };
-
-    let Some(dir) = rec.recording_dir.as_ref() else {
-        return Ok(Json(json!({ "dir": Value::Null, "files": [] })));
-    };
-
-    let root = {
-        let config = state.config.read().await;
-        config.recordings_root()
-    };
-    let dir_path = std::path::PathBuf::from(dir);
-    if !dir_path.is_dir() {
-        return Ok(Json(json!({ "dir": dir, "files": [] })));
-    }
-
-    // 播放走 /api/videos?path=<相对录制根目录>
-    let relative = dir_path
-        .strip_prefix(&root)
-        .map(|p| p.to_string_lossy().replace('\\', "/"))
-        .ok();
-
-    let mut files: Vec<Value> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&dir_path) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            let Ok(meta) = entry.metadata() else { continue };
-            let name = entry.file_name().to_string_lossy().to_string();
-            let playable = relative
-                .as_ref()
-                .map(|base| format!("{base}/{name}"))
-                .unwrap_or_else(|| name.clone());
-            let modified = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs_f64())
-                .unwrap_or(0.0);
-            files.push(json!({
-                "name": name, "size": meta.len(),
-                "path": playable, "modified": modified,
-            }));
+    let root = state.config.read().await.recordings_root();
+    let directory = std::path::PathBuf::from(&dir);
+    let mut files=state.storage.blocking(move|stop|{
+        crate::storage::check_cancel(&stop)?;
+        if !directory.exists(){return Ok(Vec::<Value>::new())}
+        let root_real=root.canonicalize()?;let dir_real=directory.canonicalize()?;
+        let relative=dir_real.strip_prefix(&root_real).map_err(|_|std::io::Error::new(std::io::ErrorKind::InvalidInput,"此任务目录不在当前录制根目录内"))?.to_string_lossy().replace('\\',"/");
+        for ancestor in directory.ancestors(){
+            if ancestor==root{break}
+            if crate::storage::is_link(&std::fs::symlink_metadata(ancestor)?){return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,"不能通过链接预览录制文件"))}
+            if ancestor.canonicalize()?==root_real{break}
         }
-    }
-
-    // 最新产出的排在前面
+        let listing=crate::storage::list(&root,&relative,&stop)?;
+        Ok(listing.items.into_iter().filter(|item|!item.is_dir).map(|item|json!({"name":item.name,"size":item.size,"path":item.path,"modified":item.modified.unwrap_or(0.0)})).collect::<Vec<_>>())
+    }).await.map_err(ApiError::storage)?;
     files.sort_by(|a, b| {
-        let am = a.get("modified").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let bm = b.get("modified").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        bm.partial_cmp(&am).unwrap_or(std::cmp::Ordering::Equal)
+        b["modified"]
+            .as_f64()
+            .unwrap_or(0.0)
+            .total_cmp(&a["modified"].as_f64().unwrap_or(0.0))
     });
-
-    Ok(Json(json!({ "dir": dir, "files": files })))
+    Ok(Json(json!({"dir":dir,"files":files})))
 }
 
 const EDIT_FIELDS: &[&str] = &[
@@ -700,6 +641,9 @@ async fn update_settings(
     let config = state.config.read().await;
     crate::store::apply_global_defaults(&state.store, &config).await;
     drop(config);
+    if changed.iter().any(|key| key == "loop_time_seconds") {
+        state.scheduler.refresh_interval();
+    }
     state.store.emit("settings", json!({ "changed": changed }));
     state.store.snack("设置已保存");
     Ok(Json(json!({ "ok": true, "changed": changed })))
@@ -747,170 +691,125 @@ async fn list_storage(
     State(state): State<ApiState>,
     Query(query): Query<SubfolderQuery>,
 ) -> ApiResult {
-    let root = {
-        let config = state.config.read().await;
-        config.recordings_root()
-    };
-    let target = match &query.subfolder {
-        Some(sub) => root.join(sub),
-        None => root.clone(),
-    };
-
-    if !target.exists() {
-        return Ok(Json(
-            json!({ "root": root.to_string_lossy(), "items": [], "totalSize": 0 }),
-        ));
-    }
-
-    let mut items: Vec<Value> = Vec::new();
-    let mut total: u64 = 0;
-
-    let entries = std::fs::read_dir(&target).map_err(|e| ApiError::internal(e.to_string()))?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().to_string();
-        let relative = path
-            .strip_prefix(&root)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
-
-        if path.is_dir() {
-            let size = dir_size(&path);
-            total += size;
-            items.push(json!({ "name": name, "isDir": true, "size": size, "path": relative }));
-        } else {
-            let meta = entry
-                .metadata()
-                .map_err(|e| ApiError::internal(e.to_string()))?;
-            total += meta.len();
-            let modified = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs_f64());
-            items.push(json!({
-                "name": name, "isDir": false, "size": meta.len(),
-                "path": relative, "modified": modified,
-            }));
-        }
-    }
-
-    items.sort_by(|a, b| {
-        let a_dir = a.get("isDir").and_then(|v| v.as_bool()).unwrap_or(false);
-        let b_dir = b.get("isDir").and_then(|v| v.as_bool()).unwrap_or(false);
-        b_dir.cmp(&a_dir).then_with(|| {
-            a.get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .cmp(b.get("name").and_then(|v| v.as_str()).unwrap_or(""))
-        })
-    });
-
-    Ok(Json(json!({
-        "root": root.to_string_lossy(),
-        "items": items,
-        "totalSize": total,
-    })))
+    let root = state.config.read().await.recordings_root();
+    let sub = query.subfolder.unwrap_or_default();
+    let listing = state
+        .storage
+        .blocking(move |stop| crate::storage::list(&root, &sub, &stop))
+        .await
+        .map_err(ApiError::storage)?;
+    Ok(Json(
+        serde_json::to_value(listing).map_err(|e| ApiError::internal(e.to_string()))?,
+    ))
 }
-
-fn dir_size(path: &std::path::Path) -> u64 {
-    let mut total = 0;
-    if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.flatten() {
-            let child = entry.path();
-            if child.is_dir() {
-                total += dir_size(&child);
-            } else if let Ok(meta) = entry.metadata() {
-                total += meta.len();
-            }
-        }
-    }
-    total
-}
-
 #[derive(Debug, Deserialize)]
 struct PathQuery {
     path: String,
 }
-
 async fn delete_storage(
     State(state): State<ApiState>,
     Query(query): Query<PathQuery>,
 ) -> ApiResult {
-    let root = {
-        let config = state.config.read().await;
-        config.recordings_root()
-    };
-    let target =
-        safe_join(&root, &query.path).ok_or_else(|| ApiError::bad_request("invalid path"))?;
-    if !target.exists() {
-        return Err(ApiError::not_found("file not found"));
+    let root = state.config.read().await.recordings_root();
+    let relative = query.path;
+    let guard = state.engine.filesystem_guard().await;
+    let checked_root = root.clone();
+    let checked_relative = relative.clone();
+    let target = state
+        .storage
+        .blocking(move |_| crate::storage::checked_target(&checked_root, &checked_relative, false))
+        .await
+        .map_err(ApiError::storage)?;
+    if state.engine.protects_path(&target).await {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "正在录制的文件及其父目录不能回收".into(),
+        ));
     }
-
-    let result = if target.is_dir() {
-        std::fs::remove_dir_all(&target)
-    } else {
-        std::fs::remove_file(&target)
-    };
-    result.map_err(|e| ApiError::internal(format!("删除失败: {e}")))?;
-
-    state.store.snack("已删除");
-    Ok(Json(json!({ "ok": true })))
+    let receipt = state
+        .storage
+        .blocking(move |stop| {
+            let _guard = guard;
+            crate::storage::recycle(&root, &relative, &stop)
+        })
+        .await
+        .map_err(ApiError::storage)?;
+    state.store.snack("已移至回收站");
+    Ok(Json(
+        json!({"ok":true,"recycled":receipt.recycled,"recycledTo":receipt.recycled_to}),
+    ))
 }
-
-/// 防目录穿越：目标必须位于 root 之内。
-fn safe_join(root: &std::path::Path, relative: &str) -> Option<PathBuf> {
-    let root = root.canonicalize().ok()?;
-    let target = root.join(relative);
-    // 目标可能尚不存在（父级规范化后仍需在 root 内）
-    let normalized = target
-        .parent()
-        .and_then(|p| p.canonicalize().ok())
-        .map(|p| p.join(target.file_name().unwrap_or_default()))?;
-    (normalized != root && normalized.starts_with(&root)).then_some(normalized)
-}
-
 async fn stream_video(
     State(state): State<ApiState>,
     Query(query): Query<PathQuery>,
+    method: axum::http::Method,
     headers: HeaderMap,
 ) -> Response {
-    let root = {
-        let config = state.config.read().await;
-        config.recordings_root()
+    use futures::StreamExt;
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let root = state.config.read().await.recordings_root();
+    let opened = state
+        .storage
+        .blocking(move |stop| {
+            crate::storage::check_cancel(&stop)?;
+            let target = crate::storage::checked_target(&root, &query.path, false)?;
+            let file = crate::storage::open_file(&root, &query.path)?;
+            let size = file.metadata()?.len();
+            Ok((file, size, mime_for(&target)))
+        })
+        .await;
+    let (file, size, mime) = match opened {
+        Ok(v) => v,
+        Err(e) => return ApiError::storage(e).into_response(),
     };
-    let Some(target) = safe_join(&root, &query.path) else {
-        return (StatusCode::BAD_REQUEST, "invalid path").into_response();
+    let range = if method == axum::http::Method::HEAD {
+        None
+    } else {
+        headers.get(header::RANGE)
     };
-    let Ok(data) = std::fs::read(&target) else {
-        return (StatusCode::NOT_FOUND, "video not found").into_response();
+    let selected = match range {
+        Some(value) => match value.to_str().ok().and_then(|v| parse_range(v, size)) {
+            Some(r) => Some(r),
+            None => {
+                return Response::builder()
+                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                    .header(header::CONTENT_RANGE, format!("bytes */{size}"))
+                    .header(header::ACCEPT_RANGES, "bytes")
+                    .header(header::CONTENT_LENGTH, "0")
+                    .body(axum::body::Body::empty())
+                    .unwrap()
+            }
+        },
+        None => None,
     };
-
-    let size = data.len();
-    let mime = mime_for(&target);
-
-    // Range 支持（<video> 拖动进度必需）
-    if let Some(range) = headers.get(header::RANGE).and_then(|v| v.to_str().ok()) {
-        if let Some((start, end)) = parse_range(range, size) {
-            let chunk = data[start..=end].to_vec();
-            return Response::builder()
-                .status(StatusCode::PARTIAL_CONTENT)
-                .header(header::CONTENT_TYPE, mime)
-                .header(header::ACCEPT_RANGES, "bytes")
-                .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{size}"))
-                .header(header::CONTENT_LENGTH, chunk.len().to_string())
-                .body(chunk.into())
-                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    let (start, length) = selected.map(|(s, e)| (s, e - s + 1)).unwrap_or((0, size));
+    let mut file = tokio::fs::File::from_std(file);
+    if start != 0 {
+        if let Err(e) = file.seek(std::io::SeekFrom::Start(start)).await {
+            return ApiError::storage(e).into_response();
         }
     }
-
-    Response::builder()
-        .status(StatusCode::OK)
+    let mut response = Response::builder()
+        .status(if selected.is_some() {
+            StatusCode::PARTIAL_CONTENT
+        } else {
+            StatusCode::OK
+        })
         .header(header::CONTENT_TYPE, mime)
         .header(header::ACCEPT_RANGES, "bytes")
-        .header(header::CONTENT_LENGTH, size.to_string())
-        .body(data.into())
+        .header(header::CONTENT_LENGTH, length.to_string());
+    if let Some((start, end)) = selected {
+        response = response.header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{size}"));
+    }
+    let body = if method == axum::http::Method::HEAD || length == 0 {
+        axum::body::Body::empty()
+    } else {
+        let stream = tokio_util::io::ReaderStream::with_capacity(file.take(length), 64 * 1024)
+            .take_until(state.resolver.cancellation().cancelled_owned());
+        axum::body::Body::from_stream(stream)
+    };
+    response
+        .body(body)
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
@@ -928,25 +827,40 @@ fn mime_for(path: &std::path::Path) -> &'static str {
         Some("mov") => "video/quicktime",
         Some("mp3") => "audio/mpeg",
         Some("m4a") => "audio/mp4",
+        Some("webm") => "video/webm",
+        Some("wav") => "audio/wav",
+        Some("aac") => "audio/aac",
+        Some("ogg") => "audio/ogg",
+        Some("ogv") => "video/ogg",
+        Some("flac") => "audio/flac",
         _ => "application/octet-stream",
     }
 }
 
-fn parse_range(header: &str, size: usize) -> Option<(usize, usize)> {
+fn parse_range(header: &str, size: u64) -> Option<(u64, u64)> {
+    if size == 0 {
+        return None;
+    }
     let spec = header.strip_prefix("bytes=")?;
-    let (start_raw, end_raw) = spec.split_once('-')?;
-    let start: usize = start_raw.trim().parse().ok()?;
-    let end: usize = if end_raw.trim().is_empty() {
-        size.saturating_sub(1)
+    if spec.contains(',') {
+        return None;
+    }
+    let (start, end) = spec.split_once('-')?;
+    if start.trim().is_empty() {
+        let count: u64 = end.trim().parse().ok()?;
+        return (count > 0).then_some((size.saturating_sub(count), size - 1));
+    }
+    let start: u64 = start.trim().parse().ok()?;
+    let end = if end.trim().is_empty() {
+        size - 1
     } else {
-        end_raw.trim().parse().ok()?
+        end.trim().parse::<u64>().ok()?.min(size - 1)
     };
-    let end = end.min(size.saturating_sub(1));
-    (start <= end && start < size).then_some((start, end))
+    (start < size && start <= end).then_some((start, end))
 }
 
 // ---------------------------------------------------------------------------
-// 扫码登录（代理到解析 sidecar）
+// 进程内扫码登录
 // ---------------------------------------------------------------------------
 
 async fn qr_start(State(state): State<ApiState>) -> ApiResult {
@@ -1064,6 +978,7 @@ pub async fn bootstrap_with_resolver(
         engine,
         config,
         scheduler,
+        storage: crate::storage::Storage::new(resolver.cancellation()),
         resolver,
         workspace,
         recording_enabled,
@@ -1079,6 +994,7 @@ pub async fn shutdown(state: &ApiState) -> std::io::Result<()> {
     state.resolver.begin_shutdown();
     tokio::join!(state.resolver.shutdown(), state.engine.stop_all(10));
     state.scheduler.finish_background().await;
+    state.storage.shutdown().await;
     for rec in state.store.all().await {
         state
             .store
@@ -1113,9 +1029,9 @@ mod tests {
         std::fs::create_dir_all(root.join("sub")).unwrap();
         std::fs::write(root.join("sub").join("a.mp4"), b"x").unwrap();
 
-        assert!(safe_join(root, "sub/a.mp4").is_some());
-        assert!(safe_join(root, "../outside.mp4").is_none());
-        assert!(safe_join(root, "sub/../../outside.mp4").is_none());
+        assert!(crate::storage::checked_target(root, "sub/a.mp4", false).is_ok());
+        assert!(crate::storage::checked_target(root, "../outside.mp4", false).is_err());
+        assert!(crate::storage::checked_target(root, "sub/../../outside.mp4", false).is_err());
     }
 
     #[test]
