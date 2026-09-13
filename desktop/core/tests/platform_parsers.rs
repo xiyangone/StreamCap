@@ -435,3 +435,28 @@ async fn qr_confirmed_but_unverified_never_exposes_or_saves_cookies() {
     assert_eq!(manager.active_tasks(), 0);
     server.abort();
 }
+
+#[test]
+fn douyin_recommends_flv_without_changing_the_requested_quality() {
+    let info = douyin::parse_json(&room(), Some("OD")).unwrap();
+    assert_eq!(info.record_url, info.flv_url);
+    assert!(info.record_url.ends_with("a.flv"));
+    assert_eq!(
+        info.pick_record_url(false).as_deref(),
+        Some(info.flv_url.as_str())
+    );
+    let lower = douyin::parse_json(&room(), Some("UHD")).unwrap();
+    assert!(lower.record_url.ends_with("b.flv"));
+}
+
+#[test]
+fn douyin_uses_hls_only_when_no_valid_flv_is_provided() {
+    let mut value = room();
+    value["data"]["data"][0]["stream_url"]["flv_pull_url"] = json!({"FULL_HD1":"not-a-url"});
+    let info = douyin::parse_json(&value, None).unwrap();
+    assert!(info.flv_url.is_empty());
+    assert_eq!(info.record_url, info.m3u8_url);
+    assert!(info.record_url.ends_with("a.m3u8"));
+    value["data"]["data"][0]["stream_url"]["hls_pull_url_map"] = json!({});
+    assert!(douyin::parse_json(&value, None).is_err());
+}

@@ -4,6 +4,7 @@
 use crate::config::ConfigStore;
 use crate::engine::{
     build_filename, build_output_dir, with_segment_suffix, Engine, FolderOptions, RecordOptions,
+    RecorderProcess,
 };
 use crate::resolver::{ResolveRequest, Resolver};
 use crate::store::Store;
@@ -49,7 +50,7 @@ pub struct Scheduler {
     recording_enabled: Arc<AtomicBool>,
     stopping: tokio_util::sync::CancellationToken,
     background: tokio_util::task::TaskTracker,
-    starting: tokio::sync::Mutex<()>,
+    starting: Arc<tokio::sync::Mutex<()>>,
     interval_changed: tokio::sync::watch::Sender<u64>,
     storage: crate::storage::Storage,
 }
@@ -75,7 +76,7 @@ impl Scheduler {
             interval_changed: tokio::sync::watch::channel(0).0,
             stopping,
             background: tokio_util::task::TaskTracker::new(),
-            starting: tokio::sync::Mutex::new(()),
+            starting: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -114,91 +115,52 @@ impl Scheduler {
         }
     }
 
-    /// 检测单个任务：解析 → 更新状态 → 按需启停录制。
+    /// Detection and manual recording share metadata updates and name persistence.
     pub async fn check(&self, rec_id: String) -> Result<CheckOutcome, String> {
         if self.stopping.is_cancelled() {
             return Err("应用正在退出".into());
         }
-        let Some(rec) = self.store.get(&rec_id).await else {
+        if self.store.get(&rec_id).await.is_none() {
             return Err(format!("任务不存在: {rec_id}"));
-        };
-
-        let (proxy, quality) = {
-            let config = self.config.read().await;
-            let proxy = if config.get_bool("enable_proxy", true) {
-                config.get_str("proxy_address", "")
-            } else {
-                String::new()
-            };
-            let quality = rec
-                .quality
-                .clone()
-                .unwrap_or_else(|| config.get_str("record_quality", "OD"));
-            (proxy, quality)
-        };
-
-        let cookie = rec
-            .platform_key
-            .as_ref()
-            .and_then(|key| self.cookie_for(key));
-
-        let request = ResolveRequest {
-            url: rec.url.clone(),
-            quality: Some(quality),
-            proxy: if proxy.is_empty() { None } else { Some(proxy) },
-            cookie,
-            platform: rec.platform_key.clone(),
-        };
-
-        let info = match self.resolver.resolve(request).await {
-            Ok(info) => info,
-            Err(err) => {
-                return Ok(CheckOutcome::Failed(err));
-            }
-        };
-
-        if !info.is_live {
-            let was_recording = self.engine.is_recording(&rec_id).await;
-            if was_recording {
-                self.stop_recording(&rec_id).await;
-            }
-            self.store
-                .update(&rec_id, |r| {
-                    r.is_live = false;
-                    r.is_recording = false;
-                    r.live_title = None;
-                    r.speed = None;
-                })
-                .await;
-            return Ok(if was_recording {
-                CheckOutcome::StreamEnded
-            } else {
-                CheckOutcome::Offline
-            });
         }
-
-        // 已开播：更新直播信息
-        let anchor = if info.anchor_name.is_empty() {
-            rec.streamer_name.clone()
-        } else {
-            info.anchor_name.clone()
+        let info = match self.resolve_for(&rec_id).await {
+            Ok(info) => info,
+            Err(error) => return Ok(CheckOutcome::Failed(error)),
         };
-        let live_title = info.title.clone();
-        self.store
-            .update(&rec_id, |r| {
-                r.is_live = true;
-                r.live_title = Some(live_title.clone());
-                if r.streamer_name.is_empty() {
-                    r.streamer_name = anchor.clone();
-                }
-            })
-            .await;
+        self.accept_resolved(rec_id, &info, false).await
+    }
 
+    async fn accept_resolved(
+        &self,
+        rec_id: String,
+        info: &crate::resolver::StreamInfo,
+        manual: bool,
+    ) -> Result<CheckOutcome, String> {
+        let _starting = self.starting.lock().await;
+        if self.stopping.is_cancelled() {
+            return Err("应用正在退出".into());
+        }
+        self.store
+            .apply_stream_info(&rec_id, info)
+            .await
+            .map_err(|error| format!("保存主播名称失败，任务未改动: {error}"))?
+            .ok_or_else(|| format!("任务不存在: {rec_id}"))?;
+        if !info.is_live {
+            let was_recording = self.stop_recording_locked(&rec_id).await;
+            return if manual {
+                Err("该直播间未开播".into())
+            } else {
+                Ok(if was_recording {
+                    CheckOutcome::StreamEnded
+                } else {
+                    CheckOutcome::Offline
+                })
+            };
+        }
         if self.engine.is_recording(&rec_id).await {
             return Ok(CheckOutcome::AlreadyRecording);
         }
-
-        self.start_recording(rec_id.clone(), &info).await?;
+        self.start_recording_locked(rec_id, info).await?;
         Ok(CheckOutcome::RecordingStarted)
     }
 
@@ -209,6 +171,40 @@ impl Scheduler {
         info: &crate::resolver::StreamInfo,
     ) -> Result<(), String> {
         let _starting = self.starting.lock().await;
+        self.start_recording_locked(rec_id, info).await
+    }
+
+    async fn start_recording_locked(
+        &self,
+        rec_id: String,
+        info: &crate::resolver::StreamInfo,
+    ) -> Result<(), String> {
+        let result = self.spawn_recording(rec_id.clone(), info).await;
+        if let Err(error) = &result {
+            if !self.stopping.is_cancelled() && !self.engine.is_recording(&rec_id).await {
+                if let Some(record) = self
+                    .store
+                    .update(&rec_id, |r| {
+                        r.is_recording = false;
+                        r.recording_run = None;
+                        r.speed = None;
+                        r.recording_error = Some(error.clone());
+                    })
+                    .await
+                {
+                    self.store
+                        .snack(format!("{}：录制失败，{error}", record.streamer_name));
+                }
+            }
+        }
+        result
+    }
+
+    async fn spawn_recording(
+        &self,
+        rec_id: String,
+        info: &crate::resolver::StreamInfo,
+    ) -> Result<(), String> {
         if self.stopping.is_cancelled() || !self.recording_enabled.load(Ordering::SeqCst) {
             return Err("已暂停录制或正在退出".into());
         }
@@ -304,11 +300,14 @@ impl Scheduler {
 
         let output_dir_str = output_dir.to_string_lossy().to_string();
 
-        self.engine.start(&ffmpeg, &rec_id, &options).await?;
+        let process = self.engine.start(&ffmpeg, &rec_id, &options).await?;
+        let run_id = process.run_id;
 
         self.store
             .update(&rec_id, move |r| {
                 r.is_recording = true;
+                r.recording_run = Some(run_id);
+                r.recording_error = None;
                 r.recording_dir = Some(output_dir_str.clone());
                 r.speed = Some("0 KB/s".into());
             })
@@ -316,40 +315,49 @@ impl Scheduler {
 
         // 速率采样：ffmpeg 以 -loglevel error 运行，stderr 没有进度行，
         // 只能按产出目录的字节增量计算（Python 侧该字段一直是静态占位符，此处改为真实值）。
-        self.spawn_speed_sampler(rec_id.clone(), output_dir.clone());
+        self.spawn_speed_sampler(process.clone(), output_dir.clone());
 
         // 退出监听：ffmpeg 读完流会自行结束，必须感知并回写状态，
         // 否则任务会永远停留在「录制中」（对应 Python 每秒轮询 returncode 的处理）。
-        self.spawn_exit_watcher(rec_id.clone());
+        self.spawn_exit_watcher(process);
 
         self.store.snack(format!("{anchor}: 开始录制"));
         Ok(())
     }
 
-    /// 每秒检查 ffmpeg 是否已退出；退出后清理录制状态，让监控循环可再次拉起。
-    fn spawn_exit_watcher(&self, rec_id: String) {
+    /// Process exit ends recording, not the last verified platform live status.
+    fn spawn_exit_watcher(&self, process: Arc<RecorderProcess>) {
         let store = self.store.clone();
         let engine = self.engine.clone();
-
+        let starting = self.starting.clone();
         let stopping = self.stopping.clone();
         self.background.spawn(async move {
             loop {
-                tokio::select!{_=stopping.cancelled()=>return,_=tokio::time::sleep(Duration::from_secs(1))=>{}}
-
-                match engine.poll_state(&rec_id).await {
+                tokio::select! { biased;
+                    _ = stopping.cancelled() => return,
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+                }
+                let _starting = tokio::select! { biased;
+                    _ = stopping.cancelled() => return,
+                    guard = starting.lock() => guard,
+                };
+                match engine.poll_state(&process).await {
                     crate::engine::ProcessState::Running => continue,
-                    crate::engine::ProcessState::Exited(code) => {
-                        log::info!("录制 {rec_id} 已结束（ffmpeg 退出码 {code:?}）");
-                        store
-                            .update(&rec_id, |r| {
+                    crate::engine::ProcessState::Exited { code, error } => {
+                        log::info!("录制 {} 已结束（ffmpeg 退出码 {code:?}）", process.rec_id);
+                        let updated = store
+                            .update_for_run(&process.rec_id, process.run_id, |r| {
                                 r.is_recording = false;
-                                r.is_live = false;
+                                r.recording_run = None;
                                 r.speed = None;
+                                r.recording_error = error.clone();
                             })
                             .await;
+                        if let (Some(record), Some(error)) = (updated, error) {
+                            store.snack(format!("{}：录制失败，{error}", record.streamer_name));
+                        }
                         return;
                     }
-                    // 已被停止流程移除，无需再监听
                     crate::engine::ProcessState::Unknown => return,
                 }
             }
@@ -357,7 +365,8 @@ impl Scheduler {
     }
 
     /// 每 2 秒采样一次产出目录大小，换算为速率写回任务状态；录制结束后自行退出。
-    fn spawn_speed_sampler(&self, rec_id: String, output_dir: PathBuf) {
+    fn spawn_speed_sampler(&self, process: Arc<RecorderProcess>, output_dir: PathBuf) {
+        let rec_id = process.rec_id.clone();
         let store = self.store.clone();
         let engine = self.engine.clone();
 
@@ -369,7 +378,7 @@ impl Scheduler {
             loop {
                 tokio::select!{_=stopping.cancelled()=>return,_=tokio::time::sleep(Duration::from_secs(2))=>{}}
 
-                if !engine.is_recording(&rec_id).await {
+                if !engine.is_current(&process).await {
                     return;
                 }
 
@@ -381,7 +390,7 @@ impl Scheduler {
                 sampled_at=tokio::time::Instant::now();
                 let speed = format!("{:.0} KB/s", delta as f64 / elapsed / 1024.0);
                 store
-                    .update(&rec_id, move |r| {
+                    .update_for_run(&rec_id, process.run_id, move |r| {
                         r.speed = Some(speed.clone());
                     })
                     .await;
@@ -393,29 +402,7 @@ impl Scheduler {
     /// 未开播时返回错误——对应 Python `recording_button_on_click` 的「该直播间未开播」提示。
     pub async fn force_start(&self, rec_id: String) -> Result<CheckOutcome, String> {
         let info = self.resolve_for(&rec_id).await?;
-
-        if !info.is_live {
-            self.store
-                .update(&rec_id, |r| {
-                    r.is_live = false;
-                })
-                .await;
-            return Err("该直播间未开播".into());
-        }
-
-        self.store
-            .update(&rec_id, |r| {
-                r.is_live = true;
-                r.live_title = Some(info.title.clone());
-            })
-            .await;
-
-        if self.engine.is_recording(&rec_id).await {
-            return Ok(CheckOutcome::AlreadyRecording);
-        }
-
-        self.start_recording(rec_id, &info).await?;
-        Ok(CheckOutcome::RecordingStarted)
+        self.accept_resolved(rec_id, &info, true).await
     }
 
     /// 解析直播流（check 与 force_start 共用）。
@@ -456,10 +443,17 @@ impl Scheduler {
 
     /// 停止录制并更新状态。
     pub async fn stop_recording(&self, rec_id: &str) -> bool {
+        let _starting = self.starting.lock().await;
+        self.stop_recording_locked(rec_id).await
+    }
+
+    async fn stop_recording_locked(&self, rec_id: &str) -> bool {
         let stopped = self.engine.stop(rec_id, 15).await;
         self.store
             .update(rec_id, |r| {
                 r.is_recording = false;
+                r.recording_run = None;
+                r.recording_error = None;
                 r.speed = None;
             })
             .await;
@@ -469,6 +463,7 @@ impl Scheduler {
     pub async fn finish_background(&self) {
         let _starting = self.starting.lock().await;
         self.background.close();
+        drop(_starting);
         self.background.wait().await;
         self.storage.shutdown().await;
     }
@@ -571,6 +566,55 @@ mod tests {
     use super::*;
     use crate::model::Recording;
     use crate::paths::Workspace;
+
+    #[tokio::test]
+    async fn confirmed_offline_updates_name_and_clears_only_recording_state() {
+        for manual in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let workspace = Workspace::from_repo_root(dir.path());
+            workspace.ensure_ready().unwrap();
+            let store = Store::new(workspace.clone());
+            let mut rec = Recording::new(
+                "offline".into(),
+                "https://media.invalid/live.flv".into(),
+                String::new(),
+            );
+            rec.is_live = true;
+            rec.recording_error = Some("上次拉流失败".into());
+            store.insert(vec![rec]).await.unwrap();
+            let resolver = Resolver::new();
+            let scheduler = Scheduler::new(
+                store.clone(),
+                Engine::new(),
+                Arc::new(RwLock::new(ConfigStore::load(workspace).unwrap())),
+                resolver.clone(),
+                None,
+                Arc::new(AtomicBool::new(true)),
+            );
+            let result = scheduler
+                .accept_resolved(
+                    "offline".into(),
+                    &crate::resolver::StreamInfo {
+                        anchor_name: "已下播主播".into(),
+                        is_live: false,
+                        ..Default::default()
+                    },
+                    manual,
+                )
+                .await;
+            if manual {
+                assert!(result.unwrap_err().contains("未开播"));
+            } else {
+                assert_eq!(result.unwrap(), CheckOutcome::Offline);
+            }
+            let current = store.get("offline").await.unwrap();
+            assert_eq!(current.streamer_name, "已下播主播");
+            assert!(!current.is_live && !current.is_recording);
+            assert!(current.recording_error.is_none() && current.live_title.is_none());
+            resolver.shutdown().await;
+            scheduler.finish_background().await;
+        }
+    }
 
     #[test]
     fn overseas_platforms_use_larger_buffers() {

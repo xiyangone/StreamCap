@@ -253,6 +253,47 @@ try {
     await visible(page.getByText('模拟 FFmpeg 启动失败', { exact: true }));
     assert.equal(record('fixture-5').isRecording, false);
   });
+  await step('自动补名、直播中录制失败与重试恢复保持一致', async () => {
+    const original = structuredClone(record('fixture-5'));
+    Object.assign(record('fixture-5'), { streamerName: '', liveTitle: '测试直播标题', isLive: true, isRecording: false, recordingError: null });
+    h.emit('update', record('fixture-5'));
+    await visible(card('fixture-5').getByRole('button', { name: '未命名直播间', exact: true }));
+    assert.equal(await card('fixture-5').locator('.card-subtitle').innerText(), '测试直播标题');
+    await card('fixture-5').getByRole('button', { name: '开始录制', exact: true }).click();
+    await visible(card('fixture-5').getByRole('button', { name: '自动识别主播', exact: true }));
+    h.failRecording('fixture-5', '播放地址返回 HTTP 404');
+    await visible(card('fixture-5').locator('.card-recording-error'));
+    assert.equal(await card('fixture-5').locator('.badge').innerText(), '直播中');
+    assert.match(await card('fixture-5').locator('.card-recording-error').innerText(), /录制失败：播放地址返回 HTTP 404/);
+    assert.equal(await card('fixture-5').getByRole('button', { name: '开始录制', exact: true }).isEnabled(), true);
+    for (const width of [1280, 800, 375]) {
+      await page.setViewportSize({ width, height: 900 });
+      await card('fixture-5').locator('.card-recording-error').scrollIntoViewIfNeeded();
+      const bounds = await card('fixture-5').locator('.card-recording-error').boundingBox();
+      assert.ok(bounds && bounds.x >= 0 && bounds.x + bounds.width <= width + 1, '错误提示不能溢出视口');
+      await h.shot('recording-failure-' + width);
+    }
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await page.getByRole('button', { name: '列表视图', exact: true }).click();
+    await card('fixture-5').locator('.card-recording-error').scrollIntoViewIfNeeded();
+    await h.shot('recording-failure-list-light');
+    await page.getByRole('button', { name: '切换到深色' }).click();
+    await waitTheme(page, 'dark');
+    await h.shot('recording-failure-list-dark');
+    await page.getByRole('button', { name: '切换到浅色' }).click();
+    await waitTheme(page, 'light');
+    await page.getByRole('button', { name: '网格视图', exact: true }).click();
+    await card('fixture-5').getByRole('button', { name: '开始录制', exact: true }).click();
+    await hidden(card('fixture-5').locator('.card-recording-error'));
+    assert.equal(await card('fixture-5').locator('.badge').innerText(), '录制中');
+    await card('fixture-5').getByRole('button', { name: '停止录制', exact: true }).click();
+    await visible(card('fixture-5').getByRole('button', { name: '开始录制', exact: true }));
+    assert.equal(await card('fixture-5').locator('.card-recording-error').count(), 0);
+    assert.equal(await card('fixture-5').locator('.badge').innerText(), '直播中');
+    Object.assign(record('fixture-5'), original);
+    h.emit('update', record('fixture-5'));
+    await visible(card('fixture-5').getByRole('button', { name: original.streamerName, exact: true }));
+  });
   await step('删除确认、取消与 SSE 删除后无信号生命周期错误', async () => {
     const before = requests('DELETE', '/api/recordings/fixture-7').length;
     await card('fixture-7').getByRole('button', { name: '删除任务' }).click();

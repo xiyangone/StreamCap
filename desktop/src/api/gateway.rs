@@ -49,6 +49,8 @@ pub struct Recording {
     pub is_live: bool,
     #[serde(default)]
     pub is_recording: bool,
+    #[serde(default)]
+    pub recording_error: Option<String>,
     pub live_title: Option<String>,
     pub speed: Option<String>,
     pub recording_dir: Option<String>,

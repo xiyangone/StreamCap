@@ -123,10 +123,12 @@ pub fn parse_json(value: &Value, quality: Option<&str>) -> Result<StreamInfo, St
             .unwrap_or_default()
             .into();
     }
-    info.record_url = if !info.m3u8_url.is_empty() {
-        info.m3u8_url.clone()
-    } else {
+    // Douyin can advertise an HLS URL that returns 404 while its FLV stream is live.
+    // Keep both sources, but recommend FLV at the requested quality for recording.
+    info.record_url = if !info.flv_url.is_empty() {
         info.flv_url.clone()
+    } else {
+        info.m3u8_url.clone()
     };
     if info.record_url.is_empty() {
         return Err("抖音显示在播但没有可用流地址（可能需要登录）".into());

@@ -35,7 +35,7 @@ export function seedRecordings() {
     recId: 'fixture-' + (index + 1), url: 'https://' + key + '.example.invalid/live/' + (index + 1),
     streamerName: name, platform, platformKey: key, recordFormat: 'TS', quality: 'OD',
     segmentRecord: false, segmentTime: '1800', monitorStatus: monitor, isLive: live,
-    isRecording: recording, liveTitle: title, speed: recording ? '2.4 MB/s' : null,
+    isRecording: recording, recordingError: null, liveTitle: title, speed: recording ? '2.4 MB/s' : null,
     recordingDir: recording ? 'X:/Fixture/Recordings/云间电台' : null,
     inheritedFields: Object.keys(inheritance), videoBitrate: null,
   }));
@@ -187,8 +187,8 @@ export async function createHarness(label, options = {}) {
         if (method === 'PUT') { applyEdit(record, body); json(res, { updated: true }); return; }
         if (method === 'POST') {
           if (action === 'monitor') { record.monitorStatus = !record.monitorStatus; if (!record.monitorStatus) record.isRecording = false; }
-          if (action === 'start' || action === 'check') { record.isRecording = true; record.isLive = true; record.speed = '1.8 MB/s'; }
-          if (action === 'stop') { record.isRecording = false; record.speed = null; }
+          if (action === 'start' || action === 'check') { if (!record.streamerName.trim()) record.streamerName = '自动识别主播'; record.isRecording = true; record.isLive = true; record.recordingError = null; record.speed = '1.8 MB/s'; }
+          if (action === 'stop') { record.isRecording = false; record.recordingError = null; record.speed = null; }
           emit('update', record); json(res, { ok: true }); return;
         }
       }
@@ -300,6 +300,7 @@ export async function createHarness(label, options = {}) {
   page.on('console', (message) => { if (message.type() === 'error') consoleErrors.push(message.text()); });
   return {
     base, state, page, context, runDir, blocked, runtimeErrors, consoleErrors, emit,
+    failRecording(id, message) { const record = state.recordings.find(r => r.recId === id); assert.ok(record); record.isRecording = false; record.speed = null; record.recordingError = message; emit('update', record); },
     async restoreNative() {state.native.visible=true;state.native.minimized=false;await page.evaluate(value=>window.__streamcapNativeFixtureEmit("streamcap:window-state",value),nativeStatus());},
     failNext(method, path, message = '模拟操作失败', status = 409) { state.failures.push({ method, path, message, status }); },
     delayNext(method, path, ms = 700) { state.delays.push({ method, path, ms }); },
