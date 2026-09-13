@@ -5,7 +5,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
@@ -387,12 +390,17 @@ pub fn with_segment_suffix(save_path: &str, format: &str, segment: bool) -> Stri
 pub struct RecorderProcess {
     pub rec_id: String,
     pub output_path: PathBuf,
+    pub run_id: uuid::Uuid,
     child: Arc<Mutex<Child>>,
+    stop_requested: AtomicBool,
+    failure: Arc<Mutex<Option<String>>>,
+    stderr_done: tokio_util::sync::CancellationToken,
 }
 
 impl RecorderProcess {
     /// 优雅停止：Windows 下向 stdin 写 `q` 让 ffmpeg 收尾；超时后强杀。
     pub async fn stop(&self, grace_secs: u64) {
+        self.stop_requested.store(true, Ordering::SeqCst);
         {
             let mut child = self.child.lock().await;
             if let Some(stdin) = child.stdin.as_mut() {
@@ -429,12 +437,15 @@ impl RecorderProcess {
 }
 
 /// 录制进程状态查询结果。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProcessState {
     /// 仍在活动表中且进程未退出
     Running,
     /// 进程已自行退出（含退出码），已从活动表移除
-    Exited(Option<i32>),
+    Exited {
+        code: Option<i32>,
+        error: Option<String>,
+    },
     /// 不在活动表中（已停止或从未启动）
     Unknown,
 }
@@ -478,34 +489,66 @@ impl Engine {
         self.active.lock().await.keys().cloned().collect()
     }
 
-    /// 非阻塞查询进程是否已自行退出（ffmpeg 读完流后会自己结束，必须被感知，
-    /// 否则任务会永远停留在「录制中」）。与 Python 每秒轮询 `returncode` 等价。
-    pub async fn poll_state(&self, rec_id: &str) -> ProcessState {
-        let Some(process) = self.active.lock().await.get(rec_id).cloned() else {
-            return ProcessState::Unknown;
-        };
+    pub async fn is_current(&self, process: &Arc<RecorderProcess>) -> bool {
+        !process.stop_requested.load(Ordering::SeqCst)
+            && self
+                .active
+                .lock()
+                .await
+                .get(&process.rec_id)
+                .is_some_and(|current| Arc::ptr_eq(current, process))
+    }
 
+    /// Poll the exact process that this watcher started, never a later attempt with the same task ID.
+    pub async fn poll_state(&self, process: &Arc<RecorderProcess>) -> ProcessState {
+        if !self.is_current(process).await {
+            return ProcessState::Unknown;
+        }
         let exit_code = {
             let mut child = process.child.lock().await;
             match child.try_wait() {
                 Ok(Some(status)) => status.code(),
                 Ok(None) => return ProcessState::Running,
                 Err(err) => {
-                    log::warn!("查询 ffmpeg 状态失败 ({rec_id}): {err}");
-                    None
+                    log::warn!("查询 ffmpeg 状态失败 ({}): {err}", process.rec_id);
+                    return ProcessState::Running;
                 }
             }
         };
-
+        // FFmpeg can exit before the asynchronous stderr reader has consumed its final error.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            process.stderr_done.cancelled(),
+        )
+        .await;
+        let error = if exit_code == Some(0) {
+            None
+        } else {
+            Some(
+                process
+                    .failure
+                    .lock()
+                    .await
+                    .clone()
+                    .unwrap_or_else(|| match exit_code {
+                        Some(code) => format!("FFmpeg 异常退出（退出码 {code}）"),
+                        None => "FFmpeg 异常退出（无退出码）".into(),
+                    }),
+            )
+        };
         let mut active = self.active.lock().await;
-        if active
-            .get(rec_id)
-            .is_some_and(|current| !Arc::ptr_eq(current, &process))
+        if process.stop_requested.load(Ordering::SeqCst)
+            || !active
+                .get(&process.rec_id)
+                .is_some_and(|current| Arc::ptr_eq(current, process))
         {
-            return ProcessState::Running;
+            return ProcessState::Unknown;
         }
-        active.remove(rec_id);
-        ProcessState::Exited(exit_code)
+        active.remove(&process.rec_id);
+        ProcessState::Exited {
+            code: exit_code,
+            error,
+        }
     }
 
     /// 启动录制。
@@ -549,17 +592,30 @@ impl Engine {
             .spawn()
             .map_err(|e| format!("启动 ffmpeg 失败: {e}"))?;
 
+        let failure = Arc::new(Mutex::new(None));
+        let stderr_done = tokio_util::sync::CancellationToken::new();
         if let Some(stderr) = child.stderr.take() {
             let rec_id = rec_id.to_string();
+            let failure = failure.clone();
+            let done = stderr_done.clone().drop_guard();
             self.log_tasks.spawn(async move {
+                let _done = done;
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     let trimmed = line.trim();
                     if !trimmed.is_empty() {
+                        if let Some(summary) = recording_failure_summary(trimmed) {
+                            failure
+                                .lock()
+                                .await
+                                .get_or_insert_with(|| summary.to_string());
+                        }
                         log::warn!("ffmpeg[{rec_id}] {}", redact_stream_url(trimmed));
                     }
                 }
             });
+        } else {
+            stderr_done.cancel();
         }
 
         let output = Path::new(&options.save_path);
@@ -572,7 +628,11 @@ impl Engine {
         let process = Arc::new(RecorderProcess {
             rec_id: rec_id.to_string(),
             output_path,
+            run_id: uuid::Uuid::new_v4(),
             child: Arc::new(Mutex::new(child)),
+            stop_requested: AtomicBool::new(false),
+            failure,
+            stderr_done,
         });
         active.insert(rec_id.to_string(), process.clone());
         Ok(process)
@@ -622,6 +682,28 @@ fn output_is_protected(output: &Path, target: &Path) -> bool {
     }
 }
 
+/// Only fixed summaries reach the UI; never expose raw stderr or signed stream URLs.
+fn recording_failure_summary(message: &str) -> Option<&'static str> {
+    let message = message.to_ascii_lowercase();
+    if message.contains("404 not found") || message.contains("server returned 404") {
+        Some("播放地址返回 HTTP 404")
+    } else if message.contains("403 forbidden") || message.contains("server returned 403") {
+        Some("播放地址拒绝访问（HTTP 403）")
+    } else if message.contains("401 unauthorized") || message.contains("server returned 401") {
+        Some("播放地址需要登录（HTTP 401）")
+    } else if message.contains("timed out") {
+        Some("拉流超时，请检查网络后重试")
+    } else if message.contains("connection refused") {
+        Some("连接播放服务器被拒绝")
+    } else if message.contains("no space left on device") {
+        Some("录制磁盘空间不足")
+    } else if message.contains("permission denied") {
+        Some("无法访问录制文件或播放地址，请检查权限")
+    } else {
+        None
+    }
+}
+
 fn redact_stream_url(message: &str) -> String {
     static URL: std::sync::LazyLock<regex::Regex> =
         std::sync::LazyLock::new(|| regex::Regex::new(r"https?://\S+").expect("static regex"));
@@ -631,6 +713,32 @@ fn redact_stream_url(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn failure_summaries_are_bounded_and_never_include_stream_credentials() {
+        assert_eq!(
+            recording_failure_summary("[in#0] Error opening input: Server returned 404 Not Found"),
+            Some("播放地址返回 HTTP 404")
+        );
+        assert_eq!(
+            recording_failure_summary("Connection timed out"),
+            Some("拉流超时，请检查网络后重试")
+        );
+        assert_eq!(
+            recording_failure_summary("No space left on device"),
+            Some("录制磁盘空间不足")
+        );
+        assert_eq!(
+            recording_failure_summary(
+                "Error opening input https://media.invalid/private.flv?token=fixture-only"
+            ),
+            None
+        );
+        assert_eq!(
+            recording_failure_summary("Unrecognized arbitrary server error"),
+            None
+        );
+    }
+
     #[test]
     fn protects_active_output_patterns_and_ancestors_not_other_files() {
         let root = Path::new("recordings/author");

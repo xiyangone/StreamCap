@@ -107,6 +107,11 @@ pub struct Recording {
     #[serde(default)]
     pub is_recording: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording_error: Option<String>,
+    /// Internal attempt identity; never sent to the UI or persisted with user tasks.
+    #[serde(skip)]
+    pub(crate) recording_run: Option<uuid::Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speed: Option<String>,
@@ -150,6 +155,8 @@ impl Recording {
             video_bitrate: None,
             is_live: false,
             is_recording: false,
+            recording_error: None,
+            recording_run: None,
             live_title: None,
             speed: None,
             display_title: None,

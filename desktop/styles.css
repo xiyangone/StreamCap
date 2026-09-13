@@ -190,6 +190,9 @@ h3 { font-size: 14px; font-weight: 600; }
 .card-name { display: block; text-align: left; font-size: 15px; font-weight: 600; padding: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .card-name:hover { color: var(--accent); }
 .card-subtitle { color: var(--subtle); font-size: 10px; margin-top: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.card-recording-error { display: flex; align-items: flex-start; gap: 6px; color: var(--danger); font-size: 11px; line-height: 1.6; margin-top: 7px; }
+.card-recording-error > .icon { flex: 0 0 auto; margin-top: 2px; }
+.card-recording-error > span { min-width: 0; overflow-wrap: anywhere; }
 .card-meta { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 15px 0; min-width: 0; }
 .card-tags { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; }
 .card-tags span { padding: 2px 6px; border: 1px solid var(--line); background: var(--field); border-radius: 4px; color: var(--muted); font-size: 9px; }

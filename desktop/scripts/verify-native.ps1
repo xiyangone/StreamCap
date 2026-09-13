@@ -34,7 +34,7 @@ try {
         if(-not(Test-Path -LiteralPath (Join-Path (Split-Path -Parent $env:STREAMCAP_TEST_FFMPEG) 'ffprobe.exe'))){throw 'Adjacent ffprobe is required for recording validation'}
     }
     Step 'core-test' {& cargo test --manifest-path core/Cargo.toml --locked --offline}
-    Step 'ffmpeg-recording' {& cargo test --manifest-path core/Cargo.toml --locked --offline --test shutdown ffmpeg_is_stopped_with_a_valid_completed_file -- --ignored}
+    Step 'ffmpeg-recording' {& cargo test --manifest-path core/Cargo.toml --locked --offline --test shutdown ffmpeg_ -- --ignored}
     Step 'tauri-test' {& cargo test --manifest-path src-tauri/Cargo.toml --locked --offline}
     Step 'core-clippy' {& cargo clippy --manifest-path core/Cargo.toml --all-targets --locked --offline -- -D warnings}
     Step 'tauri-clippy' {& cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked --offline -- -D warnings}

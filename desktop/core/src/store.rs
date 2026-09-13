@@ -136,6 +136,40 @@ impl Store {
             .cloned()
     }
 
+    /// Commit an inferred name before publishing it; never replace a user-supplied name.
+    /// Runtime room/recording state stays out of the existing disk schema.
+    pub async fn apply_stream_info(
+        &self,
+        rec_id: &str,
+        info: &crate::resolver::StreamInfo,
+    ) -> io::Result<Option<Recording>> {
+        let mut list = self.inner.write().await;
+        let Some(index) = list.iter().position(|rec| rec.rec_id == rec_id) else {
+            return Ok(None);
+        };
+        let mut updated = list[index].clone();
+        let anchor = info.anchor_name.trim();
+        let name_changed = updated.streamer_name.trim().is_empty() && !anchor.is_empty();
+        if name_changed {
+            updated.streamer_name = anchor.to_string();
+            updated.update_title();
+        }
+        updated.is_live = info.is_live;
+        updated.live_title = (info.is_live && !info.title.is_empty()).then(|| info.title.clone());
+        if !info.is_live {
+            updated.recording_error = None;
+        }
+        if name_changed {
+            let mut next = list.clone();
+            next[index] = updated.clone();
+            self.persist_snapshot(&next)?;
+        }
+        list[index] = updated.clone();
+        drop(list);
+        self.emit("update", serde_json::to_value(&updated)?);
+        Ok(Some(updated))
+    }
+
     pub async fn insert(&self, recordings: Vec<Recording>) -> io::Result<()> {
         let mut list = self.inner.write().await;
         let mut next = list.clone();
@@ -206,14 +240,39 @@ impl Store {
         Ok(edited)
     }
 
-    /// 更新单个任务并广播。`mutate` 返回 false 表示未命中。
+    /// Update runtime state and broadcast only when the task still exists.
     pub async fn update<F>(&self, rec_id: &str, mutate: F) -> Option<Recording>
     where
+        F: FnOnce(&mut Recording),
+    {
+        self.update_when(rec_id, |_| true, mutate).await
+    }
+
+    /// Old exit/sampling callbacks must not mutate a replacement recording attempt.
+    pub(crate) async fn update_for_run<F>(
+        &self,
+        rec_id: &str,
+        run_id: uuid::Uuid,
+        mutate: F,
+    ) -> Option<Recording>
+    where
+        F: FnOnce(&mut Recording),
+    {
+        self.update_when(rec_id, |rec| rec.recording_run == Some(run_id), mutate)
+            .await
+    }
+
+    async fn update_when<P, F>(&self, rec_id: &str, predicate: P, mutate: F) -> Option<Recording>
+    where
+        P: FnOnce(&Recording) -> bool,
         F: FnOnce(&mut Recording),
     {
         let updated = {
             let mut list = self.inner.write().await;
             let slot = list.iter_mut().find(|r| r.rec_id == rec_id)?;
+            if !predicate(slot) {
+                return None;
+            }
             mutate(slot);
             slot.clone()
         };
@@ -568,5 +627,159 @@ mod tests {
         assert!(std::fs::read_to_string(ws.recordings_path())
             .unwrap()
             .contains("not valid json"));
+    }
+}
+
+#[cfg(test)]
+mod resolved_state_tests {
+    use super::*;
+    use crate::resolver::StreamInfo;
+
+    async fn fixture(name: &str) -> (Store, tempfile::TempDir) {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = Workspace::from_repo_root(directory.path());
+        workspace.ensure_ready().unwrap();
+        let store = Store::new(workspace);
+        let mut record = Recording::new(
+            "name".into(),
+            "https://media.invalid/live.flv".into(),
+            name.into(),
+        );
+        record
+            .extra
+            .insert("preserved".into(), serde_json::json!({"value":7}));
+        store.insert(vec![record]).await.unwrap();
+        (store, directory)
+    }
+
+    fn resolved(live: bool, name: &str) -> StreamInfo {
+        StreamInfo {
+            is_live: live,
+            anchor_name: name.into(),
+            title: "直播标题不是主播名".into(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn names_are_saved_while_offline_and_runtime_fields_never_enter_the_disk_schema() {
+        let (store, _directory) = fixture("  ").await;
+        store
+            .update("name", |r| {
+                r.recording_error = Some("旧错误".into());
+                r.recording_run = Some(uuid::Uuid::new_v4());
+            })
+            .await;
+        let updated = store
+            .apply_stream_info("name", &resolved(false, "  自动主播  "))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.streamer_name, "自动主播");
+        assert!(!updated.is_live);
+        assert!(updated.live_title.is_none());
+        assert!(updated.recording_error.is_none());
+        assert!(updated.display_title.unwrap().starts_with("自动主播"));
+        let raw: Value =
+            serde_json::from_slice(&std::fs::read(store.workspace.recordings_path()).unwrap())
+                .unwrap();
+        let object = raw[0].as_object().unwrap();
+        for key in [
+            "recordingError",
+            "recording_error",
+            "recordingRun",
+            "recording_run",
+            "isLive",
+            "is_live",
+            "liveTitle",
+        ] {
+            assert!(!object.contains_key(key), "runtime field leaked: {key}");
+        }
+        assert_eq!(raw[0]["preserved"]["value"], 7);
+        let reopened = Store::new(store.workspace.clone());
+        reopened.load().await.unwrap();
+        assert_eq!(
+            reopened.get("name").await.unwrap().streamer_name,
+            "自动主播"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_names_and_missing_anchor_metadata_never_trigger_a_disk_rewrite() {
+        for (original, anchor) in [
+            ("我的手动备注", "平台新昵称"),
+            ("未命名直播间", "平台主播"),
+            ("", "  "),
+        ] {
+            let (store, _directory) = fixture(original).await;
+            let before = std::fs::read(store.workspace.recordings_path()).unwrap();
+            let updated = store
+                .apply_stream_info("name", &resolved(true, anchor))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(updated.streamer_name, original);
+            assert_eq!(
+                std::fs::read(store.workspace.recordings_path()).unwrap(),
+                before
+            );
+            assert!(updated.is_live);
+            assert_eq!(updated.live_title.as_deref(), Some("直播标题不是主播名"));
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_name_commit_does_not_publish_or_mutate_the_original_task() {
+        let (store, directory) = fixture("").await;
+        let original = store.get("name").await.unwrap();
+        let backup = directory.path().join("fixture-original.json");
+        std::fs::rename(store.workspace.recordings_path(), &backup).unwrap();
+        let bytes = std::fs::read(&backup).unwrap();
+        std::fs::create_dir(store.workspace.recordings_path()).unwrap();
+        let mut events = store.subscribe();
+        assert!(store
+            .apply_stream_info("name", &resolved(true, "自动主播"))
+            .await
+            .is_err());
+        assert_eq!(store.get("name").await.unwrap(), original);
+        assert_eq!(std::fs::read(backup).unwrap(), bytes);
+        assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn late_callbacks_cannot_change_a_new_recording_attempt() {
+        let (store, _directory) = fixture("保留名字").await;
+        let old = uuid::Uuid::new_v4();
+        let current = uuid::Uuid::new_v4();
+        store
+            .update("name", |r| {
+                r.recording_run = Some(current);
+                r.is_live = true;
+                r.is_recording = true;
+            })
+            .await;
+        let mut events = store.subscribe();
+        assert!(store
+            .update_for_run("name", old, |r| {
+                r.is_recording = false;
+                r.recording_error = Some("旧进程错误".into());
+            })
+            .await
+            .is_none());
+        assert!(events.try_recv().is_err());
+        let state = store.get("name").await.unwrap();
+        assert!(state.is_recording && state.recording_error.is_none());
+        assert!(store
+            .update_for_run("name", current, |r| {
+                r.is_recording = false;
+                r.recording_run = None;
+                r.recording_error = Some("本次录制失败".into());
+            })
+            .await
+            .is_some());
+        let event = events.try_recv().unwrap();
+        assert_eq!(event.payload["recordingError"], "本次录制失败");
+        assert!(event.payload.get("recordingRun").is_none());
+        assert!(store.get("name").await.unwrap().is_live);
     }
 }
