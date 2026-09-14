@@ -194,12 +194,7 @@ pub fn parse_recordings(raw: &str) -> Result<Vec<NewRecording>, String> {
 
 /// Keep failures and active captures visible in both dashboard and task sorting.
 pub fn recording_priority(record: &crate::api::gateway::Recording) -> u8 {
-    if !record.is_recording
-        && record
-            .recording_error
-            .as_ref()
-            .is_some_and(|e| !e.is_empty())
-    {
+    if record.needs_attention() {
         0
     } else if record.is_recording {
         1
@@ -215,6 +210,14 @@ pub fn recording_priority(record: &crate::api::gateway::Recording) -> u8 {
 pub fn monitoring_label(record: &crate::api::gateway::Recording) -> &'static str {
     if !record.monitor_status {
         t("监控已暂停")
+    } else if record.verification_required {
+        t("等待手动验证")
+    } else if record
+        .check_error
+        .as_ref()
+        .is_some_and(|error| !error.is_empty())
+    {
+        t("等待检测恢复")
     } else if record.only_notify_no_record == Some(true) {
         t("仅通知，不录制")
     } else if record.scheduled_recording == Some(true) {
@@ -239,6 +242,15 @@ mod tests {
         record.only_notify_no_record = Some(false);
         record.scheduled_recording = Some(true);
         assert_eq!(monitoring_label(&record), "按时间段自动监控");
+        record.verification_required = true;
+        assert_eq!(monitoring_label(&record), "等待手动验证");
+        assert_eq!(recording_priority(&record), 0);
+        assert!(record.needs_attention());
+        record.verification_required = false;
+        record.check_error = Some("检测超时".into());
+        assert_eq!(monitoring_label(&record), "等待检测恢复");
+        assert_eq!(recording_priority(&record), 0);
+        record.check_error = None;
         record.recording_error = Some("fixture".into());
         assert_eq!(recording_priority(&record), 0);
         record.is_recording = true;

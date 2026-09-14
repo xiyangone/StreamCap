@@ -279,19 +279,52 @@ fn douyin_pace_web_stream_url_uses_requested_quality() {
     assert!(info.record_url.ends_with("low.flv"));
 }
 #[test]
-fn kuaishou_mobile_restriction_is_not_offline_and_streams_are_parsed() {
-    let limited =
-        json!({"result":2,"error_msg":"Your action is too frequent. Please try again later."});
-    assert!(kuaishou::parse_mobile(&limited, None)
-        .unwrap_err()
-        .contains("限制访问"));
-    let live = json!({"result":1,"liveStream":{"living":true,"user":{"user_name":"Fixture"},"multiResolutionPlayUrls":[{"urls":[{"bitrate":3000,"url":"https://media.invalid/high.flv"},{"bitrate":800,"url":"https://media.invalid/low.flv"}]}]}});
-    let info = kuaishou::parse_mobile(&live, Some("HD")).unwrap();
-    assert!(info.is_live);
-    assert!(info.record_url.ends_with("low.flv"));
-    let mut offline = live;
-    offline["liveStream"]["living"] = json!(false);
-    assert!(!kuaishou::parse_mobile(&offline, None).unwrap().is_live);
+fn kuaishou_challenge_has_priority_over_empty_author_and_false_live_flag() {
+    let restricted = json!({"liveStream":{},"author":{},"isLiving":false,"errorType":{"type":400002,"title":"请完成滑块验证"}});
+    for code in [json!(400002), json!("400002")] {
+        let mut value = restricted.clone();
+        value["errorType"]["type"] = code;
+        assert_eq!(
+            kuaishou::parse_room(&value, None).unwrap_err(),
+            kuaishou::VERIFICATION_REQUIRED
+        );
+    }
+    let state = json!({"liveroom":{"playList":[restricted,{"author":{"name":"Recommendation"},"isLiving":false,"liveStream":{}}]}});
+    assert_eq!(
+        kuaishou::parse_state(&state, None).unwrap_err(),
+        kuaishou::VERIFICATION_REQUIRED
+    );
+    assert!(kuaishou::parse_state(&json!({"liveroom":{"playList":[]},"room":{"author":{"name":"Wrong room"},"isLiving":false}}),None).is_err());
+    assert!(
+        !kuaishou::parse_room(
+            &json!({"author":{"name":"Fixture"},"isLiving":false,"liveStream":{},"errorType":{}}),
+            None
+        )
+        .unwrap()
+        .is_live
+    );
+}
+#[test]
+fn kuaishou_login_and_room_share_the_same_state_decoder() {
+    let state = json!({"currentUser":{"userId":"42","name":"测试账号"},"liveroom":{"playList":[{"author":{"name":"测试主播"},"isLiving":false,"liveStream":{}}]}});
+    for expression in [
+        state.to_string(),
+        format!(
+            "JSON.parse({})",
+            serde_json::to_string(&state.to_string()).unwrap()
+        ),
+        format!("JSON.parse('{state}')"),
+    ] {
+        let page = format!("<script>window.__INITIAL_STATE__ = {expression};</script>");
+        assert_eq!(
+            kuaishou::parse_page(&page, None).unwrap().anchor_name,
+            "测试主播"
+        );
+        assert_eq!(
+            streamcap_core::platforms::kuaishou_login::verify_login_page(&page, "42").unwrap(),
+            Some("测试账号".into())
+        );
+    }
 }
 #[tokio::test]
 async fn qr_concurrent_start_and_shutdown_leave_no_workers() {

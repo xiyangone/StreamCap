@@ -323,6 +323,39 @@ impl Scheduler {
         self.accept_resolved(rec_id, &info, false).await
     }
 
+    /// Accept data from the same official room after an explicit human verification action.
+    /// The original URL/quality and normal monitoring/schedule rules still apply.
+    pub async fn accept_verified(
+        &self,
+        expected: &crate::model::Recording,
+        info: &crate::resolver::StreamInfo,
+    ) -> Result<CheckOutcome, String> {
+        let _operation = self.begin_check(&expected.rec_id)?;
+        let current = self
+            .store
+            .get(&expected.rec_id)
+            .await
+            .ok_or("验证任务已移除")?;
+        if current.platform_key.as_deref() != Some("kuaishou")
+            || current.url != expected.url
+            || current.quality != expected.quality
+        {
+            return Err("任务已更新，验证结果未应用".into());
+        }
+        if !current.monitor_status || !crate::schedule::active(&current)? {
+            self.store
+                .apply_stream_info(&current.rec_id, info)
+                .await
+                .map_err(|_| "无法保存验证结果")?;
+            return Ok(if current.monitor_status {
+                CheckOutcome::OutsideSchedule
+            } else {
+                CheckOutcome::MonitoringPaused
+            });
+        }
+        self.accept_resolved(current.rec_id, info, false).await
+    }
+
     async fn accept_resolved(
         &self,
         rec_id: String,
@@ -827,6 +860,33 @@ impl Scheduler {
             return Err("任务已更新，旧检测结果已丢弃".into());
         }
         self.pacer.result(key, &result);
+        if let Err(error) = &result {
+            let verification =
+                key == "kuaishou" && crate::platforms::kuaishou::verification_required(error);
+            let changed = rec.check_error.as_ref() != Some(error)
+                || rec.verification_required != verification;
+            self.store
+                .update(rec_id, |record| {
+                    record.check_error = Some(error.clone());
+                    record.verification_required = verification;
+                })
+                .await;
+            if changed {
+                // Never write cookie values, request URLs or platform response bodies to the log.
+                log::warn!(
+                    "平台检测未完成 task={} platform={} verification={}",
+                    rec_id,
+                    key,
+                    verification
+                );
+            }
+            if verification {
+                self.store.emit(
+                    "kuaishouVerificationRequired",
+                    serde_json::json!({"recId":rec_id}),
+                );
+            }
+        }
         result
     }
     pub async fn enforce_windows(self: &Arc<Self>) {
@@ -1037,7 +1097,11 @@ fn free_space_gb(path: &std::path::Path) -> Option<f64> {
     }
 }
 
-fn recording_proxy(config: &ConfigStore, platform: Option<&str>) -> Result<Option<String>, String> {
+/// Shared proxy selection for platform requests, recording and the human verification window.
+pub fn recording_proxy(
+    config: &ConfigStore,
+    platform: Option<&str>,
+) -> Result<Option<String>, String> {
     if !config.get_bool("enable_proxy", false) {
         return Ok(None);
     }

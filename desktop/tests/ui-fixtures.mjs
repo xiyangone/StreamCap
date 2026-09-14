@@ -38,7 +38,7 @@ export function seedRecordings() {
     recId: 'fixture-' + (index + 1), url: 'https://' + key + '.example.invalid/live/' + (index + 1),
     streamerName: name, platform, platformKey: key, recordFormat: 'TS', quality: 'OD',
     segmentRecord: false, segmentTime: '1800', monitorStatus: monitor, isLive: live,
-    isRecording: recording, recordedSeconds: recording ? 3661 : 0, recordingError: null, liveTitle: title, speed: recording ? '2.4 MB/s' : null,
+    isRecording: recording, recordedSeconds: recording ? 3661 : 0, recordingError: null, checkError: null, verificationRequired: false, liveTitle: title, speed: recording ? '2.4 MB/s' : null,
     recordingDir: recording ? 'X:/Fixture/Recordings/云间电台' : null,
     inheritedFields: Object.keys(inheritance), videoBitrate: null,
   }));
@@ -298,6 +298,10 @@ export async function createHarness(label, options = {}) {
     const native=state.native;native.calls.push({command,args:structuredClone(args)});let closeRequest;
     if(command==='desktop_ready')return {value:nativeStatus(),closeRequest:native.pending?{activeRecordings:state.recordings.filter(r=>r.isRecording).length,trayAvailable:native.trayAvailable}:undefined};
     if(command==='desktop_theme'){native.theme=args.theme;return {value:null};}
+    if(command==='desktop_kuaishou_verification'){
+      if(args.action!=='open'||!state.recordings.some(r=>r.recId===args.recId&&r.verificationRequired))throw Error('Invalid verification fixture request');
+      native.verification={active:true,recId:args.recId,busy:false};return {value:native.verification};
+    }
     if(command==='desktop_window_action'){
       if(args.action==='pick-directory')return {value:'X:/Fixture/Picked'};
       if(args.action==='cancel-shutdown'){native.systemShutdown=false;native.shutdownSeconds=null;state.quickShutdown=null;return {value:null,windowState:nativeStatus()};}

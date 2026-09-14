@@ -1,4 +1,4 @@
 [[permission]]
 identifier = "desktop-controls"
-description = "Typed main-window lifecycle operations. The smoke command additionally requires an isolated smoke runtime."
-commands.allow = ["desktop_ready", "desktop_window_action", "desktop_close_choice", "desktop_theme", "desktop_smoke_tray_quit"]
+description = "Typed main-window lifecycle and Kuaishou verification controls. Remote verification pages have no IPC permissions; smoke actions require an isolated runtime."
+commands.allow = ["desktop_ready", "desktop_window_action", "desktop_close_choice", "desktop_theme", "desktop_smoke_tray_quit", "desktop_kuaishou_verification"]

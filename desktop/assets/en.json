@@ -631,5 +631,14 @@
   "失败与正在录制的任务优先显示": "Issues and active recordings appear first",
   "新增直播间自动监控，开播后自动录制；单次录制用于手动操作。": "New rooms are monitored and recorded automatically. Use Record once for manual control.",
   "请先开启监控": "Enable monitoring first",
-  "已添加 {} 个录制任务，已开启自动监控": "Added {} recording tasks with monitoring enabled"
+  "已添加 {} 个录制任务，已开启自动监控": "Added {} recording tasks with monitoring enabled",
+  "待验证": "Verification needed",
+  "检测异常": "Check failed",
+  "重新验证": "Verify",
+  "检测失败：{}": "Check failed: {}",
+  "请在快手窗口完成验证": "Complete verification in the Kuaishou window",
+  "已打开快手验证窗口": "Kuaishou verification window opened",
+  "等待手动验证": "Waiting for manual verification",
+  "等待检测恢复": "Waiting for checks to recover",
+  "有需要处理的任务，请查看下方提示。": "Some tasks need attention. Review the messages below."
 }

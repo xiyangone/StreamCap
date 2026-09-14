@@ -192,3 +192,13 @@ pub async fn pick_directory() -> Result<Option<String>, String> {
 pub async fn cancel_shutdown() -> Result<(), String> {
     call("desktop_window_action", json!({"action":"cancel-shutdown"})).await
 }
+
+/// Only the local main window can request a first-party human verification window.
+pub async fn verify_kuaishou(rec_id: &str) -> Result<(), String> {
+    let _: serde_json::Value = call(
+        "desktop_kuaishou_verification",
+        json!({"action":"open","recId":rec_id}),
+    )
+    .await?;
+    Ok(())
+}

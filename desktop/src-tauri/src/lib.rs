@@ -7,6 +7,7 @@ use streamcap_core::{
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Manager, RunEvent, WindowEvent};
+mod kuaishou_verification;
 mod lifecycle;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -44,6 +45,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     let theme = tauri::async_runtime::block_on(async {
         state.config.read().await.get_str("theme_mode", "system")
     });
+    // Subscribe before monitoring can emit its first verification request during window startup.
+    let native_events = state.store.subscribe();
     let server = Arc::new(tauri::async_runtime::block_on(Server::start(
         state,
         ServerOptions {
@@ -68,9 +71,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     let app=tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
-        .invoke_handler(tauri::generate_handler![desktop_ready,desktop_window_action,desktop_close_choice,desktop_theme,desktop_smoke_tray_quit])
+        .invoke_handler(tauri::generate_handler![desktop_ready,desktop_window_action,desktop_close_choice,desktop_theme,desktop_smoke_tray_quit,desktop_kuaishou_verification])
         .setup(move |app|{
             log::info!("原生后端已启动：{}；无需 Python/Node",setup_server.address());
+            app.manage(kuaishou_verification::Verification::new(setup_server.state().clone(),smoke));
             app.manage(lifecycle::Lifecycle::new(setup_server,smoke.then(||workspace.user_data_dir.join("shutdown.json"))));
             for window_config in &window_configs{
                 let mut window=tauri::WebviewWindowBuilder::from_config(app,window_config)?.theme(match theme.as_str(){"light"=>Some(tauri::Theme::Light),"dark"=>Some(tauri::Theme::Dark),_=>None});
@@ -78,7 +82,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 if smoke{window=window.initialization_script(lifecycle::smoke_transport_script(address));}
                 window.build()?;
             }
-            lifecycle::start_native_events(app.handle());
+            lifecycle::start_native_events(app.handle(),native_events);
             match setup_tray(app){Ok(())=>app.state::<lifecycle::Lifecycle>().set_tray_available(true),Err(error)=>log::warn!("托盘不可用: {error}")}
             if smoke{
                 std::fs::write(workspace.user_data_dir.join("ready.json"),serde_json::to_vec_pretty(&serde_json::json!({"pid":std::process::id(),"address":address.to_string(),"dataDirectory":workspace.user_data_dir,"resolver":"native"}))?)?;
@@ -90,6 +94,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         })
         .on_window_event(|window,event|{
+            if window.label()==kuaishou_verification::LABEL {
+                if let WindowEvent::CloseRequested{api,..}=event { api.prevent_close();kuaishou_verification::cancel_window(window.app_handle()); }
+                return;
+            }
+            if window.label()!="main" { return; }
             if let Some(webview)=window.app_handle().get_webview_window(window.label()){
                 match event{
                     WindowEvent::CloseRequested{api,..}=>{api.prevent_close();lifecycle::on_close_requested(&webview);},
@@ -254,4 +263,54 @@ fn desktop_smoke_tray_quit(window: tauri::WebviewWindow) -> Result<(), String> {
     // Same exit path as the tray menu. No global process or window operations.
     lifecycle::request_exit(window.app_handle());
     Ok(())
+}
+
+#[tauri::command]
+async fn desktop_kuaishou_verification(
+    window: tauri::WebviewWindow,
+    action: String,
+    rec_id: Option<String>,
+    fixture_url: Option<String>,
+) -> Result<kuaishou_verification::Status, String> {
+    require_main(&window)?;
+    let app = window.app_handle();
+    match action.as_str() {
+        "open" => {
+            if fixture_url.is_some() {
+                return Err("普通验证不接受替换地址".into());
+            }
+            kuaishou_verification::open(
+                app,
+                rec_id.as_deref().ok_or("请选择验证任务")?,
+                true,
+                None,
+            )
+            .await?;
+        }
+        "smoke-open" => {
+            if !window.state::<lifecycle::Lifecycle>().is_smoke() {
+                return Err("仅隔离验收可调用".into());
+            }
+            kuaishou_verification::open(
+                app,
+                rec_id.as_deref().ok_or("请选择验证任务")?,
+                true,
+                Some(fixture_url.as_deref().ok_or("缺少隔离夹具地址")?),
+            )
+            .await?;
+        }
+        "smoke-close" => {
+            if !window.state::<lifecycle::Lifecycle>().is_smoke() {
+                return Err("仅隔离验收可调用".into());
+            }
+            if let Some(verification) = app.get_webview_window(kuaishou_verification::LABEL) {
+                verification.close().map_err(|_| "无法关闭隔离验证窗口")?;
+            }
+        }
+        "complete" => kuaishou_verification::begin_complete(app)?,
+        "cancel" => kuaishou_verification::cancel_window(app),
+        "status" => {}
+        _ => return Err("验证操作无效".into()),
+    }
+    Ok(kuaishou_verification::status(app))
 }
