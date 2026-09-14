@@ -63,7 +63,6 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/storage", get(list_storage).delete(delete_storage))
         .route("/api/videos", get(stream_video))
         .route("/api/media/info", get(media_info))
-        .route("/api/media/preview", get(media_preview))
         .route("/api/media/jobs", get(media_jobs))
         .route("/api/media/transcode", get(media_transcode))
         .route(
@@ -246,9 +245,13 @@ async fn create_recordings(
         .insert(created.clone())
         .await
         .map_err(ApiError::storage)?;
+    state.store.snack(format!(
+        "已添加 {} 个录制任务，已开启自动监控",
+        created.len()
+    ));
     state
-        .store
-        .snack(format!("已添加 {} 个录制任务", created.len()));
+        .scheduler
+        .request_monitoring(created.iter().map(|record| record.rec_id.clone()));
 
     Ok(Json(json!({ "created": created })))
 }
@@ -312,6 +315,7 @@ async fn toggle_monitor(
     }
 
     state.store.persist().await.map_err(ApiError::storage)?;
+    state.scheduler.request_monitoring([rec_id.clone()]);
     let updated = state.store.get(&rec_id).await;
     Ok(Json(serde_json::to_value(updated).unwrap_or(Value::Null)))
 }
@@ -827,22 +831,18 @@ async fn delete_storage(
 }
 
 async fn media_info(State(state): State<ApiState>, Query(query): Query<PathQuery>) -> ApiResult {
-    let root = state.config.read().await.recordings_root();
+    let config = state.config.read().await;
+    let root = config.recordings_root();
+    let ffmpeg = crate::paths::find_ffmpeg(config.workspace());
+    drop(config);
     let info = state
         .preview
-        .info(&state.storage, root, query.path)
+        .info(&state.storage, root, query.path, ffmpeg)
         .await
         .map_err(ApiError::storage)?;
     Ok(Json(
         serde_json::to_value(info).map_err(|_| ApiError::internal("预览信息序列化失败"))?,
     ))
-}
-async fn media_preview(State(state): State<ApiState>, Query(query): Query<PathQuery>) -> Response {
-    let root = state.config.read().await.recordings_root();
-    match state.preview.stream(&state.storage, root, query.path).await {
-        Ok(response) => response,
-        Err(error) => ApiError::storage(error).into_response(),
-    }
 }
 async fn media_jobs(State(state): State<ApiState>) -> Json<Value> {
     Json(
@@ -870,9 +870,17 @@ async fn remux_media(
     Ok(Json(json!({"job":job})))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlaybackQuery {
+    path: String,
+    #[serde(default)]
+    start: f64,
+}
+
 async fn media_transcode(
     State(state): State<ApiState>,
-    Query(query): Query<PathQuery>,
+    Query(query): Query<PlaybackQuery>,
 ) -> Response {
     let config = state.config.read().await;
     let root = config.recordings_root();
@@ -883,7 +891,7 @@ async fn media_transcode(
     };
     match state
         .preview
-        .transcode(&state.storage, root, query.path, ffmpeg)
+        .transcode(&state.storage, root, query.path, ffmpeg, query.start)
         .await
     {
         Ok(response) => response,

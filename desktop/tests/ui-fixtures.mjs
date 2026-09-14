@@ -38,7 +38,7 @@ export function seedRecordings() {
     recId: 'fixture-' + (index + 1), url: 'https://' + key + '.example.invalid/live/' + (index + 1),
     streamerName: name, platform, platformKey: key, recordFormat: 'TS', quality: 'OD',
     segmentRecord: false, segmentTime: '1800', monitorStatus: monitor, isLive: live,
-    isRecording: recording, recordingError: null, liveTitle: title, speed: recording ? '2.4 MB/s' : null,
+    isRecording: recording, recordedSeconds: recording ? 3661 : 0, recordingError: null, liveTitle: title, speed: recording ? '2.4 MB/s' : null,
     recordingDir: recording ? 'X:/Fixture/Recordings/云间电台' : null,
     inheritedFields: Object.keys(inheritance), videoBitrate: null,
   }));
@@ -117,6 +117,11 @@ export async function createHarness(label, options = {}) {
   let mp4Promise;
   const mp4Bytes=()=>mp4Promise??=promisify(execFile)(process.env.STREAMCAP_TEST_FFMPEG||'ffmpeg',['-v','error','-nostdin','-f','lavfi','-i','testsrc2=size=160x120:rate=10','-f','lavfi','-i','sine=frequency=440:sample_rate=48000','-t','4','-c:v','libx264','-preset','ultrafast','-g','10','-pix_fmt','yuv420p','-c:a','aac','-movflags','frag_keyframe+empty_moov','-f','mp4','pipe:1'],{windowsHide:true,encoding:'buffer',timeout:15000,maxBuffer:4*1024*1024}).then(({stdout})=>stdout);
   const tsBytes = () => tsPromise ??= promisify(execFile)(process.env.STREAMCAP_TEST_FFMPEG || 'ffmpeg', ['-v','error','-nostdin','-f','lavfi','-i','testsrc2=size=160x120:rate=10','-f','lavfi','-i','sine=frequency=440:sample_rate=48000','-t','6','-c:v','libx264','-preset','ultrafast','-tune','zerolatency','-g','10','-pix_fmt','yuv420p','-c:a','aac','-f','mpegts','pipe:1'], { windowsHide: true, encoding: 'buffer', timeout: 15000, maxBuffer: 4*1024*1024 }).then(({stdout}) => stdout);
+  let tsFilePromise;
+  const segmentBytes=async(start)=>{
+    const file=await (tsFilePromise??=tsBytes().then(async bytes=>{const file=join(temp,'seek-source.ts');await writeFile(file,bytes);return file;}));
+    const {stdout}=await promisify(execFile)(process.env.STREAMCAP_TEST_FFMPEG||'ffmpeg',['-v','error','-nostdin','-ss',String(start),'-i',file,'-t',String(Math.max(.3,6-start)),'-c:v','libx264','-preset','ultrafast','-tune','zerolatency','-c:a','aac','-f','mpegts','pipe:1'],{windowsHide:true,encoding:'buffer',timeout:15000,maxBuffer:4*1024*1024});return stdout;
+  };
   const server = createServer(async (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
@@ -162,7 +167,7 @@ export async function createHarness(label, options = {}) {
       if (path === '/api/recordings' && method === 'POST') {
         const created = (body.items ?? []).map((item) => {
           const base = seedRecordings()[2];
-          const record = { ...base, recId: 'fixture-' + state.nextId++, url: item.url, streamerName: item.streamerName || '新直播间', platform: '自定义流', platformKey: 'custom', liveTitle: null, inheritedFields: Object.keys(inheritance) };
+          const record = { ...base, recId: 'fixture-' + state.nextId++, url: item.url, streamerName: item.streamerName || '新直播间', platform: '自定义流', platformKey: 'custom', monitorStatus: true, liveTitle: null, inheritedFields: Object.keys(inheritance) };
           updateInherited(record);
           if (item.quality) { record.quality = item.quality; record.inheritedFields = record.inheritedFields.filter((key) => key !== 'quality'); }
           state.recordings.push(record); emit('update', record); return record;
@@ -231,15 +236,15 @@ export async function createHarness(label, options = {}) {
         json(res, { root: 'X:/Fixture/Recordings', items, totalSize: items.reduce((sum, item) => sum + item.size, 0) }); return;
       }
       if (path === '/api/media/jobs') { json(res, { jobs: state.mediaJobs, ready: true, activePreviews: state.activePreviews }); return; }
-      if (path === '/api/media/info') { const file = url.searchParams.get('path') || ''; json(res, { format: file.split('.').at(-1), isRecording: state.previewLive, size: file.endsWith('.ts') ? (await tsBytes()).length : 16044 }); return; }
+      if (path === '/api/media/info') { const file = url.searchParams.get('path') || ''; json(res, { format: file.split('.').at(-1), isRecording: state.previewLive, durationSeconds: 6, seekable: true, size: file.endsWith('.ts') ? (await tsBytes()).length : 16044 }); return; }
       if (path === '/api/media/remux') {
         const source = body.path; const output = source.replace(/\.ts$/i, '.mp4');
         if (state.files.some(f => f.path === output)) { json(res, {detail:'同名 MP4 已存在，未覆盖'},409); return; }
         const job={id:'job-'+(state.mediaJobs.length+1),taskId:null,source,output,deleteOriginal:body.deleteOriginal??false,sourceRemoved:false,state:'waiting',message:'等待转 MP4；原 TS 保留'};state.mediaJobs.push(job);emit('mediaJob',job);json(res,{job});
         setTimeout(()=>{job.state='complete';job.message='MP4 已生成并校验；原 TS 保留';state.files.push({name:output.split('/').at(-1),isDir:false,size:24000,path:output,modified:sampleDate});emit('mediaJob',job);},300);return;
       }
-      if (path === '/api/media/preview' || path === '/api/media/transcode' || /^\/api\/recordings\/[^/]+\/preview$/.test(path)) {
-        const bytes=await tsBytes();state.activePreviews++;let closed=false;res.once('close',()=>{closed=true;state.activePreviews--;});res.writeHead(200,{'Content-Type':'video/mp2t'});
+      if (path === '/api/media/transcode' || /^\/api\/recordings\/[^/]+\/preview$/.test(path)) {
+        const bytes=path==='/api/media/transcode'?await segmentBytes(Number(url.searchParams.get('start')||0)):await tsBytes();state.activePreviews++;let closed=false;res.once('close',()=>{closed=true;state.activePreviews--;});res.writeHead(200,{'Content-Type':'video/mp2t'});
         for(let offset=0;offset<bytes.length&&!closed;offset+=4096){res.write(bytes.subarray(offset,offset+4096));await delay(60);}if(!closed)res.end();return;
       }
       if (path === '/api/videos') {

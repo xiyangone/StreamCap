@@ -16,13 +16,13 @@ $profile = Join-Path $run 'data'
 $temp = Join-Path $run 'tmp'; [IO.Directory]::CreateDirectory($temp) | Out-Null
 $testFfmpeg=if($env:STREAMCAP_TEST_FFMPEG){$env:STREAMCAP_TEST_FFMPEG}else{(Get-Command ffmpeg -ErrorAction Stop).Source}
 $mediaDirectory=Join-Path $profile 'downloads';[IO.Directory]::CreateDirectory($mediaDirectory)|Out-Null
-& $testFfmpeg -v error -nostdin -n -f lavfi -i 'testsrc2=size=160x120:rate=10' -f lavfi -i 'sine=frequency=440:sample_rate=48000' -t 20 -c:v libx264 -preset ultrafast -tune zerolatency -g 10 -pix_fmt yuv420p -c:a aac -f mpegts (Join-Path $run 'native-preview.ts')
+& $testFfmpeg -v error -nostdin -n -f lavfi -i 'testsrc2=size=160x120:rate=10' -f lavfi -i 'sine=frequency=440:sample_rate=48000' -t 60 -c:v libx264 -preset ultrafast -tune zerolatency -g 10 -pix_fmt yuv420p -c:a aac -f mpegts (Join-Path $run 'native-preview.ts')
 if($LASTEXITCODE -ne 0){throw 'Synthetic native preview fixture failed'}
 $stdout = Join-Path $run 'app.stdout.log'; $stderr = Join-Path $run 'app.stderr.log'
 $debugListener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0)
 $debugListener.Start(); $debugPort = $debugListener.LocalEndpoint.Port; $debugListener.Stop()
 $arguments = @('--data-dir',('"' + $profile + '"'),'--api-port','0','--smoke-seconds','90')
-$environment = @{TEMP=$temp;TMP=$temp;PATH=([IO.Path]::GetDirectoryName($testFfmpeg)+';'+$env:PATH);WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS="--remote-debugging-port=$debugPort --remote-debugging-address=127.0.0.1"}
+$environment = @{TEMP=$temp;TMP=$temp;WEBVIEW2_USER_DATA_FOLDER=(Join-Path $profile 'webview');PATH=([IO.Path]::GetDirectoryName($testFfmpeg)+';'+$env:PATH);WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS="--remote-debugging-port=$debugPort --remote-debugging-address=127.0.0.1"}
 $process = Start-Process -FilePath $Executable -ArgumentList $arguments -WorkingDirectory $run -PassThru -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -Environment $environment
 $owned = @{}
 $probeProcess = $null
@@ -102,12 +102,23 @@ try {
   const created=await fetch(base+'/api/recordings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:mediaUrl,streamerName:'原生媒体验收'})});assert.equal(created.status,200);const mediaTask=(await created.json()).created[0];
   await page.getByRole('navigation',{name:'主导航'}).getByRole('link',{name:'录制任务',exact:true}).click();
   const mediaCard=page.locator('article[data-rec-id="'+mediaTask.recId+'"]');
-  await mediaCard.getByRole('button',{name:'开始录制',exact:true}).click();
+  await mediaCard.getByRole('button',{name:'单次录制',exact:true}).click();
   await mediaCard.getByRole('button',{name:'停止录制',exact:true}).waitFor();
   await mediaCard.getByRole('button',{name:'预览录制文件'}).click();const previewModal=page.getByRole('dialog',{name:'录制预览',exact:true});
   await page.waitForFunction(()=>{const video=document.querySelector('video');return video?.videoWidth===160&&video.currentTime>0.5;},null,{timeout:20000});
+  const liveSlider=previewModal.getByRole('slider',{name:'播放进度',exact:true});await liveSlider.waitFor();
+  await eventually(()=>liveSlider.getAttribute('max'),value=>Number(value)>5,'growing recording timeline',18000);
+  for(const fraction of [.75,.2]){
+    const max=Number(await liveSlider.getAttribute('max'));const box=await liveSlider.boundingBox();
+    await page.mouse.move(box.x+box.width*.5,box.y+box.height/2);await page.mouse.down();await page.mouse.move(box.x+box.width*fraction,box.y+box.height/2,{steps:6});await page.mouse.up();
+    await page.waitForFunction(({target})=>{const video=document.querySelector('video');return video?.readyState>=2&&video.currentTime>.2&&Math.abs(Number(video.dataset.seekOffset)-target)<1;},{target:max*fraction},{timeout:15000});
+  }
+  await previewModal.getByRole('button',{name:'回到最新',exact:true}).click();
+  await page.waitForFunction(()=>{const video=document.querySelector('video');return video?.readyState>=2&&Number(video.dataset.seekOffset)>2;},null,{timeout:15000});
+  assert.equal((await(await fetch(base+'/api/recordings')).json()).find(r=>r.recId===mediaTask.recId).isRecording,true,'seeking must not stop recording');
   await page.screenshot({path:path.join(output,'native-ts-live-preview.png'),fullPage:true,animations:'disabled'});
-  await previewModal.getByRole('button',{name:'关闭预览',exact:true}).click();
+  assert.equal(await previewModal.locator('.directory-note,.modal-actions').count(),0);
+  await previewModal.getByRole('button',{name:'关闭对话框',exact:true}).click();
   await eventually(()=>page.evaluate(async()=> (await import('/media-player.js')).activePlayerCount()),count=>count===0,'disposed player');
   await mediaCard.getByRole('button',{name:'停止录制',exact:true}).click();
   const completedJob=await eventually(async()=>{const response=await fetch(base+'/api/media/jobs');assert.equal(response.status,200);return (await response.json()).jobs.find(j=>j.taskId===mediaTask.recId&&j.state==='complete');},Boolean,'verified media job',25000);
@@ -116,7 +127,7 @@ try {
   await previewModal.getByRole('listitem').filter({hasText:/\.mp4/}).click();
   await page.waitForFunction(()=>{const video=document.querySelector('video');return video?.videoWidth===160&&video.currentTime>0.5;},null,{timeout:15000});
   await page.screenshot({path:path.join(output,'native-mp4-preview.png'),fullPage:true,animations:'disabled'});
-  await previewModal.getByRole('button',{name:'关闭预览',exact:true}).click();
+  await previewModal.getByRole('button',{name:'关闭对话框',exact:true}).click();
   await eventually(()=>page.evaluate(async()=> (await import('/media-player.js')).activePlayerCount()),count=>count===0,'disposed player');
   const mediaFiles=await(await fetch(base+'/api/recordings/'+mediaTask.recId+'/files')).json();
   assert.equal(mediaFiles.files.some(f=>f.name===path.basename(completedJob.source)),!deleteOriginal);assert.ok(mediaFiles.files.some(f=>f.name===path.basename(completedJob.output)));
@@ -124,7 +135,7 @@ try {
   const sourceExists=await fs.stat(path.join(outputRoot,completedJob.source)).then(()=>true,error=>{if(error.code==='ENOENT')return false;throw error;});
   assert.equal(sourceExists,!deleteOriginal);assert.ok((await fs.stat(path.join(outputRoot,completedJob.output))).size>0);
   await new Promise(resolve=>{mediaSource.closeAllConnections();mediaSource.close(resolve);});
-  const mediaValidation={tsLiveDecoded:true,mp4Decoded:true,originalTsKept:!deleteOriginal,originalTsRemoved:deleteOriginal,previewDisposed:true};
+  const mediaValidation={tsLiveDecoded:true,liveSeekingForwardAndBackward:true,returnToLatest:true,mp4Decoded:true,originalTsKept:!deleteOriginal,originalTsRemoved:deleteOriginal,previewDisposed:true};
   const modal=page.getByRole('dialog',{name:'关闭 StreamCap',exact:true});
   const requestClose=async()=>{await page.getByRole('button',{name:'关闭窗口',exact:true}).click();await modal.waitFor({state:'visible'});};
   await requestClose();assert.equal((await native()).closePending,true);

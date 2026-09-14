@@ -80,6 +80,9 @@ try {
     await waitState(() => state.recordings.length, (n) => n === 8, '添加两条任务');
     const body = requests('POST', '/api/recordings').at(-1).body;
     assert.equal(body.items[0].quality, 'HD'); assert.equal(body.items[1].streamerName, '测试乙');
+    assert.equal(record('fixture-7').monitorStatus,true);assert.equal(record('fixture-8').monitorStatus,true);
+    await visible(card('fixture-8').getByText('自动监控，开播即录',{exact:true}));
+    assert.equal(requests('POST','/api/recordings/fixture-8/start').length,0,'添加不依赖手动开录请求');
   });
   await step('单项编辑、字段契约和实时卡片更新', async () => {
     await card('fixture-3').getByRole('button', { name: '编辑任务' }).click();
@@ -261,14 +264,14 @@ try {
     await navigate('录制任务');
     await card('fixture-5').getByRole('button', { name: '开启监控', exact: true }).click();
     await waitState(() => record('fixture-5').monitorStatus, Boolean, '监控启用');
-    await card('fixture-5').getByRole('button', { name: '开始录制', exact: true }).click();
+    await card('fixture-5').getByRole('button', { name: '单次录制', exact: true }).click();
     await waitState(() => record('fixture-5').isRecording, Boolean, '开始录制');
     assert.equal(await card('fixture-5').getByRole('button', { name: '编辑任务' }).isDisabled(), true);
     assert.equal(await card('fixture-5').getByRole('button', { name: '删除任务' }).isDisabled(), true);
     await card('fixture-5').getByRole('button', { name: '停止录制', exact: true }).click();
     await waitState(() => record('fixture-5').isRecording, (v) => !v, '停止录制');
     h.failNext('POST', '/api/recordings/fixture-5/start', '模拟 FFmpeg 启动失败');
-    await card('fixture-5').getByRole('button', { name: '开始录制', exact: true }).click();
+    await card('fixture-5').getByRole('button', { name: '单次录制', exact: true }).click();
     await visible(page.getByText('模拟 FFmpeg 启动失败', { exact: true }));
     assert.equal(record('fixture-5').isRecording, false);
   });
@@ -278,13 +281,13 @@ try {
     h.emit('update', record('fixture-5'));
     await visible(card('fixture-5').getByRole('button', { name: '未命名直播间', exact: true }));
     assert.equal(await card('fixture-5').locator('.card-subtitle').innerText(), '测试直播标题');
-    await card('fixture-5').getByRole('button', { name: '开始录制', exact: true }).click();
+    await card('fixture-5').getByRole('button', { name: '单次录制', exact: true }).click();
     await visible(card('fixture-5').getByRole('button', { name: '自动识别主播', exact: true }));
     h.failRecording('fixture-5', '播放地址返回 HTTP 404');
     await visible(card('fixture-5').locator('.card-recording-error'));
     assert.equal(await card('fixture-5').locator('.badge').innerText(), '直播中');
     assert.match(await card('fixture-5').locator('.card-recording-error').innerText(), /录制失败：播放地址返回 HTTP 404/);
-    assert.equal(await card('fixture-5').getByRole('button', { name: '开始录制', exact: true }).isEnabled(), true);
+    assert.equal(await card('fixture-5').getByRole('button', { name: '单次录制', exact: true }).isEnabled(), true);
     for (const width of [1280, 800, 375]) {
       await page.setViewportSize({ width, height: 900 });
       await card('fixture-5').locator('.card-recording-error').scrollIntoViewIfNeeded();
@@ -302,11 +305,11 @@ try {
     await page.getByRole('button', { name: '切换到浅色' }).click();
     await waitTheme(page, 'light');
     await page.getByRole('button', { name: '网格视图', exact: true }).click();
-    await card('fixture-5').getByRole('button', { name: '开始录制', exact: true }).click();
+    await card('fixture-5').getByRole('button', { name: '单次录制', exact: true }).click();
     await hidden(card('fixture-5').locator('.card-recording-error'));
     assert.equal(await card('fixture-5').locator('.badge').innerText(), '录制中');
     await card('fixture-5').getByRole('button', { name: '停止录制', exact: true }).click();
-    await visible(card('fixture-5').getByRole('button', { name: '开始录制', exact: true }));
+    await visible(card('fixture-5').getByRole('button', { name: '单次录制', exact: true }));
     assert.equal(await card('fixture-5').locator('.card-recording-error').count(), 0);
     assert.equal(await card('fixture-5').locator('.badge').innerText(), '直播中');
     Object.assign(record('fixture-5'), original);
@@ -330,9 +333,18 @@ try {
       state.previewLive=live;
       await card('fixture-1').getByRole('button',{name:'预览录制文件'}).click();const modal=dialog('录制预览');
       await visible(modal.getByLabel('录制视频预览'));
+      assert.equal(await modal.locator('.directory-note,.modal-actions').count(),0);
+      assert.equal(await modal.getByRole('button',{name:'转为 MP4',exact:true}).count(),0);
+      assert.equal(await modal.getByRole('button',{name:'关闭对话框',exact:true}).count(),1);
       await page.waitForFunction(()=>{const video=document.querySelector('video');return video&&video.videoWidth===160&&video.currentTime>0.5;},null,{timeout:15000});
+      const slider=modal.getByRole('slider',{name:'播放进度',exact:true});await visible(slider);
+      for(const fraction of [.8,.2]){
+        const box=await slider.boundingBox();await page.mouse.move(box.x+box.width*.5,box.y+box.height/2);await page.mouse.down();await page.mouse.move(box.x+box.width*fraction,box.y+box.height/2,{steps:8});await page.mouse.up();
+        await page.waitForFunction(({fraction})=>{const video=document.querySelector('video');const at=Number(video?.dataset.seekOffset);return Math.abs(at-6*fraction)<.5&&video?.readyState>=2&&video.currentTime>.15;},{fraction},{timeout:15000});
+      }
+      if(live){await modal.getByRole('button',{name:'回到最新',exact:true}).click();await page.waitForFunction(()=>{const video=document.querySelector('video');return Number(video?.dataset.seekOffset)>=2.8&&video?.readyState>=2&&video.currentTime>.15;});}
       await h.shot(live?'preview-ts-growing':'preview-ts-completed');
-      await modal.getByRole('button',{name:'关闭预览'}).click();await hidden(modal);
+      await modal.getByRole('button',{name:'关闭对话框'}).click();await hidden(modal);
       await waitState(()=>page.evaluate(async()=> (await import('/media-player.js')).activePlayerCount()),count=>count===0,'播放器实例全部释放');
       await waitState(()=>state.activePreviews,n=>n===0,'关闭预览释放增量连接');
     }
@@ -348,7 +360,7 @@ try {
     const modal = dialog('媒体预览');
     await visible(modal.getByLabel('录制音频预览'));
     await page.waitForFunction(() => document.querySelector('audio')?.readyState >= 1);
-    await modal.getByRole('button', { name: '关闭预览' }).click(); await hidden(modal);
+    await modal.getByRole('button', { name: '关闭对话框' }).click(); await hidden(modal);
     assert.equal(await page.locator('audio').count(), 0);
     await page.getByRole('button', { name: '全部文件', exact: true }).click();
     await page.getByRole('button', { name: /^云间电台.*文件夹/ }).click();
@@ -371,8 +383,9 @@ try {
     await waitState(()=>state.mediaJobs.at(-1)?.state,s=>s==='complete','转换任务状态完成');
     await visible(page.getByRole('button',{name:/^海边日落.mp4/}));
     assert.ok(state.files.some(f=>f.path==='海边日落.ts'));
-    await page.getByRole('button',{name:'转为MP4：海边日落.ts',exact:true}).click();
-    await visible(page.getByText('同名 MP4 已存在，未覆盖',{exact:true}));
+    const convert=page.getByRole('button',{name:'转为MP4：海边日落.ts',exact:true});
+    assert.equal(await convert.isDisabled(),true);assert.match(await convert.innerText(),/转 MP4/);
+    assert.equal(await convert.getAttribute('title'),'同名 MP4 已存在');
   });
   await step('异步预览期间切页，不访问已销毁信号', async () => {
     await navigate('录制任务');
@@ -384,8 +397,8 @@ try {
   });
   await step('区分解析不可用与后端断线，保留任务并自动恢复', async () => {
     state.resolverReady = false;
-    await visible(page.locator('.health-row').getByText('不可用', { exact: true }));
-    assert.equal(await card('fixture-3').getByRole('button', { name: '开始录制', exact: true }).isDisabled(), true);
+    await visible(page.locator('.workbench-service').getByText('解析暂不可用', { exact: true }));
+    assert.equal(await card('fixture-2').getByRole('button', { name: '单次录制', exact: true }).isDisabled(), true);
     const count = state.recordings.length;
     h.setOffline(true);
     await visible(page.locator('.connection-banner'));
@@ -439,7 +452,7 @@ try {
     const source='海边日落.ts',output='海边日落.mp4';state.files=state.files.filter(file=>file.path!==source);
     const job={id:'cleanup-live-fixture',taskId:null,source,output,state:'complete',deleteOriginal:true,sourceRemoved:true,message:'MP4 已生成并校验，源 TS 已清理'};state.mediaJobs.push(job);h.emit('mediaJob',job);
     await page.waitForFunction(()=>document.querySelector('.media-preview')?.dataset.path==='海边日落.mp4'&&document.querySelector('video')?.readyState>=2);await h.shot('preview-after-cleanup');
-    await modal.getByRole('button',{name:'关闭预览'}).click();await hidden(modal);
+    await modal.getByRole('button',{name:'关闭对话框'}).click();await hidden(modal);
   });
   await step('语言切换、快捷键、上次页面恢复和手动更新检查',async()=>{
     const checks=state.requests.filter(request=>/\/(check|start)$/.test(request.path)).length;
@@ -450,6 +463,19 @@ try {
     await page.keyboard.press('Control+5');await page.getByRole('button',{name:'Check for updates',exact:true}).click();await visible(page.getByRole('link',{name:'v0.1.1-fixture',exact:true}));assert.equal(requests('GET','/api/tools/update').length,1);
     await page.keyboard.press('Control+,');await page.getByRole('button',{name:'Appearance and window',exact:true}).click();await page.getByRole('combobox',{name:'Interface language',exact:true}).selectOption('zh_CN');await waitState(()=>page.locator('html').getAttribute('lang'),value=>value==='zh-CN','恢复中文');
     assert.equal(state.requests.filter(request=>/\/(check|start)$/.test(request.path)).length,checks,'切页和重载不触发额外平台检查');
+  });
+  await step('工作台突出录制方案、实时耗时和待处理任务',async()=>{
+    await navigate('总览');
+    await visible(page.getByRole('heading',{name:'当前录制方案',exact:true}));
+    await visible(page.getByText('转 MP4 · 校验后清理 TS',{exact:true}));
+    const selected=record('fixture-2');const original=structuredClone(selected);
+    Object.assign(selected,{isRecording:false,recordingError:'工作台异常夹具'});h.emit('update',selected);
+    await waitState(()=>page.locator('.recording-card').first().getAttribute('data-rec-id'),id=>id==='fixture-2','失败任务置顶');
+    await h.shot('workbench-attention');
+    await navigate('录制任务');await page.getByRole('button',{name:/^需关注/}).click();
+    await visible(card('fixture-2'));assert.equal(await card('fixture-1').count(),0);
+    await page.getByRole('button',{name:/^全部/}).click();
+    Object.assign(selected,original);h.emit('update',selected);
   });
   await step('明确退出而非托盘时显示收尾状态',async()=>{
     await page.getByRole('button',{name:'关闭窗口',exact:true}).click();const close=dialog('关闭 StreamCap');await visible(close);

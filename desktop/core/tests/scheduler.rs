@@ -36,7 +36,14 @@ async fn committed_interval_changes_rearm_without_an_immediate_check() {
     ));
     let (stop, rx) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(scheduler.clone().run(rx));
-    tokio::task::yield_now().await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        state.store.get("timer").await.unwrap().is_live,
+        "启动后应先检查监控任务"
+    );
+    state.store.update("timer", |r| r.is_live = false).await;
     tokio::time::advance(Duration::from_secs(20)).await;
     state
         .config
@@ -286,5 +293,125 @@ async fn conversion_preference_is_preserved_without_changing_detection_or_source
     assert_eq!(reloaded.get_str("video_format", ""), "TS");
     assert!(!reloaded.get_bool("segmented_recording_enabled", true));
     assert_eq!(state.scheduler.postprocess.pending(), 0);
+    streamcap_core::api::shutdown(&state).await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn new_monitors_check_once_without_accelerating_existing_rooms() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = bootstrap(Workspace::from_repo_root(dir.path()))
+        .await
+        .unwrap();
+    state
+        .config
+        .write()
+        .await
+        .update_user_config(
+            json!({"loop_time_seconds":"4500","platform_request_interval":"0"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+        .unwrap();
+    let make = |id: &str| {
+        let mut rec = Recording::new(id.into(), format!("http://127.0.0.1:1/{id}.mp4"), id.into());
+        rec.only_notify_no_record = Some(true);
+        rec
+    };
+    state.store.insert(vec![make("existing")]).await.unwrap();
+    let (stop, receiver) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(state.scheduler.clone().run(receiver));
+    for _ in 0..30 {
+        tokio::task::yield_now().await;
+    }
+    assert!(state.store.get("existing").await.unwrap().is_live);
+    state.store.update("existing", |r| r.is_live = false).await;
+    tokio::time::advance(Duration::from_secs(100)).await;
+    state.store.insert(vec![make("new")]).await.unwrap();
+    state.scheduler.request_monitoring(vec!["new".into(); 5]);
+    for _ in 0..30 {
+        tokio::task::yield_now().await;
+    }
+    assert!(state.store.get("new").await.unwrap().is_live);
+    assert!(!state.store.get("existing").await.unwrap().is_live);
+    assert!(
+        state.engine.active_ids().await.is_empty(),
+        "仅通知模式不能自动录制"
+    );
+    state.store.update("new", |r| r.is_live = false).await;
+    tokio::time::advance(Duration::from_secs(4399)).await;
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert!(!state.store.get("existing").await.unwrap().is_live);
+    assert!(!state.store.get("new").await.unwrap().is_live);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    for _ in 0..30 {
+        tokio::task::yield_now().await;
+    }
+    assert!(state.store.get("existing").await.unwrap().is_live);
+    assert!(
+        !state.store.get("new").await.unwrap().is_live,
+        "新增任务不能跟着旧周期重复检测"
+    );
+    state
+        .store
+        .update("new", |r| r.monitor_status = false)
+        .await;
+    state.scheduler.request_monitoring(["new".into()]);
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(Duration::from_secs(100)).await;
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert!(!state.store.get("new").await.unwrap().is_live);
+    state.store.update("new", |r| r.monitor_status = true).await;
+    state.scheduler.request_monitoring(["new".into()]);
+    for _ in 0..30 {
+        tokio::task::yield_now().await;
+    }
+    assert!(state.store.get("new").await.unwrap().is_live);
+    stop.send(true).unwrap();
+    task.await.unwrap();
+    streamcap_core::api::shutdown(&state).await.unwrap();
+}
+
+#[tokio::test]
+async fn queued_paused_and_outside_schedule_tasks_do_not_start_recording() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = bootstrap(Workspace::from_repo_root(dir.path()))
+        .await
+        .unwrap();
+    let mut paused = Recording::new(
+        "paused".into(),
+        "http://127.0.0.1:1/live.mp4".into(),
+        "paused".into(),
+    );
+    paused.monitor_status = false;
+    let mut scheduled = Recording::new(
+        "scheduled".into(),
+        "http://127.0.0.1:1/scheduled.mp4".into(),
+        "scheduled".into(),
+    );
+    scheduled.scheduled_recording = Some(true);
+    scheduled.scheduled_start_time = Some(
+        (chrono::Local::now() + chrono::Duration::hours(6))
+            .format("%H:%M")
+            .to_string(),
+    );
+    scheduled.monitor_hours = Some("0.5".into());
+    state.store.insert(vec![paused, scheduled]).await.unwrap();
+    assert_eq!(
+        state.scheduler.check("paused".into()).await.unwrap(),
+        streamcap_core::scheduler::CheckOutcome::MonitoringPaused
+    );
+    assert_eq!(
+        state.scheduler.check("scheduled".into()).await.unwrap(),
+        streamcap_core::scheduler::CheckOutcome::OutsideSchedule
+    );
+    assert!(!state.store.get("paused").await.unwrap().is_live);
+    assert!(!state.store.get("scheduled").await.unwrap().is_live);
     streamcap_core::api::shutdown(&state).await.unwrap();
 }

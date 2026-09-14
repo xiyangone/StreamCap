@@ -30,6 +30,7 @@ pub enum CheckOutcome {
     Failed(String),
     OutsideSchedule,
     NotifyOnly,
+    MonitoringPaused,
 }
 
 impl CheckOutcome {
@@ -42,6 +43,7 @@ impl CheckOutcome {
             CheckOutcome::Failed(err) => format!("检测失败: {err}"),
             CheckOutcome::OutsideSchedule => "当前不在定时录制时间段".into(),
             CheckOutcome::NotifyOnly => "直播中，仅通知不录制".into(),
+            CheckOutcome::MonitoringPaused => "监控已暂停".into(),
         }
     }
 }
@@ -68,6 +70,8 @@ pub struct Scheduler {
     background: tokio_util::task::TaskTracker,
     starting: Arc<tokio::sync::Mutex<()>>,
     interval_changed: tokio::sync::watch::Sender<u64>,
+    monitor_requests: std::sync::Mutex<std::collections::HashSet<String>>,
+    monitor_changed: tokio::sync::Notify,
     storage: crate::storage::Storage,
     pub postprocess: crate::postprocess::Postprocessor,
     pub notifications: crate::notifications::Notifications,
@@ -178,6 +182,8 @@ impl Scheduler {
             recording_enabled,
             storage: crate::storage::Storage::new(stopping.clone()),
             interval_changed: tokio::sync::watch::channel(0).0,
+            monitor_requests: std::sync::Mutex::new(std::collections::HashSet::new()),
+            monitor_changed: tokio::sync::Notify::new(),
             stopping,
             postprocess,
             conversion_plans: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
@@ -191,37 +197,104 @@ impl Scheduler {
         self.interval_changed
             .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
-    pub async fn run(self: Arc<Self>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
-        let mut changed = self.interval_changed.subscribe();
-        loop {
-            let interval = {
-                let config = self.config.read().await;
-                config.get_i64("loop_time_seconds", 300).max(30) as u64
-            };
-            tokio::select! { biased;
-                _=self.stopping.cancelled()=>return,
-                _=shutdown.changed()=>return,
-                _=changed.changed()=>{log::info!("检测间隔已更新，重新计时");continue},
-                _=tokio::time::sleep(Duration::from_secs(interval))=>{},
-            }
-            if !self.recording_enabled.load(Ordering::Relaxed) {
-                continue;
-            }
-            use futures::StreamExt;
-            let records = self.store.all().await;
-            let spacing = self
-                .config
+    /// Queue only persisted task IDs. The monitoring service owns execution and shutdown.
+    pub fn request_monitoring(&self, ids: impl IntoIterator<Item = String>) {
+        if self.stopping.is_cancelled() {
+            return;
+        }
+        self.monitor_requests
+            .lock()
+            .expect("monitor requests")
+            .extend(ids);
+        self.monitor_changed.notify_one();
+    }
+
+    async fn monitoring_interval(&self) -> Duration {
+        Duration::from_secs(
+            self.config
                 .read()
                 .await
-                .get_i64("platform_request_interval", 3)
-                .clamp(0, 300) as u64;
-            futures::stream::iter(records.into_iter().filter(|r|r.monitor_status).enumerate()).for_each_concurrent(16,|(index,rec)|{
-                let scheduler=self.clone();async move{
-                    let delay=Duration::from_millis((index as u64*spacing*1000).min(interval*250));
-                    tokio::select!{biased;_=scheduler.stopping.cancelled()=>return,_=tokio::time::sleep(delay)=>{}}
-                    if let Err(error)=scheduler.check(rec.rec_id).await{log::debug!("检测失败: {error}");}
+                .get_i64("loop_time_seconds", 300)
+                .max(30) as u64,
+        )
+    }
+
+    pub async fn run(self: Arc<Self>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+        use futures::StreamExt;
+        use tokio::time::Instant;
+        let mut changed = self.interval_changed.subscribe();
+        let mut interval = self.monitoring_interval().await;
+        let mut deadlines: std::collections::HashMap<String, Instant> = self
+            .store
+            .all()
+            .await
+            .into_iter()
+            .filter(|record| record.monitor_status)
+            .map(|record| (record.rec_id, Instant::now()))
+            .collect();
+        loop {
+            let deadline = deadlines
+                .values()
+                .copied()
+                .min()
+                .unwrap_or_else(|| Instant::now() + Duration::from_secs(86400));
+            tokio::select! { biased;
+                _ = self.stopping.cancelled() => return,
+                _ = shutdown.changed() => return,
+                _ = changed.changed() => {
+                    interval = self.monitoring_interval().await;
+                    for next in deadlines.values_mut() { *next = Instant::now() + interval; }
+                    continue;
+                },
+                _ = self.monitor_changed.notified() => {},
+                _ = tokio::time::sleep_until(deadline) => {},
+            }
+            let requested =
+                std::mem::take(&mut *self.monitor_requests.lock().expect("monitor requests"));
+            let records = self.store.all().await;
+            deadlines.retain(|id, _| records.iter().any(|r| &r.rec_id == id && r.monitor_status));
+            for record in &records {
+                if record.monitor_status && requested.contains(&record.rec_id) {
+                    deadlines.insert(record.rec_id.clone(), Instant::now());
                 }
-            }).await;
+            }
+            let now = Instant::now();
+            let due: Vec<_> = records
+                .into_iter()
+                .filter(|record| {
+                    record.monitor_status
+                        && deadlines
+                            .get(&record.rec_id)
+                            .is_some_and(|next| *next <= now)
+                })
+                .collect();
+            for record in &due {
+                deadlines.insert(record.rec_id.clone(), now + interval);
+            }
+            if !self.recording_enabled.load(Ordering::SeqCst) {
+                continue;
+            }
+            let checks = futures::stream::iter(due)
+                .map(|record| {
+                    let scheduler = self.clone();
+                    async move {
+                        if let Err(error) = scheduler.check(record.rec_id.clone()).await {
+                            log::debug!("检测未完成: {error}");
+                        }
+                        (record.rec_id, Instant::now() + interval)
+                    }
+                })
+                .buffer_unordered(16)
+                .collect::<Vec<_>>();
+            let completed = tokio::select! { biased;
+                _ = self.stopping.cancelled() => return,
+                _ = shutdown.changed() => return,
+                result = checks => result,
+            };
+            // A new task's first check never accelerates another room's existing deadline.
+            for (id, next) in completed {
+                deadlines.insert(id, next);
+            }
         }
     }
 
@@ -235,6 +308,9 @@ impl Scheduler {
             return Err(format!("任务不存在: {rec_id}"));
         }
         if let Some(rec) = self.store.get(&rec_id).await {
+            if !rec.monitor_status {
+                return Ok(CheckOutcome::MonitoringPaused);
+            }
             if !crate::schedule::active(&rec)? {
                 self.stop_recording(&rec_id).await;
                 return Ok(CheckOutcome::OutsideSchedule);
@@ -265,6 +341,19 @@ impl Scheduler {
             .is_some_and(|token| token.is_cancelled())
         {
             return Err("检测已取消".into());
+        }
+        if !manual {
+            let record = self
+                .store
+                .get(&rec_id)
+                .await
+                .ok_or_else(|| format!("任务不存在: {rec_id}"))?;
+            if !record.monitor_status {
+                return Ok(CheckOutcome::MonitoringPaused);
+            }
+            if !crate::schedule::active(&record)? {
+                return Ok(CheckOutcome::OutsideSchedule);
+            }
         }
         let previous = self.store.get(&rec_id).await.map(|r| r.is_live);
         self.store
