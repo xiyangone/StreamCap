@@ -48,7 +48,7 @@ impl PlatformHttp {
             builder = builder.proxy(reqwest::Proxy::all(proxy).map_err(|_| "代理地址无效")?);
         }
         if let Some(cookie) = cookie.filter(|s| !s.trim().is_empty()) {
-            if cookie.contains(['\r', '\n']) {
+            if cookie.contains(['\r', '\n']) || !cookie.contains('=') {
                 return Err("Cookie 包含非法换行".into());
             }
             let origin = Url::parse(&format!("https://{domain}/")).map_err(|_| "平台域名无效")?;
@@ -113,6 +113,18 @@ pub fn validate_url(value: &str) -> Result<Url, String> {
         || url.password().is_some()
     {
         return Err("仅支持不含用户凭证的 HTTP/HTTPS 地址".into());
+    }
+    Ok(url)
+}
+
+pub fn validate_stream_url(value: &str) -> Result<Url, String> {
+    let url = Url::parse(value).map_err(|_| "播放地址无效")?;
+    if !matches!(url.scheme(), "http" | "https" | "rtmp" | "rtmps")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err("播放地址协议或身份信息无效".into());
     }
     Ok(url)
 }

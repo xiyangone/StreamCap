@@ -63,9 +63,30 @@ async fn binding_failure_does_not_start_background_work() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let dir = tempfile::tempdir().unwrap();
-    let state = api::bootstrap(Workspace::from_repo_root(dir.path()))
-        .await
-        .unwrap();
+    let workspace = Workspace::from_repo_root(dir.path());
+    workspace.ensure_ready().unwrap();
+    let journal = dir.path().join("config/media_jobs.json");
+    let root = dir.path().join("downloads");
+    let source = root.join("preserved.ts");
+    std::fs::write(&source, b"preserved fixture").unwrap();
+    let identity =
+        streamcap_core::storage::source_identity(&std::fs::File::open(&source).unwrap()).unwrap();
+    let history = serde_json::json!([{
+        "job": {
+            "id": "previous-completed-job", "taskId": null,
+            "source": "preserved.ts", "output": "preserved.mp4", "state": "complete",
+            "deleteOriginal": false, "sourceRemoved": false, "message": "原 TS 保留"
+        },
+        "input": {
+            "root": root.canonicalize().unwrap(), "identity": identity,
+            "options": {"delete_original": false, "minimum_free_bytes": 0}
+        }
+    }]);
+    let original_journal = serde_json::to_vec_pretty(&history).unwrap();
+    std::fs::write(&journal, &original_journal).unwrap();
+    let state = api::bootstrap(workspace).await.unwrap();
+    assert!(state.scheduler.postprocess.jobs().is_empty());
+    assert_eq!(std::fs::read(&journal).unwrap(), original_journal);
     assert!(Server::start(
         state.clone(),
         ServerOptions {
@@ -76,7 +97,23 @@ async fn binding_failure_does_not_start_background_work() {
     .await
     .is_err());
     assert!(state.engine.active_ids().await.is_empty());
-    state.resolver.shutdown().await;
+    assert!(state.scheduler.postprocess.jobs().is_empty());
+    assert_eq!(std::fs::read(&journal).unwrap(), original_journal);
+    let server = Server::start(
+        state.clone(),
+        ServerOptions {
+            port: 0,
+            monitoring: false,
+        },
+    )
+    .await
+    .unwrap();
+    let restored = state.scheduler.postprocess.jobs();
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].id, "previous-completed-job");
+    assert_eq!(state.scheduler.postprocess.pending(), 0);
+    server.shutdown().await.unwrap();
+    assert_eq!(std::fs::read(&source).unwrap(), b"preserved fixture");
 }
 #[test]
 fn invalid_config_is_not_replaced_and_unsupported_flags_cannot_enable() {
@@ -90,7 +127,7 @@ fn invalid_config_is_not_replaced_and_unsupported_flags_cannot_enable() {
     let values = native_defaults();
     assert_eq!(values["convert_to_mp4"], false);
     assert_eq!(values["delete_original"], false);
-    let patch = serde_json::json!({"convert_to_mp4":true})
+    let patch = serde_json::json!({"check_live_on_browser_refresh":true})
         .as_object()
         .unwrap()
         .clone();

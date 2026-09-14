@@ -23,9 +23,18 @@ uuid = { version = "1", features = ["v4"] }
 log = "0.4"
 anyhow = "1"
 dirs = "6"
+lettre = { version = "0.11.23", default-features = false, features = ["builder", "smtp-transport", "tokio1-native-tls"] }
+md5 = "0.8.1"
+sha2 = "0.11.0"
+aes = "0.9.3"
+cbc = { version = "0.2.1", features = ["alloc"] }
+rquickjs = "0.13.0"
+wasmi = { version = "2.0.0", default-features = false, features = ["stable", "std", "validate", "auto-dispatch"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+png = "0.18"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 windows = { version = "0.61.3", features = ["Win32_UI_Shell", "Win32_System_Com", "Win32_Foundation"] }
 windows-core = "0.61"
@@ -35,3 +44,4 @@ tokio = { version = "1", features = ["test-util"] }
 futures = "0.3"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 tempfile = "3"
+wat = "1.259.0"

@@ -52,8 +52,10 @@ impl StreamInfo {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct ResolveRequest {
+    #[serde(skip_serializing)]
+    pub account: Option<crate::config::PlatformAccount>,
     pub url: String,
     #[serde(default)]
     pub quality: Option<String>,
@@ -104,23 +106,26 @@ impl Resolver {
         !self.stop.is_cancelled()
     }
     pub fn supported_platforms() -> &'static [&'static str] {
-        &["douyin", "kuaishou", "custom"]
+        static KEYS: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+        KEYS.get_or_init(|| {
+            platforms::catalog::PLATFORMS
+                .iter()
+                .map(|p| p.key)
+                .chain(std::iter::once("custom"))
+                .collect()
+        })
+        .as_slice()
     }
     pub async fn resolve(&self, request: ResolveRequest) -> Result<StreamInfo, String> {
         let operation = async {
             let _slot = self.slots.acquire().await.map_err(|_| "解析已停止")?;
             let url = validate_url(&request.url)?;
-            let host = url.host_str().unwrap_or_default();
-            let platform = if host == "douyin.com" || host.ends_with(".douyin.com") {
-                "douyin"
-            } else if host == "live.kuaishou.com" {
-                "kuaishou"
-            } else {
-                "custom"
-            };
+            let detected = platforms::catalog::detect(url.as_str());
+            let platform = detected.map(|p| p.key).unwrap_or("custom");
             if let Some(expected) = request.platform.as_deref().filter(|s| !s.is_empty()) {
+                let expected = platforms::catalog::canonical_key(expected);
                 if !Self::supported_platforms().contains(&expected) {
-                    return Err(format!("{expected} 平台尚未迁移到原生版"));
+                    return Err(format!("{expected} 平台不受支持"));
                 }
                 if expected != platform {
                     return Err("平台标识与直播间域名不匹配".into());
@@ -130,7 +135,8 @@ impl Resolver {
             match platform {
                 "douyin" => platforms::douyin::resolve(&request).await,
                 "kuaishou" => self.kuaishou.resolve(&request).await,
-                _ => platforms::custom::resolve(&request),
+                "custom" => platforms::custom::resolve(&request),
+                _ => platforms::extended::resolve(&request, detected.ok_or("平台未识别")?).await,
             }
         };
         tokio::select! {biased;

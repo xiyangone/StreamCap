@@ -7,22 +7,28 @@ use serde_json::Value;
 /// 宽容解析整数：真实数据里 Python 侧不做类型校验，实测存在
 /// `"monitor_hours": "5,"`（字符串带尾逗号）这类值。
 /// 解析规则必须比 Python 更宽松，否则会拒绝载入用户的合法数据。
-fn lenient_i32<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>
+fn lenient_schedule_hours<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
-    D: Deserializer<'de>,
+    D: serde::Deserializer<'de>,
 {
     Ok(match Option::<Value>::deserialize(deserializer)? {
-        None | Some(Value::Null) => None,
-        Some(Value::Number(n)) => n.as_i64().map(|v| v as i32),
-        Some(Value::String(s)) => s
-            .trim()
-            .trim_end_matches(',')
-            .trim()
-            .parse::<i64>()
-            .ok()
-            .map(|v| v as i32),
+        Some(Value::String(s)) => Some(s.trim().trim_end_matches(',').to_string()),
+        Some(Value::Number(n)) => Some(n.to_string()),
         _ => None,
     })
+}
+
+fn serialize_schedule_hours<S: serde::Serializer>(
+    value: &Option<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match value {
+        None => serializer.serialize_none(),
+        Some(s) => match s.parse::<u32>() {
+            Ok(n) => serializer.serialize_some(&n),
+            Err(_) => serializer.serialize_some(s),
+        },
+    }
 }
 
 /// 宽容解析 64 位整数：同 lenient_i32，用于码率等可能被存成字符串的字段。
@@ -90,7 +96,7 @@ pub struct Recording {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduled_start_time: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub monitor_hours: Option<i32>,
+    pub monitor_hours: Option<String>,
 
     #[serde(default)]
     pub enabled_message_push: Option<bool>,
@@ -106,6 +112,8 @@ pub struct Recording {
     pub is_live: bool,
     #[serde(default)]
     pub is_recording: bool,
+    #[serde(default)]
+    pub recorded_seconds: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recording_error: Option<String>,
     /// Internal attempt identity; never sent to the UI or persisted with user tasks.
@@ -155,6 +163,7 @@ impl Recording {
             video_bitrate: None,
             is_live: false,
             is_recording: false,
+            recorded_seconds: 0.0,
             recording_error: None,
             recording_run: None,
             live_title: None,
@@ -223,8 +232,12 @@ pub struct StoredRecording {
     pub scheduled_recording: Option<bool>,
     #[serde(default)]
     pub scheduled_start_time: Option<String>,
-    #[serde(default, deserialize_with = "lenient_i32")]
-    pub monitor_hours: Option<i32>,
+    #[serde(
+        default,
+        deserialize_with = "lenient_schedule_hours",
+        serialize_with = "serialize_schedule_hours"
+    )]
+    pub monitor_hours: Option<String>,
     #[serde(default)]
     pub recording_dir: Option<String>,
     #[serde(default)]
@@ -277,7 +290,7 @@ impl Recording {
             monitor_status: self.monitor_status,
             scheduled_recording: self.scheduled_recording,
             scheduled_start_time: self.scheduled_start_time.clone(),
-            monitor_hours: self.monitor_hours,
+            monitor_hours: self.monitor_hours.clone(),
             recording_dir: self.recording_dir.clone(),
             enabled_message_push: self.enabled_message_push,
             only_notify_no_record: if inherited("only_notify_no_record") {
@@ -342,32 +355,7 @@ impl Recording {
     }
 }
 pub fn detect_platform(url: &str) -> Option<(String, String)> {
-    const RULES: &[(&str, &str, &str)] = &[
-        ("douyin.com", "抖音", "douyin"),
-        ("tiktok.com", "TikTok", "tiktok"),
-        ("kuaishou.com", "快手", "kuaishou"),
-        ("huya.com", "虎牙", "huya"),
-        ("douyu.com", "斗鱼", "douyu"),
-        ("bilibili.com", "哔哩哔哩", "bilibili"),
-        ("yy.com", "YY", "yy"),
-        ("xiaohongshu.com", "小红书", "xhs"),
-        ("twitch.tv", "Twitch", "twitch"),
-        ("youtube.com", "YouTube", "youtube"),
-        ("chzzk.naver.com", "CHZZK", "chzzk"),
-        ("sooplive", "SOOP", "soop"),
-        ("pandalive", "PandaLive", "pandalive"),
-        ("flextv", "FlexTV", "flextv"),
-        ("winktv", "WinkTV", "winktv"),
-        ("popkontv", "PopkonTV", "popkontv"),
-        ("showroom", "SHOWROOM", "showroom"),
-        ("twitcasting", "TwitCasting", "twitcasting"),
-    ];
-
-    let lower = url.to_lowercase();
-    RULES
-        .iter()
-        .find(|(needle, _, _)| lower.contains(needle))
-        .map(|(_, name, key)| ((*name).to_string(), (*key).to_string()))
+    crate::platforms::catalog::detect(url).map(|p| (p.name.to_string(), p.key.to_string()))
 }
 
 #[cfg(test)]
@@ -396,8 +384,42 @@ mod tests {
     #[test]
     fn detect_platform_matches_known_hosts() {
         let (name, key) = detect_platform("https://live.douyin.com/123").unwrap();
-        assert_eq!(name, "抖音");
+        assert_eq!(name, "抖音直播");
         assert_eq!(key, "douyin");
         assert!(detect_platform("https://unknown.example.com/x").is_none());
+    }
+}
+
+/// Runtime-only media processing status; original task persistence schema is unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaJob {
+    pub id: String,
+    pub task_id: Option<String>,
+    pub source: String,
+    pub output: String,
+    pub state: MediaJobState,
+    pub delete_original: bool,
+    pub source_removed: bool,
+    pub message: String,
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum MediaJobState {
+    Waiting,
+    Running,
+    Verifying,
+    Cleaning,
+    CleanupFailed,
+    Complete,
+    Failed,
+    Cancelled,
+}
+impl MediaJobState {
+    pub fn pending(self) -> bool {
+        matches!(
+            self,
+            Self::Waiting | Self::Running | Self::Verifying | Self::Cleaning
+        )
     }
 }

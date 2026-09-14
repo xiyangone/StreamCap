@@ -5,13 +5,16 @@ import { dirname, extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { chromium } from 'playwright';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 
 const desktop = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const dist = join(desktop, 'dist');
 const apiOrigin = 'http://127.0.0.1:6059';
 const defaults = {
-  record_quality: 'OD', video_format: 'TS', video_segment_time: '1800',
-  segmented_recording_enabled: false, loop_time_seconds: '600',
+  language: 'zh_CN', record_quality: 'OD', video_format: 'TS', video_segment_time: '1800',
+  generate_time_subtitle_file: false, scheduled_shutdown_enabled: false, scheduled_shutdown_time: '23:00', execute_custom_script: false, custom_script_command: '', system_notification_enabled: false, stream_start_notification_enabled: false, stream_end_notification_enabled: false,
+  segmented_recording_enabled: false, loop_time_seconds: '600', convert_to_mp4: false, delete_original: false,
   live_save_path: 'X:/Fixture/Recordings', recording_space_threshold: '1.0',
   folder_name_platform: true, folder_name_author: true, folder_name_time: false,
   filename_includes_title: true, theme_mode: 'light', theme_color: 'blue', is_grid_view: true, close_action: 'ask',
@@ -45,9 +48,9 @@ function initialState({ empty = false, offline = false } = {}) {
   return {
     recordings: empty ? [] : seedRecordings(), userConfig: {}, defaultConfig: structuredClone(defaults),
     cookies: { douyin: 'fixture-douyin-not-a-credential', bilibili: 'fixture-bilibili-not-a-credential' },
-    offline, resolverReady: true, requests: [], unexpected: [], nextId: 7,
-    failures: [], delays: [], qrPhase: 'waiting', qrCancelled: 0,
-    native: { maximized: false, visible: true, closing: false, trayAvailable: true, pending: false, calls: [], failRemember: false },
+    offline, resolverReady: true, requests: [], unexpected: [], nextId: 7, mediaJobs: [], previewLive: false, activePreviews: 0,
+    failures: [], delays: [], qrPhase: 'waiting', qrCancelled: 0, accounts: {}, quickShutdown: null, installation: {state:'idle',message:'FFmpeg 与 ffprobe 已就绪',bytes:0},
+    native: { maximized: false, visible: true, closing: false, trayAvailable: true, pending: false, calls: [], failRemember: false, systemShutdown:false, shutdownSeconds:null },
     files: [
       { name: '云间电台', isDir: true, size: 734003200, path: '云间电台', modified: sampleDate },
       { name: '海边日落.ts', isDir: false, size: 128450560, path: '海边日落.ts', modified: sampleDate },
@@ -110,6 +113,10 @@ export async function createHarness(label, options = {}) {
     res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify(value));
   };
+  let tsPromise;
+  let mp4Promise;
+  const mp4Bytes=()=>mp4Promise??=promisify(execFile)(process.env.STREAMCAP_TEST_FFMPEG||'ffmpeg',['-v','error','-nostdin','-f','lavfi','-i','testsrc2=size=160x120:rate=10','-f','lavfi','-i','sine=frequency=440:sample_rate=48000','-t','4','-c:v','libx264','-preset','ultrafast','-g','10','-pix_fmt','yuv420p','-c:a','aac','-movflags','frag_keyframe+empty_moov','-f','mp4','pipe:1'],{windowsHide:true,encoding:'buffer',timeout:15000,maxBuffer:4*1024*1024}).then(({stdout})=>stdout);
+  const tsBytes = () => tsPromise ??= promisify(execFile)(process.env.STREAMCAP_TEST_FFMPEG || 'ffmpeg', ['-v','error','-nostdin','-f','lavfi','-i','testsrc2=size=160x120:rate=10','-f','lavfi','-i','sine=frequency=440:sample_rate=48000','-t','6','-c:v','libx264','-preset','ultrafast','-tune','zerolatency','-g','10','-pix_fmt','yuv420p','-c:a','aac','-f','mpegts','pipe:1'], { windowsHide: true, encoding: 'buffer', timeout: 15000, maxBuffer: 4*1024*1024 }).then(({stdout}) => stdout);
   const server = createServer(async (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
@@ -179,7 +186,7 @@ export async function createHarness(label, options = {}) {
         const record = state.recordings.find((r) => r.recId === id);
         if (!record) { json(res, { detail: '任务不存在' }, 404); return; }
         if (action === 'files') {
-          json(res, { dir: 'X:/Fixture/Recordings/云间电台', files: [{ name: '周末音乐.ts', path: '云间电台/周末音乐.ts', size: 734003200, modified: sampleDate }] }); return;
+          json(res, { dir: 'X:/Fixture/Recordings/云间电台', files: state.files.filter(file=>!file.isDir&&file.path.startsWith('云间电台/')&&/\.(ts|mp4|mkv|flv|wav|wma)$/i.test(file.path)) }); return;
         }
         if (method === 'DELETE') {
           state.recordings = state.recordings.filter((r) => r.recId !== id); emit('delete', [id]); json(res, { deleted: true }); return;
@@ -200,6 +207,15 @@ export async function createHarness(label, options = {}) {
         }
         json(res, { defaultConfig: state.defaultConfig, userConfig: state.userConfig }); return;
       }
+      if (path === '/api/accounts') {
+        if(method==='PUT'){Object.assign(state.accounts[body.platform]??={},body.changes??{});json(res,{ok:true});return;}
+        json(res,{accounts:Object.fromEntries(Object.entries(state.accounts).map(([key,value])=>[key,{username:value.username??'',accountType:value.accountType??'',hasPassword:!!value.password,hasAccessToken:!!value.accessToken}]))});return;
+      }
+      if(path==='/api/tools/status'){json(res,{ffmpegReady:true,ffprobeReady:true,installation:state.installation});return;}
+      if(path==='/api/tools/install'){state.installation={state:'complete',message:'FFmpeg 与 ffprobe 已就绪',bytes:0};json(res,{ok:true});return;}
+      if(path==='/api/tools/update'){json(res,{tag_name:'v0.1.1-fixture',html_url:'https://github.com/xiyangone/StreamCap/releases/tag/v0.1.1-fixture',body:'isolated release fixture'});return;}
+      if(path==='/api/automation/shutdown'){state.quickShutdown=body.hours??null;json(res,{ok:true});return;}
+      if(path==='/api/media/screenshot'){assert.ok(Buffer.from(body.pngBase64,'base64').subarray(0,8).equals(Buffer.from([137,80,78,71,13,10,26,10])));json(res,{path:'fixture-screenshot.png'});return;}
       if (path === '/api/cookies') {
         if (method === 'PUT') for (const [key, value] of Object.entries(body.cookies ?? {})) { if (value) state.cookies[key] = value; else delete state.cookies[key]; }
         json(res, { cookies: state.cookies }); return;
@@ -214,11 +230,25 @@ export async function createHarness(label, options = {}) {
         const items = state.files.filter((f) => f.path.split('/').slice(0, -1).join('/') === folder);
         json(res, { root: 'X:/Fixture/Recordings', items, totalSize: items.reduce((sum, item) => sum + item.size, 0) }); return;
       }
+      if (path === '/api/media/jobs') { json(res, { jobs: state.mediaJobs, ready: true, activePreviews: state.activePreviews }); return; }
+      if (path === '/api/media/info') { const file = url.searchParams.get('path') || ''; json(res, { format: file.split('.').at(-1), isRecording: state.previewLive, size: file.endsWith('.ts') ? (await tsBytes()).length : 16044 }); return; }
+      if (path === '/api/media/remux') {
+        const source = body.path; const output = source.replace(/\.ts$/i, '.mp4');
+        if (state.files.some(f => f.path === output)) { json(res, {detail:'同名 MP4 已存在，未覆盖'},409); return; }
+        const job={id:'job-'+(state.mediaJobs.length+1),taskId:null,source,output,deleteOriginal:body.deleteOriginal??false,sourceRemoved:false,state:'waiting',message:'等待转 MP4；原 TS 保留'};state.mediaJobs.push(job);emit('mediaJob',job);json(res,{job});
+        setTimeout(()=>{job.state='complete';job.message='MP4 已生成并校验；原 TS 保留';state.files.push({name:output.split('/').at(-1),isDir:false,size:24000,path:output,modified:sampleDate});emit('mediaJob',job);},300);return;
+      }
+      if (path === '/api/media/preview' || path === '/api/media/transcode' || /^\/api\/recordings\/[^/]+\/preview$/.test(path)) {
+        const bytes=await tsBytes();state.activePreviews++;let closed=false;res.once('close',()=>{closed=true;state.activePreviews--;});res.writeHead(200,{'Content-Type':'video/mp2t'});
+        for(let offset=0;offset<bytes.length&&!closed;offset+=4096){res.write(bytes.subarray(offset,offset+4096));await delay(60);}if(!closed)res.end();return;
+      }
       if (path === '/api/videos') {
-        const bytes = wave();
-        if ((url.searchParams.get('path') ?? '').endsWith('.wav')) { res.writeHead(200, { 'Content-Type': 'audio/wav', 'Content-Length': bytes.length }); res.end(bytes); }
-        else json(res, { detail: '此模拟媒体不可内嵌播放' }, 415);
-        return;
+        const file=url.searchParams.get('path')??'';
+        const bytes=file.endsWith('.wav')?wave():file.endsWith('.ts')?await tsBytes():file.endsWith('.mp4')?await mp4Bytes():null;
+        if(!bytes){json(res,{detail:'模拟文件不支持'},415);return;}
+        const range=/^bytes=(\d+)-(\d*)$/.exec(req.headers.range??'');const start=range?Number(range[1]):0;const end=range&&range[2]?Math.min(Number(range[2]),bytes.length-1):bytes.length-1;
+        if(start>=bytes.length){res.writeHead(416,{'Content-Range':'bytes */'+bytes.length});res.end();return;}
+        const headers={'Content-Type':file.endsWith('.ts')?'video/mp2t':file.endsWith('.mp4')?'video/mp4':'audio/wav','Content-Length':end-start+1,'Accept-Ranges':'bytes'};if(range)headers['Content-Range']='bytes '+start+'-'+end+'/'+bytes.length;res.writeHead(range?206:200,headers);res.end(bytes.subarray(start,end+1));return;
       }
       if (path.startsWith('/api/qr/kuaishou/')) {
         if (path.endsWith('/cancel')) { state.qrCancelled++; json(res, { ok: true }); return; }
@@ -258,12 +288,14 @@ export async function createHarness(label, options = {}) {
     blocked.push(url.origin + url.pathname);
     await route.abort('blockedbyclient');
   });
-  const nativeStatus=()=>({maximized:state.native.maximized,visible:state.native.visible,closing:state.native.closing,trayAvailable:state.native.trayAvailable});
+  const nativeStatus=()=>({maximized:state.native.maximized,visible:state.native.visible,closing:state.native.closing,trayAvailable:state.native.trayAvailable,systemShutdown:state.native.systemShutdown,shutdownSeconds:state.native.shutdownSeconds});
   await context.exposeBinding('__streamcapNativeFixture',async(_source,command,args={})=>{
     const native=state.native;native.calls.push({command,args:structuredClone(args)});let closeRequest;
     if(command==='desktop_ready')return {value:nativeStatus(),closeRequest:native.pending?{activeRecordings:state.recordings.filter(r=>r.isRecording).length,trayAvailable:native.trayAvailable}:undefined};
     if(command==='desktop_theme'){native.theme=args.theme;return {value:null};}
     if(command==='desktop_window_action'){
+      if(args.action==='pick-directory')return {value:'X:/Fixture/Picked'};
+      if(args.action==='cancel-shutdown'){native.systemShutdown=false;native.shutdownSeconds=null;state.quickShutdown=null;return {value:null,windowState:nativeStatus()};}
       if(args.action==='maximize')native.maximized=!native.maximized;
       else if(args.action==='minimize')native.minimized=true;
       else if(args.action==='close'){
@@ -301,6 +333,7 @@ export async function createHarness(label, options = {}) {
   return {
     base, state, page, context, runDir, blocked, runtimeErrors, consoleErrors, emit,
     failRecording(id, message) { const record = state.recordings.find(r => r.recId === id); assert.ok(record); record.isRecording = false; record.speed = null; record.recordingError = message; emit('update', record); },
+    async triggerShutdown(seconds=60){state.native.systemShutdown=true;state.native.shutdownSeconds=seconds;await page.evaluate(value=>window.__streamcapNativeFixtureEmit('streamcap:window-state',value),nativeStatus());},
     async restoreNative() {state.native.visible=true;state.native.minimized=false;await page.evaluate(value=>window.__streamcapNativeFixtureEmit("streamcap:window-state",value),nativeStatus());},
     failNext(method, path, message = '模拟操作失败', status = 409) { state.failures.push({ method, path, message, status }); },
     delayNext(method, path, ms = 700) { state.delays.push({ method, path, ms }); },

@@ -1,5 +1,6 @@
 //! Human-readable labels and pure presentation helpers.
 use crate::api::gateway::NewRecording;
+use crate::app::i18n::t;
 use std::collections::HashSet;
 
 pub const QUALITY_OPTIONS: &[(&str, &str)] = &[
@@ -13,57 +14,55 @@ pub const FORMAT_OPTIONS: &[&str] = &[
     "TS", "FLV", "MKV", "MOV", "MP4", "NUT", "MP3", "M4A", "AAC", "WAV", "WMA",
 ];
 pub const PLATFORMS: &[(&str, &str)] = &[
-    ("douyin", "抖音"),
+    ("douyin", "抖音直播"),
+    ("kuaishou", "快手直播"),
     ("bilibili", "哔哩哔哩"),
-    ("huya", "虎牙"),
-    ("douyu", "斗鱼"),
-    ("kuaishou", "快手"),
+    ("huya", "虎牙直播"),
+    ("douyu", "斗鱼直播"),
     ("tiktok", "TikTok"),
-    ("twitch", "Twitch"),
-    ("youtube", "YouTube"),
-    ("yy", "YY"),
-    ("xhs", "小红书"),
-    ("xiaohongshu", "小红书"),
+    ("yy", "YY直播"),
+    ("rednote", "小红书"),
     ("bigo", "Bigo"),
     ("blued", "Blued"),
     ("soop", "SOOP"),
-    ("sooplive", "SOOP"),
-    ("netease", "网易 CC"),
+    ("netease", "网易CC"),
     ("qiandurebo", "千度热播"),
-    ("pandalive", "PandaTV"),
-    ("maoerfm", "猫耳 FM"),
+    ("pandatv", "PandaTV"),
+    ("maoerfm", "猫耳FM"),
+    ("look", "LOOK"),
     ("winktv", "WinkTV"),
     ("flextv", "FlexTV"),
-    ("look", "LOOK"),
     ("popkontv", "PopkonTV"),
     ("twitcasting", "TwitCasting"),
-    ("baidu", "百度"),
-    ("weibo", "微博"),
-    ("kugou", "酷狗"),
+    ("baidu", "百度直播"),
+    ("weibo", "微博直播"),
+    ("kugou", "酷狗直播"),
+    ("twitch", "Twitch"),
     ("liveme", "LiveMe"),
-    ("huajiao", "花椒"),
+    ("huajiao", "花椒直播"),
     ("showroom", "SHOWROOM"),
     ("acfun", "AcFun"),
-    ("changliao", "畅聊"),
-    ("yinbo", "音播"),
-    ("inke", "映客"),
-    ("zhihu", "知乎"),
+    ("inke", "映客直播"),
+    ("yinbo", "音播直播"),
+    ("changliao", "畅聊直播"),
+    ("zhihu", "知乎直播"),
     ("chzzk", "CHZZK"),
-    ("haixiu", "嗨秀"),
-    ("vvxq", "VV 星球"),
+    ("haixiu", "嗨秀直播"),
+    ("vvxq", "VV星球"),
     ("17live", "17Live"),
-    ("lang", "浪 Live"),
-    ("piaopiao", "漂漂"),
-    ("6room", "六间房"),
-    ("lehai", "乐嗨"),
-    ("catshow", "花猫"),
+    ("langlive", "浪Live"),
+    ("piaopiao", "漂漂直播"),
+    ("sixroom", "六间房"),
+    ("lehai", "乐嗨直播"),
+    ("huamao", "花猫直播"),
     ("shopee", "Shopee"),
-    ("taobao", "淘宝"),
-    ("jd", "京东"),
+    ("youtube", "YouTube"),
+    ("taobao", "淘宝直播"),
+    ("jd", "京东直播"),
     ("faceit", "FACEIT"),
-    ("lianjie", "连接"),
-    ("migu", "咪咕"),
-    ("laixiu", "来秀"),
+    ("lianjie", "连接直播"),
+    ("migu", "咪咕直播"),
+    ("laixiu", "来秀直播"),
     ("picarto", "Picarto"),
     ("xindongrebo", "心动热播"),
     ("custom", "自定义流"),
@@ -73,10 +72,10 @@ pub fn quality_label(code: Option<&str>) -> String {
     QUALITY_OPTIONS
         .iter()
         .find(|(key, _)| *key == code)
-        .map(|(_, name)| (*name).into())
+        .map(|(_, name)| t(name).into())
         .unwrap_or_else(|| {
             if code.is_empty() {
-                "跟随全局".into()
+                t("跟随全局").into()
             } else {
                 code
             }
@@ -85,13 +84,13 @@ pub fn quality_label(code: Option<&str>) -> String {
 pub fn format_label(code: Option<&str>) -> String {
     code.filter(|s| !s.is_empty())
         .map(str::to_ascii_uppercase)
-        .unwrap_or_else(|| "跟随全局".into())
+        .unwrap_or_else(|| t("跟随全局").into())
 }
 pub fn platform_label(key: &str) -> String {
     PLATFORMS
         .iter()
         .find(|(k, _)| *k == key)
-        .map(|(_, name)| (*name).into())
+        .map(|(_, name)| t(name).into())
         .unwrap_or_else(|| key.to_string())
 }
 pub fn human_size(bytes: u64) -> String {
@@ -148,13 +147,21 @@ pub fn parse_recordings(raw: &str) -> Result<Vec<NewRecording>, String> {
             [url, name] if valid_url(url) => (None, *url, Some(*name)),
             [quality, url] => (Some(*quality), *url, None),
             [quality, url, name] => (Some(*quality), *url, Some(*name)),
-            _ => return Err(format!("第 {} 行格式不正确，请每行填写一个地址", index + 1)),
+            _ => {
+                return Err(crate::tr_format!(
+                    "第 {} 行格式不正确，请每行填写一个地址",
+                    index + 1
+                ))
+            }
         };
         if !valid_url(url) {
-            return Err(format!("第 {} 行不是有效的 HTTP / HTTPS 地址", index + 1));
+            return Err(crate::tr_format!(
+                "第 {} 行不是有效的 HTTP / HTTPS 地址",
+                index + 1
+            ));
         }
         if !seen.insert(url.to_string()) {
-            return Err(format!("第 {} 行的地址重复", index + 1));
+            return Err(crate::tr_format!("第 {} 行的地址重复", index + 1));
         }
         let quality = quality.map(|q| {
             match q {
@@ -171,7 +178,7 @@ pub fn parse_recordings(raw: &str) -> Result<Vec<NewRecording>, String> {
             .as_ref()
             .is_some_and(|q| !QUALITY_OPTIONS.iter().any(|(code, _)| code == q))
         {
-            return Err(format!("第 {} 行的清晰度无效", index + 1));
+            return Err(crate::tr_format!("第 {} 行的清晰度无效", index + 1));
         }
         items.push(NewRecording {
             url: url.into(),
@@ -180,7 +187,7 @@ pub fn parse_recordings(raw: &str) -> Result<Vec<NewRecording>, String> {
         });
     }
     if items.is_empty() {
-        return Err("请至少填写一个直播间地址".into());
+        return Err(t("请至少填写一个直播间地址").into());
     }
     Ok(items)
 }
@@ -215,4 +222,14 @@ mod tests {
         assert_eq!(human_size(1024), "1.0 KB");
         assert_eq!(human_size(0), "0 B");
     }
+}
+
+pub fn duration(seconds: f64) -> String {
+    let seconds = seconds.max(0.0) as u64;
+    format!(
+        "{:02}:{:02}:{:02}",
+        seconds / 3600,
+        (seconds / 60) % 60,
+        seconds % 60
+    )
 }

@@ -273,3 +273,18 @@ async fn parse_failure_does_not_erase_last_verified_live_state() {
     streamcap_core::api::shutdown(&state).await.unwrap();
     scheduler.finish_background().await;
 }
+
+#[tokio::test]
+async fn conversion_preference_is_preserved_without_changing_detection_or_source_format() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Workspace::from_repo_root(dir.path());
+    let state = bootstrap(workspace.clone()).await.unwrap();
+    state.config.write().await.update_user_config(json!({"loop_time_seconds":"4500","video_format":"TS","segmented_recording_enabled":false,"convert_to_mp4":true}).as_object().unwrap().clone()).unwrap();
+    let reloaded = streamcap_core::ConfigStore::load(workspace).unwrap();
+    assert!(reloaded.get_bool("convert_to_mp4", false));
+    assert_eq!(reloaded.get_i64("loop_time_seconds", 0), 4500);
+    assert_eq!(reloaded.get_str("video_format", ""), "TS");
+    assert!(!reloaded.get_bool("segmented_recording_enabled", true));
+    assert_eq!(state.scheduler.postprocess.pending(), 0);
+    streamcap_core::api::shutdown(&state).await.unwrap();
+}

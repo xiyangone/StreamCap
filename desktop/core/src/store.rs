@@ -31,6 +31,10 @@ impl Store {
         }
     }
 
+    pub(crate) fn data_dir(&self) -> &std::path::Path {
+        &self.workspace.user_data_dir
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<GatewayEvent> {
         self.events.subscribe()
     }
@@ -229,6 +233,13 @@ impl Store {
         let mut edited = Vec::new();
         for rec in next.iter_mut().filter(|rec| ids.contains(&rec.rec_id)) {
             mutate(rec);
+            if rec.scheduled_recording == Some(true) {
+                crate::schedule::parse(
+                    rec.scheduled_start_time.as_deref(),
+                    rec.monitor_hours.as_deref(),
+                )
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+            }
             edited.push(rec.clone());
         }
         self.persist_snapshot(&next)?;
@@ -493,7 +504,11 @@ mod tests {
 
         // null 字段应标记为「跟随全局」
         // 真实数据里 monitor_hours 是字符串 "5,"，必须被宽容解析
-        assert_eq!(rec.monitor_hours, Some(5), "字符串形式的数值也要能解析");
+        assert_eq!(
+            rec.monitor_hours.as_deref(),
+            Some("5"),
+            "字符串形式的数值也要能解析"
+        );
         assert!(rec.is_inherited("record_format"));
         assert!(rec.is_inherited("only_notify_no_record"));
         assert!(!rec.is_inherited("quality"), "有值字段不应被标记为跟随全局");
@@ -595,9 +610,13 @@ mod tests {
         assert_eq!(store.load().await.unwrap(), 2);
 
         let all = store.all().await;
-        assert_eq!(all[0].monitor_hours, Some(5), "字符串 \"5,\" 应解析为 5");
+        assert_eq!(
+            all[0].monitor_hours.as_deref(),
+            Some("5"),
+            "字符串 \"5,\" 应解析为 5"
+        );
         assert_eq!(all[0].last_duration, Some(1664.814659));
-        assert_eq!(all[1].monitor_hours, Some(3));
+        assert_eq!(all[1].monitor_hours.as_deref(), Some("3"));
         assert_eq!(
             all[1].video_bitrate,
             Some(2000),

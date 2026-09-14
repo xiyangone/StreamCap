@@ -3,6 +3,7 @@ use super::{
     Dialog, Icon,
 };
 use crate::api::gateway;
+use crate::app::i18n::t;
 use leptos::prelude::*;
 
 #[component]
@@ -24,7 +25,7 @@ pub fn BatchEditDialog(open: RwSignal<bool>, ids: RwSignal<Vec<String>>) -> impl
         }
         let selected = ids.get_untracked();
         if selected.is_empty() {
-            error.set(Some("请先选择任务".into()));
+            error.set(Some(t("请先选择任务").into()));
             return;
         }
         let (changes, follow) = match draft.collect() {
@@ -35,7 +36,7 @@ pub fn BatchEditDialog(open: RwSignal<bool>, ids: RwSignal<Vec<String>>) -> impl
             }
         };
         if changes.is_empty() && follow.is_empty() {
-            error.set(Some("请至少选择一项需要修改的设置".into()));
+            error.set(Some(t("请至少选择一项需要修改的设置").into()));
             return;
         }
         let count = selected.len();
@@ -45,7 +46,7 @@ pub fn BatchEditDialog(open: RwSignal<bool>, ids: RwSignal<Vec<String>>) -> impl
             match gateway::batch_edit(selected, changes, follow).await {
                 Ok(()) => {
                     let _ = open.try_set(false);
-                    state.notify(format!("已更新选中的 {count} 个任务"));
+                    state.notify(crate::tr_format!("已更新选中的 {count} 个任务"));
                     if let Err(message) = gateway::refresh_recordings(state).await {
                         state.fail(message);
                     }
@@ -58,11 +59,11 @@ pub fn BatchEditDialog(open: RwSignal<bool>, ids: RwSignal<Vec<String>>) -> impl
         });
     };
     view! {
-        <Dialog open=Signal::derive(move || open.get()) title="批量编辑任务" busy=busy on_close=Callback::new(move |_| open.set(false))>
-            <div class="scope-notice"><Icon name="shield" /><p>{move || format!("仅修改已选择的 {} 个任务，其他任务不受影响。", ids.get().len())}</p></div>
+        <Dialog open=Signal::derive(move || open.get()) title=t("批量编辑任务") busy=busy on_close=Callback::new(move |_| open.set(false))>
+            <div class="scope-notice"><Icon name="shield" /><p>{move || crate::tr_format!("仅修改已选择的 {} 个任务，其他任务不受影响。", ids.get().len())}</p></div>
             <form on:submit=submit><fieldset disabled=move || busy.get()><RecordingFields draft=draft batch=true /></fieldset>
                 <Show when=move || error.get().is_some()><p class="field-error" role="alert">{move || error.get().unwrap_or_default()}</p></Show>
-                <footer class="modal-actions"><button class="button secondary" type="button" disabled=move || busy.get() on:click=move |_| open.set(false)>"取消"</button><button class="button primary" type="submit" disabled=move || busy.get()>{move || if busy.get() { "保存中…" } else { "应用到所选任务" }}</button></footer>
+                <footer class="modal-actions"><button class="button secondary" type="button" disabled=move || busy.get() on:click=move |_| open.set(false)>{t("取消")}</button><button class="button primary" type="submit" disabled=move || busy.get()>{move || if busy.get() { t("保存中…") } else { t("应用到所选任务") }}</button></footer>
             </form>
         </Dialog>
     }

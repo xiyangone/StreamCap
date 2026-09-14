@@ -220,3 +220,32 @@ mod tests {
         assert_eq!(ws.resource_dir, ws.user_data_dir);
     }
 }
+
+/// Post-processing verifies completed outputs with the ffprobe from the same FFmpeg distribution.
+pub fn adjacent_ffprobe(ffmpeg: &Path) -> Option<PathBuf> {
+    let probe = ffmpeg.with_file_name(if cfg!(windows) {
+        "ffprobe.exe"
+    } else {
+        "ffprobe"
+    });
+    probe.is_file().then_some(probe)
+}
+
+#[cfg(test)]
+#[test]
+fn media_probe_discovery_never_silently_uses_an_unrelated_binary() {
+    let root = tempfile::tempdir().unwrap();
+    let ffmpeg = root.path().join(if cfg!(windows) {
+        "ffmpeg.exe"
+    } else {
+        "ffmpeg"
+    });
+    assert!(adjacent_ffprobe(&ffmpeg).is_none());
+    let probe = root.path().join(if cfg!(windows) {
+        "ffprobe.exe"
+    } else {
+        "ffprobe"
+    });
+    std::fs::write(&probe, b"fixture").unwrap();
+    assert_eq!(adjacent_ffprobe(&ffmpeg), Some(probe));
+}

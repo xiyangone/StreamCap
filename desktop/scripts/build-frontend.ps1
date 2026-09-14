@@ -10,6 +10,7 @@ if(-not(Test-Path -LiteralPath $tool)){throw "Missing project-local wasm-bindgen
 $actual=(& $tool --version).Trim()
 if($LASTEXITCODE -ne 0 -or $actual -ne "wasm-bindgen $version"){throw "wasm-bindgen version mismatch. Lockfile: $version; CLI: $actual"}
 if(-not(Test-Path -LiteralPath (Join-Path $desktop 'node_modules\@tauri-apps\api\core.js'))){throw 'Run npm ci in desktop before building.'}
+if(-not(Test-Path -LiteralPath (Join-Path $desktop 'node_modules\mpegts.js\dist\mpegts.js'))){throw 'Run npm ci in desktop: local TS preview assets are required.'}
 $previousPath=$env:PATH
 $previousColor=$env:NO_COLOR
 $env:NO_COLOR='true'

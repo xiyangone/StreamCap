@@ -9,7 +9,7 @@ $tmp=Join-Path $run 'tmp'
 [IO.Directory]::CreateDirectory($tmp)|Out-Null
 $publish=Join-Path $desktop ('src-tauri/target/native-noFF-'+$stamp)
 $steps=[Collections.Generic.List[object]]::new()
-$names=@('TEMP','TMP','STREAMCAP_TEST_ARTIFACTS','npm_config_cache','NO_COLOR','STREAMCAP_TEST_FFMPEG')
+$names=@('TEMP','TMP','STREAMCAP_TEST_ARTIFACTS','npm_config_cache','NO_COLOR','STREAMCAP_TEST_FFMPEG','STREAMCAP_TEST_PWSH')
 $saved=@{};foreach($name in $names){$saved[$name]=[Environment]::GetEnvironmentVariable($name,'Process')}
 $env:TEMP=$tmp;$env:TMP=$tmp;$env:STREAMCAP_TEST_ARTIFACTS=$run;$env:npm_config_cache=Join-Path $desktop 'build/npm-cache';$env:NO_COLOR='true'
 function Step([string]$name,[scriptblock]$body){
@@ -34,7 +34,10 @@ try {
         if(-not(Test-Path -LiteralPath (Join-Path (Split-Path -Parent $env:STREAMCAP_TEST_FFMPEG) 'ffprobe.exe'))){throw 'Adjacent ffprobe is required for recording validation'}
     }
     Step 'core-test' {& cargo test --manifest-path core/Cargo.toml --locked --offline}
+    Step 'frontend-test' {& cargo test --manifest-path Cargo.toml --target x86_64-pc-windows-msvc --lib --locked --offline}
     Step 'ffmpeg-recording' {& cargo test --manifest-path core/Cargo.toml --locked --offline --test shutdown ffmpeg_ -- --ignored}
+    Step 'media-pipeline' {& cargo test --manifest-path core/Cargo.toml --locked --offline --test media_pipeline -- --ignored}
+    Step 'owned-script-tree' {$env:STREAMCAP_TEST_PWSH=(Get-Command pwsh -ErrorAction Stop).Source; & cargo test --manifest-path core/Cargo.toml --locked --offline --lib owned_process::tests::owned_script_tree_exits_with_its_job -- --ignored}
     Step 'tauri-test' {& cargo test --manifest-path src-tauri/Cargo.toml --locked --offline}
     Step 'core-clippy' {& cargo clippy --manifest-path core/Cargo.toml --all-targets --locked --offline -- -D warnings}
     Step 'tauri-clippy' {& cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked --offline -- -D warnings}

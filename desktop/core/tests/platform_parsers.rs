@@ -56,6 +56,7 @@ fn kuaishou_bitrate_selection() {
 #[test]
 fn custom_urls_reject_credentials_and_unknown_pages() {
     let req = |url: &str| ResolveRequest {
+        account: None,
         url: url.into(),
         quality: None,
         proxy: None,
@@ -74,17 +75,18 @@ fn custom_urls_reject_credentials_and_unknown_pages() {
 async fn shutdown_cancels_resolver_and_unsupported_has_no_fallback() {
     let resolver = Resolver::new();
     let req = ResolveRequest {
-        url: "https://live.bilibili.com/1".into(),
+        account: None,
+        url: "https://unsupported.example.test/1".into(),
         quality: None,
         proxy: None,
         cookie: None,
-        platform: Some("bilibili".into()),
+        platform: Some("unsupported-fixture".into()),
     };
     assert!(resolver
         .resolve(req.clone())
         .await
         .unwrap_err()
-        .contains("尚未迁移"));
+        .contains("不受支持"));
     resolver.shutdown().await;
     assert!(!resolver.healthy().await);
     assert!(resolver.resolve(req).await.unwrap_err().contains("退出"));
@@ -223,6 +225,7 @@ async fn native_platform_readonly_probe() {
             None
         };
         let request = ResolveRequest {
+            account: None,
             url: task["url"].as_str().unwrap().into(),
             quality: task["quality"]
                 .as_str()

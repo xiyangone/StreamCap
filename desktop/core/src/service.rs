@@ -38,6 +38,9 @@ impl Server {
         let listener =
             tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, options.port)).await?;
         let address = listener.local_addr()?;
+        if let Err(error) = state.scheduler.postprocess.recover().await {
+            log::warn!("未恢复媒体处理队列: {error}");
+        }
         let (stop, receiver) = watch::channel(false);
         let cancel = state.resolver.cancellation();
         let mut background = Vec::new();
@@ -52,6 +55,11 @@ impl Server {
                     if let Err(error)=scheduler.check_free_space().await{log::warn!("空间检查: {error}");}
                 }
             }));
+        }
+        if options.monitoring {
+            let scheduler = state.scheduler.clone();
+            let stop = cancel.clone();
+            background.push(tokio::spawn(async move {loop{tokio::select!{biased;_=stop.cancelled()=>return,_=tokio::time::sleep(Duration::from_secs(1))=>{}}scheduler.enforce_windows().await;}}));
         }
         let app = api::router(state.clone());
         let http = tokio::spawn(async move {

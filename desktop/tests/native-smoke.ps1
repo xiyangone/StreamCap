@@ -14,13 +14,18 @@ if (Test-Path -LiteralPath $run) {throw 'Smoke output collision'}
 $profile = Join-Path $run 'data'
 [IO.Directory]::CreateDirectory($profile) | Out-Null
 $temp = Join-Path $run 'tmp'; [IO.Directory]::CreateDirectory($temp) | Out-Null
+$testFfmpeg=if($env:STREAMCAP_TEST_FFMPEG){$env:STREAMCAP_TEST_FFMPEG}else{(Get-Command ffmpeg -ErrorAction Stop).Source}
+$mediaDirectory=Join-Path $profile 'downloads';[IO.Directory]::CreateDirectory($mediaDirectory)|Out-Null
+& $testFfmpeg -v error -nostdin -n -f lavfi -i 'testsrc2=size=160x120:rate=10' -f lavfi -i 'sine=frequency=440:sample_rate=48000' -t 20 -c:v libx264 -preset ultrafast -tune zerolatency -g 10 -pix_fmt yuv420p -c:a aac -f mpegts (Join-Path $run 'native-preview.ts')
+if($LASTEXITCODE -ne 0){throw 'Synthetic native preview fixture failed'}
 $stdout = Join-Path $run 'app.stdout.log'; $stderr = Join-Path $run 'app.stderr.log'
 $debugListener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0)
 $debugListener.Start(); $debugPort = $debugListener.LocalEndpoint.Port; $debugListener.Stop()
 $arguments = @('--data-dir',('"' + $profile + '"'),'--api-port','0','--smoke-seconds','90')
-$environment = @{TEMP=$temp;TMP=$temp;WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS="--remote-debugging-port=$debugPort --remote-debugging-address=127.0.0.1"}
+$environment = @{TEMP=$temp;TMP=$temp;PATH=([IO.Path]::GetDirectoryName($testFfmpeg)+';'+$env:PATH);WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS="--remote-debugging-port=$debugPort --remote-debugging-address=127.0.0.1"}
 $process = Start-Process -FilePath $Executable -ArgumentList $arguments -WorkingDirectory $run -PassThru -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -Environment $environment
 $owned = @{}
+$probeProcess = $null
 function Update-OwnedProcesses {
     $all = @(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath)
     do {
@@ -57,8 +62,16 @@ import { chromium } from 'playwright';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-const [port,output,base,exitMode]=process.argv.slice(1);
+import { createServer } from 'node:http';
+import { setTimeout as sleep } from 'node:timers/promises';
+const [port,output,base,exitMode]=process.argv.slice(2);
+const deleteOriginal=exitMode==='Tray';
 let page;const diagnostic=[];
+const eventually=async(read,predicate,label,timeout=15000)=>{
+  const deadline=Date.now()+timeout;
+  while(Date.now()<deadline){const value=await read();if(predicate(value))return value;await sleep(100);}
+  throw Error('Timed out waiting for '+label);
+};
 try {
   const browser=await chromium.connectOverCDP('http://127.0.0.1:'+port);
   page=browser.contexts().flatMap(context=>context.pages()).find(page=>page.url().includes('tauri.localhost'));
@@ -74,12 +87,44 @@ try {
   assert.equal((await native()).decorated,false,'the web UI and the window must share one title bar');
   assert.equal((await native()).trayAvailable,true);
   await page.getByRole('button',{name:'最大化窗口',exact:true}).click();
-  await page.waitForFunction(async()=>(await (await import('/tauri-api/core.js')).invoke('desktop_ready')).maximized);
+  await eventually(native,state=>state.maximized,'native maximize');
   await page.getByRole('button',{name:'还原窗口',exact:true}).click();
-  await page.waitForFunction(async()=>!(await (await import('/tauri-api/core.js')).invoke('desktop_ready')).maximized);
+  await eventually(native,state=>!state.maximized,'native restore');
   const shell=await page.locator('.app-shell').boundingBox();assert.equal(shell.x,0);assert.equal(shell.y,0);
   assert.equal(await page.locator('.sidebar').evaluate(el=>getComputedStyle(el).borderRadius),'0px');
   await page.screenshot({path:path.join(output,'native-window.png'),fullPage:true,animations:'disabled'});
+  // Actual WebView2 decoding and automatic conversion; only generated, loopback media is used.
+  const fixture=await fs.readFile(path.join(output,'native-preview.ts'));
+  const mediaSource=createServer((_req,res)=>{res.writeHead(200,{'Content-Type':'video/mp2t','Content-Length':fixture.length});res.end(fixture);});
+  await new Promise(resolve=>mediaSource.listen(0,'127.0.0.1',resolve));
+  const mediaUrl='http://127.0.0.1:'+mediaSource.address().port+'/live.ts';
+  const configured=await fetch(base+'/api/settings',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({userConfig:{convert_to_mp4:true,delete_original:deleteOriginal,video_format:'TS',folder_name_platform:false,folder_name_author:false,folder_name_time:false,segmented_recording_enabled:false}})});assert.equal(configured.status,200);
+  const created=await fetch(base+'/api/recordings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:mediaUrl,streamerName:'原生媒体验收'})});assert.equal(created.status,200);const mediaTask=(await created.json()).created[0];
+  await page.getByRole('navigation',{name:'主导航'}).getByRole('link',{name:'录制任务',exact:true}).click();
+  const mediaCard=page.locator('article[data-rec-id="'+mediaTask.recId+'"]');
+  await mediaCard.getByRole('button',{name:'开始录制',exact:true}).click();
+  await mediaCard.getByRole('button',{name:'停止录制',exact:true}).waitFor();
+  await mediaCard.getByRole('button',{name:'预览录制文件'}).click();const previewModal=page.getByRole('dialog',{name:'录制预览',exact:true});
+  await page.waitForFunction(()=>{const video=document.querySelector('video');return video?.videoWidth===160&&video.currentTime>0.5;},null,{timeout:20000});
+  await page.screenshot({path:path.join(output,'native-ts-live-preview.png'),fullPage:true,animations:'disabled'});
+  await previewModal.getByRole('button',{name:'关闭预览',exact:true}).click();
+  await eventually(()=>page.evaluate(async()=> (await import('/media-player.js')).activePlayerCount()),count=>count===0,'disposed player');
+  await mediaCard.getByRole('button',{name:'停止录制',exact:true}).click();
+  const completedJob=await eventually(async()=>{const response=await fetch(base+'/api/media/jobs');assert.equal(response.status,200);return (await response.json()).jobs.find(j=>j.taskId===mediaTask.recId&&j.state==='complete');},Boolean,'verified media job',25000);
+  assert.equal(completedJob.deleteOriginal,deleteOriginal);assert.equal(completedJob.sourceRemoved,deleteOriginal);
+  await mediaCard.getByRole('button',{name:'预览录制文件'}).click();
+  await previewModal.getByRole('listitem').filter({hasText:/\.mp4/}).click();
+  await page.waitForFunction(()=>{const video=document.querySelector('video');return video?.videoWidth===160&&video.currentTime>0.5;},null,{timeout:15000});
+  await page.screenshot({path:path.join(output,'native-mp4-preview.png'),fullPage:true,animations:'disabled'});
+  await previewModal.getByRole('button',{name:'关闭预览',exact:true}).click();
+  await eventually(()=>page.evaluate(async()=> (await import('/media-player.js')).activePlayerCount()),count=>count===0,'disposed player');
+  const mediaFiles=await(await fetch(base+'/api/recordings/'+mediaTask.recId+'/files')).json();
+  assert.equal(mediaFiles.files.some(f=>f.name===path.basename(completedJob.source)),!deleteOriginal);assert.ok(mediaFiles.files.some(f=>f.name===path.basename(completedJob.output)));
+  const outputRoot=path.join(output,'data','downloads');
+  const sourceExists=await fs.stat(path.join(outputRoot,completedJob.source)).then(()=>true,error=>{if(error.code==='ENOENT')return false;throw error;});
+  assert.equal(sourceExists,!deleteOriginal);assert.ok((await fs.stat(path.join(outputRoot,completedJob.output))).size>0);
+  await new Promise(resolve=>{mediaSource.closeAllConnections();mediaSource.close(resolve);});
+  const mediaValidation={tsLiveDecoded:true,mp4Decoded:true,originalTsKept:!deleteOriginal,originalTsRemoved:deleteOriginal,previewDisposed:true};
   const modal=page.getByRole('dialog',{name:'关闭 StreamCap',exact:true});
   const requestClose=async()=>{await page.getByRole('button',{name:'关闭窗口',exact:true}).click();await modal.waitFor({state:'visible'});};
   await requestClose();assert.equal((await native()).closePending,true);
@@ -94,7 +139,7 @@ try {
   const status=await (await fetch(base+'/api/status')).json();assert.equal(status.ok,true);assert.equal(status.resolverReady,true);
   const settings=await (await fetch(base+'/api/settings')).json();assert.equal(settings.userConfig.close_action,'tray');
   await page.evaluate(async()=>(await import('/tauri-api/core.js')).invoke('desktop_window_action',{action:'close'}));
-  await page.waitForFunction(async()=>!(await (await import('/tauri-api/core.js')).invoke('desktop_ready')).closePending);
+  await eventually(native,state=>!state.closePending,'remembered native close');
   await modal.waitFor({state:'hidden'});assert.equal((await native()).closing,false);
   const update=await fetch(base+'/api/settings',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({userConfig:{close_action:'ask'}})});assert.equal(update.status,200);
   await requestClose();await modal.getByRole('button',{name:'取消',exact:true}).click();await modal.waitFor({state:'hidden'});
@@ -118,7 +163,7 @@ try {
     setTimeout(()=>finish(false),1000);
   }));
   assert.equal(security.inlineScriptBlocked,true);
-  const result={passed:true,security,title:await page.title(),checks:['frameless-shell','maximize-restore','flush-layout','close-cancel','escape-cancel','tray-keeps-backend','remember-tray','close-preference-change',exitMode==='Tray'?'tray-menu-exit':'explicit-dialog-exit'],transport:stats,exitMode};
+  const result={passed:true,security,mediaValidation,title:await page.title(),checks:['frameless-shell','maximize-restore','flush-layout','close-cancel','escape-cancel','tray-keeps-backend','remember-tray','close-preference-change',exitMode==='Tray'?'tray-menu-exit':'explicit-dialog-exit'],transport:stats,exitMode};
   await fs.writeFile(path.join(output,'ui-result.json'),JSON.stringify(result,null,2));
   if(exitMode==='Tray') {
     await requestClose();await modal.getByRole('button',{name:/最小化到托盘/}).click();await modal.waitFor({state:'hidden'});
@@ -133,8 +178,20 @@ try {
   console.error(String(error));process.exit(1);
 }
 '@
-    Push-Location $desktop
-    try {& node --input-type=module -e $probe "$debugPort" "$run" "$base" "$ExitMode" 2>&1 | Tee-Object -LiteralPath (Join-Path $run 'ui-probe.log'); if ($LASTEXITCODE -ne 0) {throw 'Native UI probe failed'}} finally {Pop-Location}
+    $probePath=Join-Path $run 'native-probe.mjs'
+    [IO.File]::WriteAllText($probePath,$probe,[Text.UTF8Encoding]::new($false))
+    $probeArguments=@(('"'+$probePath+'"'),"$debugPort",('"'+$run+'"'),"$base","$ExitMode")
+    $probeProcess=Start-Process -FilePath (Get-Command node -ErrorAction Stop).Source -ArgumentList $probeArguments -WorkingDirectory $desktop -PassThru -WindowStyle Hidden -RedirectStandardOutput (Join-Path $run 'ui-probe.log') -RedirectStandardError (Join-Path $run 'ui-probe.error.log')
+    $probeDeadline=[DateTime]::UtcNow.AddSeconds(80)
+    while(-not $probeProcess.HasExited){
+        Update-OwnedProcesses
+        if([DateTime]::UtcNow -gt $probeDeadline){throw 'Native UI probe timed out'}
+        Start-Sleep -Milliseconds 200
+    }
+    $probeProcess.WaitForExit()
+    Update-OwnedProcesses
+    Get-Content -LiteralPath (Join-Path $run 'ui-probe.log')
+    if($probeProcess.ExitCode -ne 0){Get-Content -LiteralPath (Join-Path $run 'ui-probe.error.log');throw 'Native UI probe failed'}
     while (-not $process.HasExited) {
         Update-OwnedProcesses
         if ([DateTime]::UtcNow -gt $deadline.AddSeconds(80)) {throw 'Application shutdown timed out'}
@@ -143,7 +200,7 @@ try {
     $process.WaitForExit()
     if ($process.ExitCode -ne 0) {throw "Application exit code=$($process.ExitCode)"}
     $shutdown = Get-Content -LiteralPath (Join-Path $profile 'shutdown.json') -Raw | ConvertFrom-Json
-    if (-not $shutdown.shutdownComplete -or $shutdown.activeRecordings -ne 0) {throw 'Ordered shutdown incomplete'}
+    if (-not $shutdown.shutdownComplete -or $shutdown.activeRecordings -ne 0 -or $shutdown.pendingMediaJobs -ne 0 -or $shutdown.activePreviews -ne 0) {throw 'Ordered shutdown incomplete'}
     $remaining = @()
     for ($i=0;$i -lt 30;$i++) {
         $remaining=@($owned.Keys | Where-Object {Get-Process -Id $_ -ErrorAction SilentlyContinue})
@@ -161,5 +218,6 @@ try {
     $result | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $run 'result.json') -Encoding utf8
     $result | ConvertTo-Json -Depth 8
 } finally {
+    if ($null -ne $probeProcess -and -not $probeProcess.HasExited) {$probeProcess.Kill($true);$probeProcess.WaitForExit(10000)|Out-Null}
     if (-not $process.HasExited) {$process.Kill($true);$process.WaitForExit(10000)|Out-Null}
 }

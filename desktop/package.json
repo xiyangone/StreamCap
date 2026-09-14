@@ -16,6 +16,7 @@
   "devDependencies": {
     "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/cli": "^2",
+    "mpegts.js": "1.8.2",
     "playwright": "1.63.0"
   }
 }

@@ -1,10 +1,14 @@
 //! Native resolvers. No external interpreter or fallback gateway.
+pub mod catalog;
 pub mod custom;
 pub mod douyin;
 pub mod douyin_sign;
+pub mod extended;
 pub mod http;
 pub mod kuaishou;
 pub mod kuaishou_login;
+pub mod migu_wasm;
+pub mod signatures;
 
 use serde_json::Value;
 

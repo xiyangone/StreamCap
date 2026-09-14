@@ -39,12 +39,15 @@ pub struct WindowStatus {
     pub maximized: bool,
     pub visible: bool,
     pub closing: bool,
+    pub shutdown_seconds: Option<u64>,
+    pub system_shutdown: bool,
     pub tray_available: bool,
 }
 #[derive(Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct CloseRequest {
     pub active_recordings: usize,
+    pub pending_media_jobs: usize,
     pub tray_available: bool,
 }
 #[derive(Clone, Copy)]
@@ -124,20 +127,24 @@ fn error_message(value: JsValue) -> String {
                 .ok()?
                 .as_string()
         })
-        .unwrap_or_else(|| "原生窗口操作失败".into())
+        .unwrap_or_else(|| crate::app::i18n::t("原生窗口操作失败").into())
 }
 async fn call<T: serde::de::DeserializeOwned>(
     command: &str,
     args: serde_json::Value,
 ) -> Result<T, String> {
     if !available() {
-        return Err("此操作仅在桌面应用中可用".into());
+        return Err(crate::app::i18n::t("此操作仅在桌面应用中可用").into());
     }
     let value = js_sys::futures::JsFuture::from(invoke(command, &args.to_string()))
         .await
         .map_err(error_message)?;
-    serde_json::from_str(&value.as_string().ok_or("窗口返回内容无效")?)
-        .map_err(|_| "窗口返回内容无效".into())
+    serde_json::from_str(
+        &value
+            .as_string()
+            .ok_or(crate::app::i18n::t("窗口返回内容无效"))?,
+    )
+    .map_err(|_| crate::app::i18n::t("窗口返回内容无效").into())
 }
 pub fn action(desktop: DesktopState, app: super::gateway::AppState, action: &'static str) {
     if !desktop.available {
@@ -177,4 +184,11 @@ pub fn apply_theme(theme: &str) {
             log::warn!("{error}");
         }
     });
+}
+
+pub async fn pick_directory() -> Result<Option<String>, String> {
+    call("desktop_window_action", json!({"action":"pick-directory"})).await
+}
+pub async fn cancel_shutdown() -> Result<(), String> {
+    call("desktop_window_action", json!({"action":"cancel-shutdown"})).await
 }
