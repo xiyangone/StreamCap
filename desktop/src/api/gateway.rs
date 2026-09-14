@@ -7,7 +7,7 @@ use std::{cell::RefCell, rc::Rc};
 use wasm_bindgen::prelude::*;
 
 /// The native shell supplies the actual bound address before WASM starts.
-fn gateway_base() -> String {
+pub fn gateway_base() -> String {
     let value = js_sys::Reflect::get(&window(), &JsValue::from_str("__STREAMCAP_RUNTIME__"))
         .ok()
         .and_then(|runtime| js_sys::Reflect::get(&runtime, &JsValue::from_str("apiOrigin")).ok())
@@ -40,7 +40,7 @@ pub struct Recording {
     pub monitor_status: bool,
     pub scheduled_recording: Option<bool>,
     pub scheduled_start_time: Option<String>,
-    pub monitor_hours: Option<i32>,
+    pub monitor_hours: Option<String>,
     pub enabled_message_push: Option<bool>,
     pub only_notify_no_record: Option<bool>,
     pub flv_use_direct_download: Option<bool>,
@@ -49,6 +49,8 @@ pub struct Recording {
     pub is_live: bool,
     #[serde(default)]
     pub is_recording: bool,
+    #[serde(default)]
+    pub recorded_seconds: f64,
     #[serde(default)]
     pub recording_error: Option<String>,
     pub live_title: Option<String>,
@@ -61,7 +63,7 @@ pub struct Recording {
 impl Recording {
     pub fn name(&self) -> String {
         if self.streamer_name.trim().is_empty() {
-            "未命名直播间".into()
+            crate::app::i18n::t("未命名直播间").into()
         } else {
             self.streamer_name.clone()
         }
@@ -92,10 +94,10 @@ pub enum StatusKind {
 impl StatusKind {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Recording => "录制中",
-            Self::Live => "直播中",
-            Self::Monitoring => "监控中",
-            Self::Stopped => "已暂停",
+            Self::Recording => crate::app::i18n::t("录制中"),
+            Self::Live => crate::app::i18n::t("直播中"),
+            Self::Monitoring => crate::app::i18n::t("监控中"),
+            Self::Stopped => crate::app::i18n::t("已暂停"),
         }
     }
     pub fn class(self) -> &'static str {
@@ -194,6 +196,7 @@ pub struct Notice {
 pub struct AppState {
     pub status: RwSignal<GatewayStatus>,
     pub recordings: RwSignal<Vec<Recording>>,
+    pub media_jobs: RwSignal<Vec<MediaJob>>,
     pub settings: RwSignal<Map<String, Value>>,
     pub settings_version: RwSignal<u32>,
     pub notice: RwSignal<Option<Notice>>,
@@ -246,6 +249,15 @@ impl AppState {
         if let Some(grid) = settings.get("is_grid_view").and_then(Value::as_bool) {
             self.grid_view.set(grid);
         }
+        if let Some(language) = settings
+            .get("language")
+            .and_then(Value::as_str)
+            .filter(|v| matches!(*v, "en" | "zh_CN"))
+        {
+            if language != crate::app::i18n::language() {
+                crate::app::i18n::set_language(language);
+            }
+        }
         self.settings.set(settings);
     }
 }
@@ -278,6 +290,7 @@ pub fn provide_app_state() -> AppState {
     let state = AppState {
         status: RwSignal::new(GatewayStatus::default()),
         recordings: RwSignal::new(Vec::new()),
+        media_jobs: RwSignal::new(Vec::new()),
         settings: RwSignal::new(Map::new()),
         settings_version: RwSignal::new(0),
         notice: RwSignal::new(None),
@@ -324,12 +337,13 @@ async fn decode<T: DeserializeOwned>(response: Response) -> Result<T, String> {
             .await
             .ok()
             .and_then(|v| v.get("detail").and_then(Value::as_str).map(str::to_owned));
-        return Err(detail.unwrap_or_else(|| format!("操作未完成（HTTP {status}），请刷新后重试")));
+        return Err(detail
+            .unwrap_or_else(|| crate::tr_format!("操作未完成（HTTP {status}），请刷新后重试")));
     }
     response
         .json::<T>()
         .await
-        .map_err(|_| "服务返回的数据格式不正确".into())
+        .map_err(|_| crate::app::i18n::t("服务返回的数据格式不正确").into())
 }
 async fn call<T: DeserializeOwned>(
     method: &str,
@@ -338,10 +352,11 @@ async fn call<T: DeserializeOwned>(
 ) -> Result<T, String> {
     let base = gateway_base();
     if base.is_empty() {
-        return Err("原生运行配置未就绪，请从桌面程序启动".into());
+        return Err(crate::app::i18n::t("原生运行配置未就绪，请从桌面程序启动").into());
     }
     let url = format!("{base}{path}");
-    let abort = web_sys::AbortController::new().map_err(|_| "无法创建请求".to_string())?;
+    let abort = web_sys::AbortController::new()
+        .map_err(|_| crate::app::i18n::t("无法创建请求").to_string())?;
     let builder = match method {
         "POST" => Request::post(&url),
         "PUT" => Request::put(&url),
@@ -353,12 +368,11 @@ async fn call<T: DeserializeOwned>(
         Some(body) => builder.json(&body),
         None => builder.build(),
     }
-    .map_err(|_| "无法构造请求".to_string())?;
+    .map_err(|_| crate::app::i18n::t("无法构造请求").to_string())?;
     let timer = gloo_timers::callback::Timeout::new(12_000, move || abort.abort());
-    let response = request
-        .send()
-        .await
-        .map_err(|_| "本地服务未响应；请刷新确认操作结果后再重试".to_string())?;
+    let response = request.send().await.map_err(|_| {
+        crate::app::i18n::t("本地服务未响应；请刷新确认操作结果后再重试").to_string()
+    })?;
     drop(timer);
     decode(response).await
 }
@@ -379,6 +393,8 @@ pub async fn refresh_recordings(state: AppState) -> Result<(), String> {
         s.active_recordings = list.iter().filter(|r| r.is_recording).count();
     });
     state.recordings.set(list);
+    let jobs: MediaJobs = call("GET", "/api/media/jobs", None).await?;
+    state.media_jobs.set(jobs.jobs);
     state.loading.set(false);
     Ok(())
 }
@@ -598,9 +614,40 @@ pub fn save_appearance(state: AppState) {
                     state.apply_settings(settings);
                 }
             }
-            Err(error) => state.fail(format!("外观已本地应用，配置同步失败：{error}")),
+            Err(error) => state.fail(crate::tr_format!("外观已本地应用，配置同步失败：{error}")),
         }
     });
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaJob {
+    pub id: String,
+    pub task_id: Option<String>,
+    pub source: String,
+    pub output: String,
+    pub state: String,
+    #[serde(default)]
+    pub source_removed: bool,
+    #[serde(default)]
+    pub delete_original: bool,
+    pub message: String,
+}
+impl MediaJob {
+    pub fn pending(&self) -> bool {
+        matches!(
+            self.state.as_str(),
+            "waiting" | "running" | "verifying" | "cleaning"
+        )
+    }
+}
+#[derive(Deserialize)]
+struct MediaJobs {
+    jobs: Vec<MediaJob>,
+}
+pub async fn remux_file(path: &str) -> Result<(), String> {
+    let _: Value = call("POST", "/api/media/remux", Some(json!({"path":path}))).await?;
+    Ok(())
 }
 
 type EventHandler = (&'static str, Closure<dyn FnMut(web_sys::MessageEvent)>);
@@ -657,7 +704,7 @@ pub fn subscribe_events(state: AppState) -> Option<EventConnection> {
     source.set_onopen(Some(on_open.as_ref().unchecked_ref()));
     source.set_onerror(Some(on_error.as_ref().unchecked_ref()));
     let mut messages = Vec::new();
-    for event_name in ["update", "delete", "settings"] {
+    for event_name in ["update", "delete", "settings", "mediaJob"] {
         let handler = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(
             move |event: web_sys::MessageEvent| {
                 let Some(text) = event.data().as_string() else {
@@ -684,6 +731,22 @@ pub fn subscribe_events(state: AppState) -> Option<EventConnection> {
                                 .update(|list| list.retain(|r| !ids.contains(&r.rec_id)));
                         }
                     }
+                    "mediaJob" => {
+                        if let Ok(job) = serde_json::from_str::<MediaJob>(&text) {
+                            state.media_jobs.update(|jobs| {
+                                if let Some(existing) =
+                                    jobs.iter_mut().find(|item| item.id == job.id)
+                                {
+                                    *existing = job;
+                                } else {
+                                    if jobs.len() >= 256 {
+                                        jobs.remove(0);
+                                    }
+                                    jobs.push(job);
+                                }
+                            });
+                        }
+                    }
                     "settings" => {
                         state.settings_version.update(|v| *v += 1);
                         leptos::task::spawn_local(async move {
@@ -707,4 +770,49 @@ pub fn subscribe_events(state: AppState) -> Option<EventConnection> {
         _error: on_error,
         retry_timer,
     })
+}
+
+pub async fn tool_status() -> Result<Value, String> {
+    call("GET", "/api/tools/status", None).await
+}
+pub async fn install_tools() -> Result<(), String> {
+    call::<Value>("POST", "/api/tools/install", Some(json!({})))
+        .await
+        .map(|_| ())
+}
+pub async fn check_update() -> Result<Value, String> {
+    call("GET", "/api/tools/update", None).await
+}
+pub async fn accounts() -> Result<Value, String> {
+    call("GET", "/api/accounts", None).await
+}
+pub async fn save_account(platform: &str, changes: Value) -> Result<(), String> {
+    call::<Value>(
+        "PUT",
+        "/api/accounts",
+        Some(json!({"platform":platform,"changes":changes})),
+    )
+    .await
+    .map(|_| ())
+}
+pub async fn shutdown_timer(hours: Option<f64>) -> Result<(), String> {
+    call::<Value>(
+        "POST",
+        "/api/automation/shutdown",
+        Some(json!({"hours":hours})),
+    )
+    .await
+    .map(|_| ())
+}
+pub async fn save_screenshot(path: &str, data: &str) -> Result<String, String> {
+    let value: Value = call(
+        "POST",
+        "/api/media/screenshot",
+        Some(json!({"path":path,"pngBase64":data})),
+    )
+    .await?;
+    value["path"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or(crate::app::i18n::t("截图保存结果无效").into())
 }

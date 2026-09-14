@@ -241,3 +241,22 @@ async fn recording_preview_uses_the_same_root_boundary_and_relative_paths() {
     );
     server.shutdown().await.unwrap();
 }
+
+#[test]
+fn conversion_output_publish_never_overwrites_and_temporary_files_are_not_listed() {
+    let dir = tempfile::tempdir().unwrap();
+    let temporary = dir.path().join(".streamcap-remux-fixture.mp4");
+    let output = dir.path().join("kept.mp4");
+    std::fs::write(&temporary, b"new media").unwrap();
+    std::fs::write(&output, b"original media").unwrap();
+    assert!(storage::publish_new_file(&temporary, &output).is_err());
+    assert_eq!(std::fs::read(&output).unwrap(), b"original media");
+    assert_eq!(std::fs::read(&temporary).unwrap(), b"new media");
+    let listing = storage::list(dir.path(), "", &CancellationToken::new()).unwrap();
+    assert_eq!(listing.items.len(), 1);
+    assert_eq!(listing.items[0].name, "kept.mp4");
+    let new_output = dir.path().join("new.mp4");
+    storage::publish_new_file(&temporary, &new_output).unwrap();
+    assert_eq!(std::fs::read(&new_output).unwrap(), b"new media");
+    assert!(!temporary.exists());
+}

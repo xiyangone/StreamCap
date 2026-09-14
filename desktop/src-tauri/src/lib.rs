@@ -1,4 +1,5 @@
 //! Native desktop shell: in-process resolution, system WebView2 and owned-resource shutdown.
+use std::sync::Arc;
 use streamcap_core::{
     service::{Server, ServerOptions},
     Workspace,
@@ -43,13 +44,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     let theme = tauri::async_runtime::block_on(async {
         state.config.read().await.get_str("theme_mode", "system")
     });
-    let server = tauri::async_runtime::block_on(Server::start(
+    let server = Arc::new(tauri::async_runtime::block_on(Server::start(
         state,
         ServerOptions {
             port: options.port,
             monitoring: options.smoke_seconds.is_none(),
         },
-    ))?;
+    ))?);
     let address = server.address();
     let smoke = options.smoke_seconds.is_some();
     let mut context = tauri::generate_context!();
@@ -63,17 +64,21 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let window_configs = std::mem::take(&mut context.config_mut().app.windows);
+    let setup_server = server.clone();
     let app=tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .invoke_handler(tauri::generate_handler![desktop_ready,desktop_window_action,desktop_close_choice,desktop_theme,desktop_smoke_tray_quit])
         .setup(move |app|{
-            log::info!("原生后端已启动：{}；无需 Python/Node",server.address());
-            app.manage(lifecycle::Lifecycle::new(server,smoke.then(||workspace.user_data_dir.join("shutdown.json"))));
+            log::info!("原生后端已启动：{}；无需 Python/Node",setup_server.address());
+            app.manage(lifecycle::Lifecycle::new(setup_server,smoke.then(||workspace.user_data_dir.join("shutdown.json"))));
             for window_config in &window_configs{
                 let mut window=tauri::WebviewWindowBuilder::from_config(app,window_config)?.theme(match theme.as_str(){"light"=>Some(tauri::Theme::Light),"dark"=>Some(tauri::Theme::Dark),_=>None});
                 window=window.initialization_script(lifecycle::runtime_script(address));
                 if smoke{window=window.initialization_script(lifecycle::smoke_transport_script(address));}
                 window.build()?;
             }
+            lifecycle::start_native_events(app.handle());
             match setup_tray(app){Ok(())=>app.state::<lifecycle::Lifecycle>().set_tray_available(true),Err(error)=>log::warn!("托盘不可用: {error}")}
             if smoke{
                 std::fs::write(workspace.user_data_dir.join("ready.json"),serde_json::to_vec_pretty(&serde_json::json!({"pid":std::process::id(),"address":address.to_string(),"dataDirectory":workspace.user_data_dir,"resolver":"native"}))?)?;
@@ -93,7 +98,16 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         })
-        .build(context)?;
+        .build(context);
+    let app = match app {
+        Ok(app) => app,
+        Err(error) => {
+            if let Err(cleanup) = tauri::async_runtime::block_on(server.shutdown()) {
+                log::error!("窗口启动失败后的后端清理未完成: {cleanup}");
+            }
+            return Err(error.into());
+        }
+    };
     app.run(|handle, event| match event {
         RunEvent::ExitRequested { api, .. } => {
             if let Some(state) = handle.try_state::<lifecycle::Lifecycle>() {
@@ -106,6 +120,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         RunEvent::Exit => log::info!("StreamCap 已退出"),
         _ => {}
     });
+    tauri::async_runtime::block_on(server.shutdown())?;
     Ok(())
 }
 fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
@@ -158,11 +173,39 @@ async fn desktop_ready(window: tauri::WebviewWindow) -> Result<lifecycle::Window
     Ok(lifecycle::window_status(&window))
 }
 #[tauri::command]
-fn desktop_window_action(
+async fn desktop_window_action(
     window: tauri::WebviewWindow,
     action: String,
-) -> Result<lifecycle::WindowStatus, String> {
+) -> Result<serde_json::Value, String> {
     require_main(&window)?;
+    if action == "cancel-shutdown" {
+        lifecycle::cancel_shutdown(window.app_handle())?;
+        return Ok(serde_json::Value::Null);
+    }
+    if action == "pick-directory" {
+        use tauri_plugin_dialog::DialogExt;
+        if window.state::<lifecycle::Lifecycle>().is_smoke() {
+            return Err("隔离验收不打开系统目录选择器".into());
+        }
+        let (send, receive) = tokio::sync::oneshot::channel();
+        window
+            .dialog()
+            .file()
+            .set_parent(&window)
+            .pick_folder(move |value| {
+                let _ = send.send(value);
+            });
+        let path = receive
+            .await
+            .map_err(|_| "目录选择已取消")?
+            .map(|file| {
+                file.into_path()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .map_err(|_| "请选择本地目录")
+            })
+            .transpose()?;
+        return Ok(serde_json::json!(path));
+    }
     let result = match action.as_str() {
         "minimize" => window.minimize(),
         "maximize" => {
@@ -177,7 +220,7 @@ fn desktop_window_action(
     };
     result.map_err(|_| "窗口操作失败，请重试")?;
     lifecycle::emit_window_status(&window);
-    Ok(lifecycle::window_status(&window))
+    serde_json::to_value(lifecycle::window_status(&window)).map_err(|_| "窗口状态无法读取".into())
 }
 #[tauri::command]
 async fn desktop_close_choice(

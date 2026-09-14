@@ -13,7 +13,9 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
-pub const SUPPORTED_RECORD_FORMATS: &[&str] = &["TS", "FLV", "MKV", "MOV", "MP4"];
+pub const SUPPORTED_RECORD_FORMATS: &[&str] = &[
+    "TS", "FLV", "MKV", "MOV", "MP4", "NUT", "WAV", "MP3", "WMA", "M4A", "AAC",
+];
 pub const DEFAULT_RW_TIMEOUT: &str = "15000000";
 pub const DEFAULT_ANALYZEDURATION: &str = "20000000";
 pub const DEFAULT_PROBESIZE: &str = "10000000";
@@ -74,8 +76,19 @@ pub fn build_command(options: &RecordOptions) -> Vec<String> {
         )
     };
 
+    let http_input =
+        options.record_url.starts_with("http://") || options.record_url.starts_with("https://");
+    let rtmp_input =
+        options.record_url.starts_with("rtmp://") || options.record_url.starts_with("rtmps://");
+    let protocols = if http_input {
+        "http,https,tcp,tls,crypto,httpproxy"
+    } else if rtmp_input {
+        "rtmp,rtmps,tcp,tls"
+    } else {
+        "file,crypto"
+    };
     let mut command: Vec<String> = vec![
-        "-y",
+        "-n",
         "-v",
         "verbose",
         "-rw_timeout",
@@ -83,10 +96,8 @@ pub fn build_command(options: &RecordOptions) -> Vec<String> {
         "-loglevel",
         "error",
         "-hide_banner",
-        "-user_agent",
-        FFMPEG_USER_AGENT,
         "-protocol_whitelist",
-        "rtmp,crypto,file,http,https,tcp,tls,udp,rtp,httpproxy",
+        protocols,
         "-thread_queue_size",
         "1024",
         "-analyzeduration",
@@ -108,6 +119,18 @@ pub fn build_command(options: &RecordOptions) -> Vec<String> {
         }
     }
 
+    if http_input {
+        command.extend(strings(&[
+            "-user_agent",
+            FFMPEG_USER_AGENT,
+            "-reconnect",
+            "1",
+            "-reconnect_streamed",
+            "1",
+            "-reconnect_delay_max",
+            "5",
+        ]));
+    }
     command.push("-i".into());
     command.push(options.record_url.clone());
 
@@ -117,10 +140,6 @@ pub fn build_command(options: &RecordOptions) -> Vec<String> {
             bufsize,
             "-sn",
             "-dn",
-            "-reconnect_delay_max",
-            "60",
-            "-reconnect_streamed",
-            "-reconnect_at_eof",
             "-max_muxing_queue_size",
             max_muxing_queue,
             "-correct_ts_overflow",
@@ -136,7 +155,11 @@ pub fn build_command(options: &RecordOptions) -> Vec<String> {
 
     // headers 与 proxy 属于输入选项：必须位于 -i 之前，否则 ffmpeg 会当作输出选项忽略。
     // 与 Python `_get_basic_ffmpeg_command` 的插入位置一致（headers 紧随 user_agent）。
-    if let Some(headers) = options.headers.as_ref().filter(|h| !h.is_empty()) {
+    if let Some(headers) = options
+        .headers
+        .as_ref()
+        .filter(|h| http_input && !h.is_empty())
+    {
         let index = command
             .iter()
             .position(|a| a == "-protocol_whitelist" || a == "-i")
@@ -207,7 +230,7 @@ pub fn build_command(options: &RecordOptions) -> Vec<String> {
                     "-f",
                     "mp4",
                     "-movflags",
-                    "+faststart+frag_keyframe+empty_moov+delay_moov",
+                    "+faststart",
                 ]));
             }
         }
@@ -272,11 +295,45 @@ pub fn build_command(options: &RecordOptions) -> Vec<String> {
                 ]));
             }
         }
-        other => {
-            log::warn!("未支持的录制格式 {other}，回退为 TS");
+        "NUT" => {
             tail.extend(video_codec.iter().cloned());
-            tail.extend(strings(&["-c:a", "copy", "-map", "0", "-f", "mpegts"]));
+            if options.segment_record {
+                tail.extend(segment_args("nut", options));
+            } else {
+                tail.extend(strings(&[
+                    "-c:a", "copy", "-map", "0:v?", "-map", "0:a?", "-f", "nut",
+                ]));
+            }
         }
+        "WAV" | "MP3" | "WMA" | "M4A" | "AAC" => {
+            let (codec, muxer) = match format.as_str() {
+                "WAV" => ("pcm_s16le", "wav"),
+                "MP3" => ("libmp3lame", "mp3"),
+                "WMA" => ("wmav2", "asf"),
+                "M4A" => ("aac", "mp4"),
+                _ => ("aac", "adts"),
+            };
+            tail.extend(strings(&[
+                "-vn", "-map", "0:a:0", "-c:a", codec, "-ar", "44100", "-ac", "2",
+            ]));
+            if format != "WAV" {
+                tail.extend(strings(&["-b:a", "192k"]));
+            }
+            if options.segment_record {
+                tail.extend(strings(&[
+                    "-f",
+                    "segment",
+                    "-segment_format",
+                    muxer,
+                    "-reset_timestamps",
+                    "1",
+                ]));
+                tail.extend(segment_time_args(options));
+            } else {
+                tail.extend(strings(&["-f", muxer]));
+            }
+        }
+        _ => return Vec::new(),
     }
 
     command.extend(tail);
@@ -284,6 +341,18 @@ pub fn build_command(options: &RecordOptions) -> Vec<String> {
     command
 }
 
+pub(crate) fn validate_recording_proxy(url: &str, proxy: Option<&str>) -> Result<(), String> {
+    if let Some(proxy) = proxy.filter(|value| !value.is_empty()) {
+        let proxy = reqwest::Url::parse(proxy).map_err(|_| "录制代理地址无效")?;
+        if proxy.scheme() != "http" || proxy.host_str().is_none() {
+            return Err("FFmpeg 录制请使用 http:// 代理；SOCKS 仅支持解析和 FLV 直下".into());
+        }
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return Err("当前流协议不支持 HTTP 录制代理，请关闭该平台代理".into());
+        }
+    }
+    Ok(())
+}
 fn strings(items: &[&str]) -> Vec<String> {
     items.iter().map(|s| (*s).to_string()).collect()
 }
@@ -321,7 +390,7 @@ pub fn build_filename(anchor_name: &str, title: Option<&str>, timestamp: &str) -
     let mut parts: Vec<String> = vec![sanitize(anchor_name)];
     if let Some(title) = title.filter(|t| !t.is_empty()) {
         // 与 Python `_clean_and_truncate_title` 一致：截断 30 字符、全角逗号转半角、去除空格
-        let cleaned: String = title
+        let cleaned: String = sanitize(title)
             .chars()
             .take(30)
             .collect::<String>()
@@ -365,12 +434,39 @@ pub fn build_output_dir(
 
 /// 去掉文件名中的非法字符并去除空格（与 Python 的 replace(" ", "_") 取向一致）。
 pub fn sanitize(name: &str) -> String {
-    const ILLEGAL: &[char] = &['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
-    name.chars()
-        .map(|c| if ILLEGAL.contains(&c) { '_' } else { c })
-        .collect::<String>()
-        .trim()
-        .to_string()
+    let mut result: String = name
+        .chars()
+        .map(|c| {
+            if c.is_control() || r#"<>:"/\|?*%"#.contains(c) {
+                '_'
+            } else {
+                c
+            }
+        })
+        .take(96)
+        .collect();
+    result = result.trim().trim_end_matches(['.', ' ']).to_string();
+    let stem = result
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    if result.is_empty()
+        || stem == "CON"
+        || stem == "PRN"
+        || stem == "AUX"
+        || stem == "NUL"
+        || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.as_bytes()[3].is_ascii_digit())
+    {
+        result.insert(0, '_');
+    }
+    result
+}
+
+pub fn without_emojis(value: &str) -> String {
+    value.chars().filter(|c|!matches!(*c as u32,0x1F000..=0x1FAFF|0x2600..=0x27FF|0xFE00..=0xFE0F|0x200D|0x20E3)).collect()
 }
 
 /// 分段录制时 ffmpeg 需要 `_%03d` 序号占位。
@@ -391,7 +487,10 @@ pub struct RecorderProcess {
     pub rec_id: String,
     pub output_path: PathBuf,
     pub run_id: uuid::Uuid,
-    child: Arc<Mutex<Child>>,
+    pub started_at: std::time::Instant,
+    pub wall_started_at: chrono::DateTime<chrono::Local>,
+    child: Option<Arc<Mutex<Child>>>,
+    direct: Option<crate::direct::Download>,
     stop_requested: AtomicBool,
     failure: Arc<Mutex<Option<String>>>,
     stderr_done: tokio_util::sync::CancellationToken,
@@ -401,8 +500,12 @@ impl RecorderProcess {
     /// 优雅停止：Windows 下向 stdin 写 `q` 让 ffmpeg 收尾；超时后强杀。
     pub async fn stop(&self, grace_secs: u64) {
         self.stop_requested.store(true, Ordering::SeqCst);
+        if let Some(direct) = &self.direct {
+            direct.stop().await;
+            return;
+        }
         {
-            let mut child = self.child.lock().await;
+            let mut child = self.child.as_ref().expect("ffmpeg process").lock().await;
             if let Some(stdin) = child.stdin.as_mut() {
                 use tokio::io::AsyncWriteExt;
                 let _ = stdin.write_all(b"q").await;
@@ -413,7 +516,7 @@ impl RecorderProcess {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(grace_secs);
         loop {
             {
-                let mut child = self.child.lock().await;
+                let mut child = self.child.as_ref().expect("ffmpeg process").lock().await;
                 match child.try_wait() {
                     Ok(Some(_)) => return,
                     Ok(None) => {}
@@ -429,7 +532,7 @@ impl RecorderProcess {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
 
-        let mut child = self.child.lock().await;
+        let mut child = self.child.as_ref().expect("ffmpeg process").lock().await;
         if let Err(err) = child.kill().await {
             log::warn!("强制结束 ffmpeg 失败: {err}");
         }
@@ -457,6 +560,7 @@ pub struct Engine {
     active: Arc<Mutex<HashMap<String, Arc<RecorderProcess>>>>,
     log_tasks: tokio_util::task::TaskTracker,
     filesystem: Arc<Mutex<()>>,
+    media_reservations: Arc<std::sync::Mutex<HashMap<uuid::Uuid, Vec<PathBuf>>>>,
 }
 
 impl Engine {
@@ -474,6 +578,35 @@ impl Engine {
             .await
             .values()
             .any(|process| output_is_protected(&process.output_path, target))
+            || self
+                .media_reservations
+                .lock()
+                .expect("media reservation lock")
+                .values()
+                .flatten()
+                .any(|path| path.starts_with(target))
+    }
+    pub async fn is_recording_path(&self, target: &Path) -> bool {
+        self.active
+            .lock()
+            .await
+            .values()
+            .any(|process| output_is_protected(&process.output_path, target))
+    }
+    pub async fn process(&self, rec_id: &str) -> Option<Arc<RecorderProcess>> {
+        self.active.lock().await.get(rec_id).cloned()
+    }
+    /// Caller holds filesystem_guard while selecting files and registering this reservation.
+    pub(crate) fn reserve_media(&self, paths: Vec<PathBuf>) -> MediaReservation {
+        let id = uuid::Uuid::new_v4();
+        self.media_reservations
+            .lock()
+            .expect("media reservation lock")
+            .insert(id, paths);
+        MediaReservation {
+            id,
+            reservations: self.media_reservations.clone(),
+        }
     }
 
     pub fn begin_shutdown(&self) {
@@ -504,8 +637,18 @@ impl Engine {
         if !self.is_current(process).await {
             return ProcessState::Unknown;
         }
-        let exit_code = {
-            let mut child = process.child.lock().await;
+        let exit_code = if let Some(direct) = &process.direct {
+            let result = direct.result.lock().await;
+            match result.as_ref() {
+                None => return ProcessState::Running,
+                Some(Ok(())) => Some(0),
+                Some(Err(error)) => {
+                    *process.failure.lock().await = Some(error.clone());
+                    Some(1)
+                }
+            }
+        } else {
+            let mut child = process.child.as_ref().expect("ffmpeg process").lock().await;
             match child.try_wait() {
                 Ok(Some(status)) => status.code(),
                 Ok(None) => return ProcessState::Running,
@@ -561,8 +704,9 @@ impl Engine {
         rec_id: &str,
         options: &RecordOptions,
     ) -> Result<Arc<RecorderProcess>, String> {
+        validate_recording_proxy(&options.record_url, options.proxy.as_deref())?;
         if !SUPPORTED_RECORD_FORMATS.contains(&options.format.to_ascii_uppercase().as_str()) {
-            return Err("此录制格式尚未迁移到原生版".into());
+            return Err("不支持的录制格式".into());
         }
         let _filesystem = self.filesystem_guard().await;
         let mut active = self.active.lock().await;
@@ -576,6 +720,34 @@ impl Engine {
             std::fs::create_dir_all(parent).map_err(|e| format!("创建输出目录失败: {e}"))?;
         }
 
+        let output = Path::new(&options.save_path);
+        let output_path = output
+            .parent()
+            .ok_or("输出目录无效")?
+            .canonicalize()
+            .map_err(|e| e.to_string())?
+            .join(output.file_name().ok_or("输出文件名无效")?);
+        if self
+            .media_reservations
+            .lock()
+            .expect("media reservation lock")
+            .values()
+            .flatten()
+            .any(|path| output_is_protected(&output_path, path))
+        {
+            return Err("同名录制文件正在转 MP4，请稍后重试".into());
+        }
+        if std::fs::symlink_metadata(&output_path).is_ok()
+            || !crate::media_safety::recording_outputs(&output_path)
+                .map_err(|e| e.to_string())?
+                .is_empty()
+            || active.values().any(|p| {
+                output_is_protected(&p.output_path, &output_path)
+                    || output_is_protected(&output_path, &p.output_path)
+            })
+        {
+            return Err("同名输出已存在，未覆盖任何录像".into());
+        }
         let args = build_command(options);
         log::info!("启动录制 {rec_id}");
 
@@ -618,21 +790,73 @@ impl Engine {
             stderr_done.cancel();
         }
 
-        let output = Path::new(&options.save_path);
-        let output_path = output
-            .parent()
-            .ok_or("输出目录无效")?
-            .canonicalize()
-            .map_err(|e| e.to_string())?
-            .join(output.file_name().ok_or("输出文件名无效")?);
         let process = Arc::new(RecorderProcess {
             rec_id: rec_id.to_string(),
             output_path,
             run_id: uuid::Uuid::new_v4(),
-            child: Arc::new(Mutex::new(child)),
+            started_at: std::time::Instant::now(),
+            wall_started_at: chrono::Local::now(),
+            child: Some(Arc::new(Mutex::new(child))),
+            direct: None,
             stop_requested: AtomicBool::new(false),
             failure,
             stderr_done,
+        });
+        active.insert(rec_id.to_string(), process.clone());
+        Ok(process)
+    }
+
+    pub async fn start_direct(
+        &self,
+        rec_id: &str,
+        options: &RecordOptions,
+    ) -> Result<Arc<RecorderProcess>, String> {
+        if options.format != "FLV" || options.segment_record {
+            return Err("FLV 直下需要选择 FLV 格式并关闭分段".into());
+        }
+        let _filesystem = self.filesystem_guard().await;
+        let mut active = self.active.lock().await;
+        if self.closing.load(Ordering::SeqCst) || active.contains_key(rec_id) {
+            return Err("任务已在运行或正在退出".into());
+        }
+        let path = Path::new(&options.save_path);
+        let output_path = path
+            .parent()
+            .ok_or("输出目录无效")?
+            .canonicalize()
+            .map_err(|_| "输出目录无效")?
+            .join(path.file_name().ok_or("输出文件名无效")?);
+        if self
+            .media_reservations
+            .lock()
+            .expect("media reservations")
+            .values()
+            .flatten()
+            .any(|p| p == &output_path)
+        {
+            return Err("文件正在后处理中".into());
+        }
+        let direct = crate::direct::Download::start(
+            &output_path,
+            &options.record_url,
+            options.proxy.as_deref(),
+            options.headers.as_deref(),
+            &self.log_tasks,
+        )
+        .await?;
+        let done = tokio_util::sync::CancellationToken::new();
+        done.cancel();
+        let process = Arc::new(RecorderProcess {
+            rec_id: rec_id.to_string(),
+            output_path,
+            run_id: uuid::Uuid::new_v4(),
+            started_at: std::time::Instant::now(),
+            wall_started_at: chrono::Local::now(),
+            child: None,
+            direct: Some(direct),
+            stop_requested: AtomicBool::new(false),
+            failure: Arc::new(Mutex::new(None)),
+            stderr_done: done,
         });
         active.insert(rec_id.to_string(), process.clone());
         Ok(process)
@@ -708,6 +932,19 @@ fn redact_stream_url(message: &str) -> String {
     static URL: std::sync::LazyLock<regex::Regex> =
         std::sync::LazyLock::new(|| regex::Regex::new(r"https?://\S+").expect("static regex"));
     URL.replace_all(message, "[stream-url]").into_owned()
+}
+
+/// Keeps queued and running conversions protected from in-app recycle operations.
+pub(crate) struct MediaReservation {
+    id: uuid::Uuid,
+    reservations: Arc<std::sync::Mutex<HashMap<uuid::Uuid, Vec<PathBuf>>>>,
+}
+impl Drop for MediaReservation {
+    fn drop(&mut self) {
+        if let Ok(mut paths) = self.reservations.lock() {
+            paths.remove(&self.id);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -920,5 +1157,55 @@ mod tests {
         let engine = Engine::new();
         assert!(!engine.stop("missing", 1).await);
         assert!(!engine.is_recording("missing").await);
+    }
+}
+
+#[cfg(test)]
+mod protocol_tests {
+    use super::*;
+    fn options(url: &str) -> RecordOptions {
+        RecordOptions {
+            record_url: url.into(),
+            save_path: "fixture.ts".into(),
+            format: "TS".into(),
+            segment_record: false,
+            segment_time: None,
+            headers: Some("Referer: https://example.test/\r\n".into()),
+            proxy: None,
+            platform_key: None,
+            video_bitrate: None,
+            is_overseas: false,
+        }
+    }
+    #[test]
+    fn http_playlists_cannot_read_local_files_and_rtmp_has_no_http_options() {
+        let http = build_command(&options("https://media.example.test/stream.m3u8"));
+        let at = http
+            .iter()
+            .position(|s| s == "-protocol_whitelist")
+            .unwrap();
+        assert!(!http[at + 1].split(',').any(|s| s == "file"));
+        let rtmp = build_command(&options("rtmp://media.example.test/live"));
+        assert!(!rtmp
+            .iter()
+            .any(|s| s == "-user_agent" || s == "-headers" || s == "-reconnect"));
+    }
+    #[test]
+    fn unsupported_proxy_protocols_fail_instead_of_being_ignored() {
+        assert!(validate_recording_proxy(
+            "https://example.test/live",
+            Some("socks5://127.0.0.1:1080")
+        )
+        .is_err());
+        assert!(validate_recording_proxy(
+            "rtmp://example.test/live",
+            Some("http://127.0.0.1:8080")
+        )
+        .is_err());
+        assert!(validate_recording_proxy(
+            "https://example.test/live",
+            Some("http://127.0.0.1:8080")
+        )
+        .is_ok());
     }
 }

@@ -10,6 +10,7 @@ use std::{
 };
 use streamcap_core::service::Server;
 use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 pub struct Lifecycle {
     server: Arc<Server>,
@@ -20,6 +21,11 @@ pub struct Lifecycle {
     ui_ready: AtomicBool,
     action: tokio::sync::Mutex<()>,
     report: Option<PathBuf>,
+    native_stop: CancellationToken,
+    native_tasks: TaskTracker,
+    shutdown_at: std::sync::Mutex<Option<std::time::Instant>>,
+    system_shutdown: AtomicBool,
+    power_committed: AtomicBool,
 }
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -30,11 +36,14 @@ pub struct WindowStatus {
     pub close_pending: bool,
     pub closing: bool,
     pub tray_available: bool,
+    pub shutdown_seconds: Option<u64>,
+    pub system_shutdown: bool,
 }
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CloseRequest {
     pub active_recordings: usize,
+    pub pending_media_jobs: usize,
     pub tray_available: bool,
 }
 #[derive(Debug, PartialEq)]
@@ -53,15 +62,20 @@ impl ClosePolicy {
     }
 }
 impl Lifecycle {
-    pub fn new(server: Server, report: Option<PathBuf>) -> Self {
+    pub fn new(server: Arc<Server>, report: Option<PathBuf>) -> Self {
         Self {
-            server: Arc::new(server),
+            server,
             closing: AtomicBool::new(false),
             finished: AtomicBool::new(false),
             pending: AtomicBool::new(false),
             tray_available: AtomicBool::new(false),
             ui_ready: AtomicBool::new(false),
             action: tokio::sync::Mutex::new(()),
+            native_stop: CancellationToken::new(),
+            native_tasks: TaskTracker::new(),
+            shutdown_at: std::sync::Mutex::new(None),
+            system_shutdown: AtomicBool::new(false),
+            power_committed: AtomicBool::new(false),
             report,
         }
     }
@@ -79,6 +93,7 @@ impl Lifecycle {
         if self.pending.load(Ordering::SeqCst) && !self.closing.load(Ordering::SeqCst) {
             let request = CloseRequest {
                 active_recordings: self.server.state().engine.active_ids().await.len(),
+                pending_media_jobs: self.server.state().scheduler.postprocess.pending(),
                 tray_available: self.tray_available.load(Ordering::SeqCst),
             };
             let _ = window.emit("streamcap:close-requested", request);
@@ -87,6 +102,15 @@ impl Lifecycle {
 }
 pub fn window_status(window: &WebviewWindow) -> WindowStatus {
     let lifecycle = window.state::<Lifecycle>();
+    let shutdown_seconds = lifecycle
+        .shutdown_at
+        .lock()
+        .expect("shutdown timer")
+        .map(|when| {
+            when.saturating_duration_since(std::time::Instant::now())
+                .as_secs()
+                .saturating_add(1)
+        });
     WindowStatus {
         maximized: window.is_maximized().unwrap_or(false),
         visible: window.is_visible().unwrap_or(false),
@@ -94,6 +118,8 @@ pub fn window_status(window: &WebviewWindow) -> WindowStatus {
         close_pending: lifecycle.pending.load(Ordering::SeqCst),
         closing: lifecycle.closing.load(Ordering::SeqCst),
         tray_available: lifecycle.tray_available.load(Ordering::SeqCst),
+        shutdown_seconds,
+        system_shutdown: lifecycle.system_shutdown.load(Ordering::SeqCst),
     }
 }
 pub fn emit_window_status(window: &WebviewWindow) {
@@ -147,6 +173,7 @@ pub fn on_close_requested(window: &WebviewWindow) {
             ClosePolicy::Ask => {
                 let payload = CloseRequest {
                     active_recordings: state.server.state().engine.active_ids().await.len(),
+                    pending_media_jobs: state.server.state().scheduler.postprocess.pending(),
                     tray_available,
                 };
                 if let Err(error) = window.emit("streamcap:close-requested", payload) {
@@ -219,21 +246,34 @@ pub fn request_exit(app: &AppHandle) {
     if state.closing.swap(true, Ordering::SeqCst) {
         return;
     }
+    state.native_stop.cancel();
+    state.native_tasks.close();
     state.server.request_shutdown();
     if let Some(window) = app.get_webview_window("main") {
         emit_window_status(&window);
     }
     let server = state.server.clone();
+    let native_tasks = state.native_tasks.clone();
+    let known_terminal = server
+        .state()
+        .scheduler
+        .postprocess
+        .jobs()
+        .into_iter()
+        .filter(|job| !job.state.pending())
+        .map(|job| job.id)
+        .collect::<std::collections::HashSet<_>>();
     let report = state.report.clone();
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
+        native_tasks.wait().await;
         let outcome = server.shutdown().await;
         let ok = outcome.is_ok();
         if let Err(error) = &outcome {
             log::error!("退出保存失败: {error}");
         }
         if let Some(report) = report {
-            let value = serde_json::json!({"shutdownComplete":ok,"activeRecordings":server.state().engine.active_ids().await.len(),"pythonResolver":false});
+            let value = serde_json::json!({"shutdownComplete":ok,"activeRecordings":server.state().engine.active_ids().await.len(),"pythonResolver":false,"pendingMediaJobs":server.state().scheduler.postprocess.pending(),"activePreviews":server.state().preview.active()});
             if let Err(error) = std::fs::write(
                 report,
                 serde_json::to_vec_pretty(&value).unwrap_or_default(),
@@ -244,8 +284,166 @@ pub fn request_exit(app: &AppHandle) {
         if let Some(state) = handle.try_state::<Lifecycle>() {
             state.finished.store(true, Ordering::SeqCst);
         }
+        let shutdown_requested = handle
+            .state::<Lifecycle>()
+            .system_shutdown
+            .load(Ordering::SeqCst);
+        let failed_media = server
+            .state()
+            .scheduler
+            .postprocess
+            .jobs()
+            .iter()
+            .filter(|job| !known_terminal.contains(&job.id))
+            .any(|job| {
+                matches!(
+                    job.state,
+                    streamcap_core::model::MediaJobState::Failed
+                        | streamcap_core::model::MediaJobState::Cancelled
+                )
+            });
+        let commit_shutdown = {
+            let state = handle.state::<Lifecycle>();
+            let _gate = state.shutdown_at.lock().expect("shutdown timer");
+            let commit = state.system_shutdown.load(Ordering::SeqCst)
+                && ok
+                && !failed_media
+                && !state.is_smoke();
+            if commit {
+                state.power_committed.store(true, Ordering::SeqCst);
+            }
+            commit
+        };
+        if commit_shutdown {
+            if let Err(error) = power_off().await {
+                log::error!("{error}");
+                handle.exit(1);
+                return;
+            }
+        } else if shutdown_requested {
+            log::warn!("未执行系统关机：处于验收模式或退出收尾未通过");
+        }
         handle.exit(if ok { 0 } else { 1 });
     });
+}
+
+fn spawn_native_task(
+    tracker: &TaskTracker,
+    task: impl std::future::Future<Output = ()> + Send + 'static,
+) {
+    // Tauri setup runs on the main thread, outside a current Tokio runtime.
+    tauri::async_runtime::spawn(tracker.track_future(task));
+}
+
+/// One owned event loop handles notifications and countdowns; it is joined on exit.
+pub fn start_native_events(app: &AppHandle) {
+    use tauri_plugin_notification::NotificationExt;
+    let state = app.state::<Lifecycle>();
+    let mut events = state.server.state().store.subscribe();
+    let stop = state.native_stop.clone();
+    let handle = app.clone();
+    spawn_native_task(&state.native_tasks, async move {
+        let app = handle;
+        let mut timer = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                biased;
+                _ = stop.cancelled() => break,
+                message = events.recv() => {
+                    let message = match message {
+                        Ok(value) => value,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(_) => break,
+                    };
+                    let state = app.state::<Lifecycle>();
+                    if state.is_smoke() || state.closing.load(Ordering::SeqCst) { continue; }
+                    match message.topic.as_str() {
+                        "nativeNotification" => {
+                            let title = message.payload["title"].as_str().unwrap_or("StreamCap").chars().take(120).collect::<String>();
+                            let body = message.payload["body"].as_str().unwrap_or("").chars().take(1000).collect::<String>();
+                            if app.notification().builder().title(title).body(body).show().is_err() { state.server.state().store.snack("系统通知未送达，请检查 Windows 通知权限"); }
+                        },
+                        "shutdownSchedule" => {
+                            state.system_shutdown.store(false, Ordering::SeqCst);
+                            *state.shutdown_at.lock().expect("shutdown timer") = None;
+                            if let Some(window)=app.get_webview_window("main"){emit_window_status(&window);}
+                        },
+                        "nativeShutdown" => {
+                            let mut when = state.shutdown_at.lock().expect("shutdown timer");
+                            if when.is_none() {
+                                *when = Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+                                state.system_shutdown.store(true, Ordering::SeqCst);
+                                drop(when);
+                                let _ = show_main(&app);
+                            }
+                        },
+                        _ => {}
+                    }
+                },
+                _ = timer.tick() => {
+                    let state = app.state::<Lifecycle>();
+                    let when = *state.shutdown_at.lock().expect("shutdown timer");
+                    if when.is_some_and(|at| at <= std::time::Instant::now()) {
+                        *state.shutdown_at.lock().expect("shutdown timer") = None;
+                        request_exit(&app);
+                        break;
+                    }
+                    if when.is_some() { if let Some(window) = app.get_webview_window("main") { emit_window_status(&window); } }
+                }
+            }
+        }
+    });
+}
+pub fn cancel_shutdown(app: &AppHandle) -> Result<(), String> {
+    let state = app.state::<Lifecycle>();
+    {
+        let mut timer = state.shutdown_at.lock().map_err(|_| "关机状态异常")?;
+        if state.power_committed.load(Ordering::SeqCst) {
+            return Err("关机请求已提交给 Windows，不能再通过应用取消".into());
+        }
+        state.system_shutdown.store(false, Ordering::SeqCst);
+        *timer = None;
+    }
+    state
+        .server
+        .state()
+        .scheduler
+        .automation
+        .quick_shutdown(None)?;
+    if let Some(window) = app.get_webview_window("main") {
+        emit_window_status(&window);
+    }
+    Ok(())
+}
+async fn power_off() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let executable =
+            PathBuf::from(std::env::var_os("SystemRoot").ok_or("Windows 系统目录不可用")?)
+                .join("System32/shutdown.exe");
+        let mut command = tokio::process::Command::new(executable);
+        command
+            .args(["/s", "/t", "0"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(0x08000000)
+            .kill_on_drop(true);
+        let mut child = command.spawn().map_err(|_| "无法执行系统关机")?;
+        match tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await {
+            Ok(Ok(status)) if status.success() => Ok(()),
+            Ok(_) => Err("系统拒绝关机，未强制关闭其他程序".into()),
+            Err(_) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                Err("系统关机请求超时".into())
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        Err("当前平台不支持自动关机".into())
+    }
 }
 
 pub struct RunOptions {
@@ -358,6 +556,30 @@ pub fn runtime_script(address: std::net::SocketAddr) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_tasks_start_from_a_synchronous_thread_and_are_joined() {
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        let tracker = TaskTracker::new();
+        let stop = CancellationToken::new();
+        let completed = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let worker_completed = completed.clone();
+        spawn_native_task(&tracker, async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            worker_stop.cancelled().await;
+            worker_completed.store(true, Ordering::SeqCst);
+        });
+        tracker.close();
+        stop.cancel();
+        tauri::async_runtime::block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(3), tracker.wait())
+                .await
+                .unwrap();
+        });
+        assert!(completed.load(Ordering::SeqCst));
+        assert!(tracker.is_empty());
+    }
+
     #[test]
     fn runtime_policy_and_probe_use_the_bound_port() {
         let address = "127.0.0.1:54321".parse().unwrap();

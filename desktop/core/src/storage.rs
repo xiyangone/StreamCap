@@ -131,6 +131,15 @@ pub fn directory_size(path: &Path, stop: &CancellationToken) -> io::Result<u64> 
 }
 
 pub fn open_file(root: &Path, relative: &str) -> io::Result<std::fs::File> {
+    open_media_file(root, relative, false)
+}
+
+/// Hold a read-only lease during conversion; on Windows writers and deleters cannot race it.
+pub fn open_conversion_source(root: &Path, relative: &str) -> io::Result<std::fs::File> {
+    open_media_file(root, relative, true)
+}
+
+fn open_media_file(root: &Path, relative: &str, locked: bool) -> io::Result<std::fs::File> {
     let target = checked_target(root, relative, false)?;
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
@@ -138,7 +147,12 @@ pub fn open_file(root: &Path, relative: &str) -> io::Result<std::fs::File> {
     {
         use std::os::windows::fs::OpenOptionsExt;
         options.custom_flags(0x00200000);
+        if locked {
+            options.share_mode(1);
+        }
     }
+    #[cfg(not(windows))]
+    let _ = locked;
     let file = options.open(&target)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() || is_link(&metadata) {
@@ -207,7 +221,26 @@ pub fn list(root: &Path, relative: &str, stop: &CancellationToken) -> io::Result
     for entry in std::fs::read_dir(target)? {
         check_cancel(stop)?;
         let entry = entry?;
-        let metadata = std::fs::symlink_metadata(entry.path())?;
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".streamcap-remux-")
+            || entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".streamcap-subtitle-")
+        {
+            continue;
+        }
+        let metadata = match std::fs::symlink_metadata(entry.path()) {
+            Ok(metadata) => metadata,
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(303) =>
+            {
+                continue
+            }
+            Err(error) => return Err(error),
+        };
         if is_link(&metadata) {
             continue;
         }
@@ -503,5 +536,132 @@ mod windows_recycle {
             }
         };
         operation().map_err(|e| io::Error::other(format!("无法移入回收站，未启用永久删除: {e}")))
+    }
+}
+
+/// Publish a completed temporary output without ever replacing an existing user file.
+pub fn publish_new_file(temporary: &Path, destination: &Path) -> io::Result<()> {
+    if temporary.parent() != destination.parent() {
+        return Err(invalid("输出必须在源文件目录"));
+    }
+    let meta = std::fs::symlink_metadata(temporary)?;
+    if !meta.is_file() || is_link(&meta) {
+        return Err(invalid("临时输出不是普通文件"));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let from: Vec<u16> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
+        let to: Vec<u16> = destination
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        // MOVEFILE_WRITE_THROUGH, deliberately without MOVEFILE_REPLACE_EXISTING.
+        let ok = unsafe {
+            windows_sys::Win32::Storage::FileSystem::MoveFileExW(from.as_ptr(), to.as_ptr(), 8)
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::hard_link(temporary, destination)?;
+        std::fs::remove_file(temporary)?;
+    }
+    Ok(())
+}
+
+/// Permanently delete only the exact file verified while leased read-only.
+/// Caller holds the engine filesystem guard and has published a validated MP4.
+pub fn remove_verified_source(root: &Path, relative: &str, lease: std::fs::File) -> io::Result<()> {
+    let expected = source_identity(&lease)?;
+    drop(lease);
+    let target = checked_target(root, relative, false)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileDispositionInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO,
+        };
+        // Read + DELETE, only share reads; no external writer/deleter can race this check.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .access_mode(0x80010000)
+            .share_mode(1)
+            .custom_flags(0x00200000)
+            .open(&target)?;
+        if is_link(&file.metadata()?) || source_identity(&file)? != expected {
+            return Err(invalid("源 TS 已发生变化，未删除"));
+        }
+        let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+        let ok = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle() as _,
+                FileDispositionInfo,
+                (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        drop(file);
+    }
+    #[cfg(not(windows))]
+    {
+        let file = open_conversion_source(root, relative)?;
+        if source_identity(&file)? != expected {
+            return Err(invalid("源 TS 已发生变化，未删除"));
+        }
+        std::fs::remove_file(target)?;
+    }
+    Ok(())
+}
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SourceIdentity {
+    pub volume: u64,
+    pub index: u64,
+    pub size: u64,
+    pub modified: u64,
+}
+pub fn source_identity(file: &std::fs::File) -> io::Result<SourceIdentity> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        };
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(SourceIdentity {
+            volume: info.dwVolumeSerialNumber as u64,
+            index: ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
+            size: ((info.nFileSizeHigh as u64) << 32) | info.nFileSizeLow as u64,
+            modified: ((info.ftLastWriteTime.dwHighDateTime as u64) << 32)
+                | info.ftLastWriteTime.dwLowDateTime as u64,
+        })
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let info = file.metadata()?;
+        Ok(SourceIdentity {
+            volume: info.dev(),
+            index: info.ino(),
+            size: info.len(),
+            modified: info.mtime_nsec() as u64 ^ info.mtime() as u64,
+        })
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = file;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "当前平台不支持安全源文件清理",
+        ))
     }
 }

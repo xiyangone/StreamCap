@@ -22,6 +22,8 @@ try {
         assert.equal(layout.contentOverflow, false, '主内容不能横向溢出');
         assert.deepEqual(layout.overflow, [], '组件不能溢出窗口');
         assert.equal(layout.dialogs, 0, '闭合弹窗不能覆盖页面');
+        assert.equal(await page.evaluate(async()=> (await import('/media-player.js')).activePlayerCount()),0,'未打开预览时不得持有播放器');
+        if(path==='/settings') assert.equal(await page.getByRole('switch',{name:'录制结束转 MP4'}).count(),1,'转换开关必须真实可见');
         assert.equal(await page.evaluate(()=>typeof window.__TAURI__),'undefined','不公开整套 Tauri 全局 API');
         const shell=await page.locator('.app-shell').boundingBox();assert.equal(shell.x,0);assert.equal(shell.y,0);
         assert.equal(await page.locator('.device-avatar').count(),0);

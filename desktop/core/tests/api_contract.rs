@@ -693,9 +693,8 @@ async fn native_settings_reject_unsupported_features_and_formats() {
     let (base, _guard) = start_backend().await;
     let client = reqwest::Client::new();
     for patch in [
-        json!({"convert_to_mp4":true}),
-        json!({"delete_original":true}),
-        json!({"video_format":"WAV"}),
+        json!({"delete_original":"yes"}),
+        json!({"video_format":"INVALID"}),
     ] {
         let response = client
             .put(format!("{base}/api/settings"))
@@ -757,4 +756,16 @@ async fn interval_updates_are_committed_and_invalid_changes_do_not_publish() {
     assert_eq!(result.status(), 400);
     let settings = get_json(&format!("{base}/api/settings")).await;
     assert_eq!(settings["userConfig"]["loop_time_seconds"], "4500");
+}
+
+#[tokio::test]
+async fn media_conversion_and_explicit_cleanup_settings_are_valid() {
+    assert!(streamcap_core::config::validate_settings(
+        json!({"convert_to_mp4":true}).as_object().unwrap()
+    )
+    .is_ok());
+    assert!(streamcap_core::config::validate_settings(
+        json!({"delete_original":true}).as_object().unwrap()
+    )
+    .is_ok());
 }

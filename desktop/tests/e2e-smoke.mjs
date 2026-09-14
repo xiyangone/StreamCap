@@ -145,6 +145,16 @@ try {
     await waitState(() => state.userConfig.loop_time_seconds, (v) => v === '120', '重试保存');
     await hidden(page.locator('.settings-savebar'));
   });
+  await step('录制结束转 MP4 开关按显式选择保存，不改变 TS 与检测间隔', async () => {
+    await page.getByRole('button',{name:'录制与存储',exact:true}).click();
+    const interval=state.userConfig.loop_time_seconds,format=state.userConfig.video_format;
+    const toggle=page.getByRole('switch',{name:'录制结束转 MP4',exact:true});await toggle.check();
+    await page.locator('.settings-savebar').getByRole('button',{name:'保存修改'}).click();
+    await waitState(()=>state.userConfig.convert_to_mp4,v=>v===true,'启用转换设置');await hidden(page.locator('.settings-savebar'));
+    assert.equal(state.userConfig.loop_time_seconds,interval);assert.equal(state.userConfig.video_format,format);
+    await toggle.uncheck();await page.locator('.settings-savebar').getByRole('button',{name:'保存修改'}).click();
+    await waitState(()=>state.userConfig.convert_to_mp4,v=>v===false,'关闭转换设置');await hidden(page.locator('.settings-savebar'));
+  });
   await step('系统主题随系统实时变化，强调色与持久化', async () => {
     await page.getByRole('button', { name: '外观与窗口', exact: true }).click();
     await page.getByRole('button', { name: '跟随系统', exact: true }).click();
@@ -198,7 +208,7 @@ try {
     assert.deepEqual(requests('PUT', '/api/cookies').at(-1).body.cookies, { douyin: 'fixture-edited-not-a-credential' });
     assert.equal(state.cookies.bilibili, untouched);
     await page.getByRole('textbox', { name: '搜索平台' }).fill('快手');
-    await page.locator('.cookie-platform-list').getByRole('button', { name: '快手', exact: true }).click();
+    await page.locator('.cookie-platform-list').getByRole('button', { name: '快手直播', exact: true }).click();
     await page.getByRole('button', { name: '扫码登录' }).click();
     const modal = dialog('快手扫码登录');
     await visible(modal.getByText('二维码有效期：120 秒', { exact: true }));
@@ -233,10 +243,19 @@ try {
     await visible(page.locator('.account-status'));
     await h.shot('qr-account-saved');
   });
-  await step('未实现能力明确禁用，不显示假开关', async () => {
+  await step('转换、清理与时间字幕为真实可保存开关，自动化不再显示占位卡片', async () => {
+    await page.getByRole('button', {name:'录制与存储',exact:true}).click();
+    await page.getByRole('switch',{name:'录制结束转 MP4',exact:true}).check();
+    await page.getByRole('switch',{name:'转换成功后清理源 TS',exact:true}).check();
+    await page.getByRole('switch',{name:'生成时间字幕',exact:true}).check();
+    await page.locator('.settings-savebar').getByRole('button',{name:'保存修改',exact:true}).click();
+    await waitState(()=>state.userConfig.delete_original,Boolean,'清理设置保存');assert.equal(state.userConfig.generate_time_subtitle_file,true);
     await page.getByRole('button', { name: '自动化与通知', exact: true }).click();
-    assert.equal(await page.locator('.unavailable-row').count(), 4);
-    assert.equal(await page.locator('.unavailable-row input').count(), 0);
+    assert.equal(await page.locator('.unavailable-row').count(),0);
+    await visible(page.getByRole('switch',{name:'定时关机',exact:true}));
+    await visible(page.getByRole('switch',{name:'录制后执行脚本',exact:true}));
+    await visible(page.getByRole('switch',{name:'系统通知',exact:true}));
+    await h.shot('automation-and-notifications');
   });
   await step('监控、录制、停止与失败反馈', async () => {
     await navigate('录制任务');
@@ -306,14 +325,18 @@ try {
     await waitState(() => requests('DELETE', '/api/recordings/fixture-7').length, (n) => n === before + 1, '仅删除选定任务');
     assert.ok(record('fixture-8'));
   });
-  await step('录制预览对不支持容器清晰降级', async () => {
-    await card('fixture-1').getByRole('button', { name: '预览录制文件' }).click();
-    const modal = dialog('录制预览');
-    await visible(modal.getByText('此格式需要本地播放器', { exact: true }));
-    await visible(modal.getByRole('listitem'));
-    await h.shot('09-recording-preview');
-    await modal.getByRole('button', { name: '关闭预览' }).click(); await hidden(modal);
-    assert.equal(await page.locator('video,audio').count(), 0);
+  await step('TS 录后与录中预览实际播放，关闭后释放播放器', async () => {
+    for(const live of [false,true]) {
+      state.previewLive=live;
+      await card('fixture-1').getByRole('button',{name:'预览录制文件'}).click();const modal=dialog('录制预览');
+      await visible(modal.getByLabel('录制视频预览'));
+      await page.waitForFunction(()=>{const video=document.querySelector('video');return video&&video.videoWidth===160&&video.currentTime>0.5;},null,{timeout:15000});
+      await h.shot(live?'preview-ts-growing':'preview-ts-completed');
+      await modal.getByRole('button',{name:'关闭预览'}).click();await hidden(modal);
+      await waitState(()=>page.evaluate(async()=> (await import('/media-player.js')).activePlayerCount()),count=>count===0,'播放器实例全部释放');
+      await waitState(()=>state.activePreviews,n=>n===0,'关闭预览释放增量连接');
+    }
+    state.previewLive=false;
   });
   await step('媒体库筛选、目录导航与真正的内嵌音频加载', async () => {
     await navigate('媒体库');
@@ -341,6 +364,15 @@ try {
     await page.getByRole('button', { name: '回收录制说明.txt', exact: true }).click();
     await modal.getByRole('button', { name: '移至回收站' }).click(); await hidden(modal);
     await waitState(() => state.files.some((f) => f.name === '录制说明.txt'), (v) => !v, '模拟文件删除');
+  });
+  await step('媒体库转 MP4 显示状态并保留原 TS，拒绝同名覆盖', async () => {
+    await page.getByRole('button',{name:'返回媒体库根目录'}).click();
+    await page.getByRole('button',{name:'转为MP4：海边日落.ts',exact:true}).click();
+    await waitState(()=>state.mediaJobs.at(-1)?.state,s=>s==='complete','转换任务状态完成');
+    await visible(page.getByRole('button',{name:/^海边日落.mp4/}));
+    assert.ok(state.files.some(f=>f.path==='海边日落.ts'));
+    await page.getByRole('button',{name:'转为MP4：海边日落.ts',exact:true}).click();
+    await visible(page.getByText('同名 MP4 已存在，未覆盖',{exact:true}));
   });
   await step('异步预览期间切页，不访问已销毁信号', async () => {
     await navigate('录制任务');
@@ -375,6 +407,49 @@ try {
     assert.equal(await page.locator('.skeleton-grid').count(), 0);
     await hidden(page.locator('.connection-banner'));
     await waitState(() => page.locator('.recording-card').count(), (n) => n === Math.min(state.recordings.length, 6), '列表失败自动重试后恢复');
+  });
+  await step('安装与关机都有准确确认文案，取消不产生副作用',async()=>{
+    await navigate('偏好设置');
+    const before=requests('POST','/api/tools/install').length;
+    await page.getByRole('button',{name:'安装 FFmpeg',exact:true}).click();const install=dialog('安装录制工具');await visible(install);
+    await visible(install.getByRole('button',{name:'确认安装',exact:true}));assert.equal(await install.getByRole('button',{name:'确认删除',exact:true}).count(),0);
+    await install.getByRole('button',{name:'取消',exact:true}).click();assert.equal(requests('POST','/api/tools/install').length,before);
+    await page.getByRole('button',{name:'选择文件夹',exact:true}).click();await visible(page.locator('.settings-savebar'));assert.ok(state.native.calls.some(call=>call.command==='desktop_window_action'&&call.args.action==='pick-directory'));await page.getByRole('button',{name:'放弃修改',exact:true}).click();
+    await page.getByRole('button',{name:'自动化与通知',exact:true}).click();await page.getByRole('spinbutton',{name:'关机倒计时（小时）',exact:true}).fill('2');await page.getByRole('button',{name:'启动倒计时',exact:true}).click();const timer=dialog('启动关机倒计时');await visible(timer);await timer.getByRole('button',{name:'启动倒计时',exact:true}).click();await waitState(()=>state.quickShutdown,value=>value===2,'只设置模拟倒计时');
+    await h.triggerShutdown(60);await visible(page.locator('.shutdown-banner'));await page.getByRole('button',{name:'取消关机',exact:true}).click();await hidden(page.locator('.shutdown-banner'));assert.equal(state.native.systemShutdown,false);assert.equal(state.quickShutdown,null);
+    await h.shot('native-shutdown-cancelled');
+  });
+  await step('真实视频画面截图、直播源预览与关闭清理',async()=>{
+    await navigate('录制任务');await card('fixture-1').getByRole('button',{name:'预览录制文件'}).click();const modal=dialog('录制预览');await visible(modal);
+    await page.waitForFunction(()=>document.querySelector('video')?.readyState>=2&&document.querySelector('video').videoWidth>0);
+    const capture=modal.getByRole('button',{name:'保存截图',exact:true});
+    const initialTheme=await page.locator('html').getAttribute('data-theme');
+    try {
+      for(const theme of ['light','dark']){
+        await page.locator('html').evaluate((el,value)=>{el.dataset.theme=value;},theme);
+        await waitState(()=>capture.evaluate(el=>({text:getComputedStyle(el).color,expected:getComputedStyle(document.body).color})),colors=>colors.text===colors.expected,'截图按钮在 '+theme+' 主题中使用可读文字颜色');
+      }
+    } finally {await page.locator('html').evaluate((el,value)=>{if(value===null)delete el.dataset.theme;else el.dataset.theme=value;},initialTheme);}
+    await capture.click();await waitState(()=>requests('POST','/api/media/screenshot').length,count=>count>=1,'截图已通过模拟 API');
+    await modal.getByRole('button',{name:'预览直播源',exact:true}).click();await waitState(()=>requests('GET','/api/recordings/fixture-1/preview').length,count=>count>=1,'直播源独立预览');
+    await page.keyboard.press('Escape');await hidden(modal);await waitState(()=>state.activePreviews,count=>count===0,'直播预览连接关闭');
+  });
+  await step('源 TS 清理后，已打开的媒体预览自动切换到可播放 MP4',async()=>{
+    await navigate('媒体库');await page.getByRole('button',{name:'返回媒体库根目录'}).click();await page.getByRole('button',{name:/^海边日落.ts/}).click();const modal=dialog('媒体预览');await visible(modal);await page.waitForFunction(()=>document.querySelector('video')?.readyState>=2);
+    const source='海边日落.ts',output='海边日落.mp4';state.files=state.files.filter(file=>file.path!==source);
+    const job={id:'cleanup-live-fixture',taskId:null,source,output,state:'complete',deleteOriginal:true,sourceRemoved:true,message:'MP4 已生成并校验，源 TS 已清理'};state.mediaJobs.push(job);h.emit('mediaJob',job);
+    await page.waitForFunction(()=>document.querySelector('.media-preview')?.dataset.path==='海边日落.mp4'&&document.querySelector('video')?.readyState>=2);await h.shot('preview-after-cleanup');
+    await modal.getByRole('button',{name:'关闭预览'}).click();await hidden(modal);
+  });
+  await step('语言切换、快捷键、上次页面恢复和手动更新检查',async()=>{
+    const checks=state.requests.filter(request=>/\/(check|start)$/.test(request.path)).length;
+    await navigate('偏好设置');await page.getByRole('button',{name:'外观与窗口',exact:true}).click();await page.getByRole('combobox',{name:'界面语言',exact:true}).selectOption('en');
+    await waitState(()=>page.locator('html').getAttribute('lang'),value=>value==='en','英文界面');await visible(page.getByRole('heading',{name:'Preferences',exact:true}));
+    await page.keyboard.press('Control+3');await visible(page.getByRole('heading',{name:'Media library',exact:true}));await page.goto(h.base+'/');await visible(page.getByRole('heading',{name:'Media library',exact:true}));
+    await page.keyboard.press('Control+2');await visible(card('fixture-2').getByRole('button',{name:record('fixture-2').streamerName,exact:true}));await h.shot('english-recordings');
+    await page.keyboard.press('Control+5');await page.getByRole('button',{name:'Check for updates',exact:true}).click();await visible(page.getByRole('link',{name:'v0.1.1-fixture',exact:true}));assert.equal(requests('GET','/api/tools/update').length,1);
+    await page.keyboard.press('Control+,');await page.getByRole('button',{name:'Appearance and window',exact:true}).click();await page.getByRole('combobox',{name:'Interface language',exact:true}).selectOption('zh_CN');await waitState(()=>page.locator('html').getAttribute('lang'),value=>value==='zh-CN','恢复中文');
+    assert.equal(state.requests.filter(request=>/\/(check|start)$/.test(request.path)).length,checks,'切页和重载不触发额外平台检查');
   });
   await step('明确退出而非托盘时显示收尾状态',async()=>{
     await page.getByRole('button',{name:'关闭窗口',exact:true}).click();const close=dialog('关闭 StreamCap');await visible(close);

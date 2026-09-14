@@ -35,6 +35,8 @@ pub struct ApiState {
     pub workspace: Workspace,
     pub recording_enabled: Arc<AtomicBool>,
     pub storage: crate::storage::Storage,
+    pub preview: crate::preview::Preview,
+    pub tools: crate::tools::Tools,
 }
 
 pub fn router(state: ApiState) -> Router {
@@ -55,10 +57,25 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/recordings/{rec_id}/start", post(start_recording))
         .route("/api/recordings/{rec_id}/stop", post(stop_recording))
         .route("/api/recordings/{rec_id}/files", get(list_recording_files))
+        .route("/api/recordings/{rec_id}/preview", get(live_preview))
         .route("/api/settings", get(get_settings).put(update_settings))
         .route("/api/cookies", get(get_cookies).put(update_cookies))
         .route("/api/storage", get(list_storage).delete(delete_storage))
         .route("/api/videos", get(stream_video))
+        .route("/api/media/info", get(media_info))
+        .route("/api/media/preview", get(media_preview))
+        .route("/api/media/jobs", get(media_jobs))
+        .route("/api/media/transcode", get(media_transcode))
+        .route(
+            "/api/media/screenshot",
+            post(save_screenshot).layer(axum::extract::DefaultBodyLimit::max(12 * 1024 * 1024)),
+        )
+        .route("/api/tools/status", get(tools_status))
+        .route("/api/tools/install", post(install_tools))
+        .route("/api/tools/update", get(check_update))
+        .route("/api/accounts", get(account_summaries).put(save_account))
+        .route("/api/automation/shutdown", post(schedule_shutdown))
+        .route("/api/media/remux", post(remux_media))
         .route("/api/qr/kuaishou/start", post(qr_start))
         .route("/api/qr/kuaishou/status", get(qr_status))
         .route("/api/qr/kuaishou/cancel", post(qr_cancel))
@@ -131,6 +148,25 @@ impl ApiError {
 // 状态与录制任务
 // ---------------------------------------------------------------------------
 
+async fn live_preview(
+    State(state): State<ApiState>,
+    AxumPath(rec_id): AxumPath<String>,
+) -> Result<Response, ApiError> {
+    let input = state
+        .scheduler
+        .preview_input(&rec_id)
+        .await
+        .map_err(ApiError::bad_request)?;
+    let ffmpeg = crate::paths::find_ffmpeg(&state.workspace)
+        .ok_or_else(|| ApiError::bad_request("直播预览需要 FFmpeg"))?;
+    state
+        .preview
+        .live(ffmpeg, input)
+        .await
+        .map(IntoResponse::into_response)
+        .map_err(ApiError::storage)
+}
+
 async fn status(State(state): State<ApiState>) -> Json<Value> {
     let (total, active) = state.store.count().await;
     Json(json!({
@@ -140,6 +176,8 @@ async fn status(State(state): State<ApiState>) -> Json<Value> {
         "totalRecordings": total,
         "resolverReady": state.resolver.healthy().await,
         "resolverMode": "native",
+        "pendingMediaJobs": state.scheduler.postprocess.pending(),
+        "postprocessReady": state.scheduler.postprocess.ready(),
         "supportedPlatforms": Resolver::supported_platforms(),
     }))
 }
@@ -332,6 +370,30 @@ async fn stop_recording(
 }
 
 /// 列出某个任务已产出的录制文件，供卡片「预览」使用。
+fn is_media_name(name: &str) -> bool {
+    std::path::Path::new(name)
+        .extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "ts" | "mp4"
+                    | "m4v"
+                    | "flv"
+                    | "mkv"
+                    | "mov"
+                    | "webm"
+                    | "nut"
+                    | "mp3"
+                    | "m4a"
+                    | "aac"
+                    | "wav"
+                    | "wma"
+                    | "ogg"
+                    | "ogv"
+            )
+        })
+}
 async fn list_recording_files(
     State(state): State<ApiState>,
     AxumPath(rec_id): AxumPath<String>,
@@ -357,7 +419,7 @@ async fn list_recording_files(
             if ancestor.canonicalize()?==root_real{break}
         }
         let listing=crate::storage::list(&root,&relative,&stop)?;
-        Ok(listing.items.into_iter().filter(|item|!item.is_dir).map(|item|json!({"name":item.name,"size":item.size,"path":item.path,"modified":item.modified.unwrap_or(0.0)})).collect::<Vec<_>>())
+        Ok(listing.items.into_iter().filter(|item|!item.is_dir && is_media_name(&item.name)).map(|item|json!({"name":item.name,"size":item.size,"path":item.path,"modified":item.modified.unwrap_or(0.0)})).collect::<Vec<_>>())
     }).await.map_err(ApiError::storage)?;
     files.sort_by(|a, b| {
         b["modified"]
@@ -376,6 +438,12 @@ const EDIT_FIELDS: &[&str] = &[
     "segmentRecord",
     "segmentTime",
     "videoBitrate",
+    "scheduledRecording",
+    "scheduledStartTime",
+    "monitorHours",
+    "enabledMessagePush",
+    "onlyNotifyNoRecord",
+    "flvUseDirectDownload",
 ];
 const BATCH_FIELDS: &[&str] = &[
     "quality",
@@ -383,6 +451,12 @@ const BATCH_FIELDS: &[&str] = &[
     "segmentRecord",
     "segmentTime",
     "videoBitrate",
+    "scheduledRecording",
+    "scheduledStartTime",
+    "monitorHours",
+    "enabledMessagePush",
+    "onlyNotifyNoRecord",
+    "flvUseDirectDownload",
 ];
 
 fn validate_url(value: &str) -> Result<(), ApiError> {
@@ -431,6 +505,17 @@ fn validate_changes(
                     .contains(&value.as_str().unwrap_or("")) =>
             {
                 return Err(ApiError::bad_request("不支持的录制格式"))
+            }
+            "scheduledRecording"
+            | "enabledMessagePush"
+            | "onlyNotifyNoRecord"
+            | "flvUseDirectDownload"
+                if !value.is_boolean() =>
+            {
+                return Err(ApiError::bad_request("开关必须为布尔值"));
+            }
+            "scheduledStartTime" | "monitorHours" if !value.is_string() => {
+                return Err(ApiError::bad_request("定时字段必须是文本"));
             }
             "segmentRecord" if !value.is_boolean() => {
                 return Err(ApiError::bad_request("分段录制必须是布尔值"))
@@ -532,9 +617,10 @@ fn apply_changes(rec: &mut Recording, changes: &Map<String, Value>, allowed: &[&
             "segmentRecord" => rec.segment_record = value.as_bool(),
             "monitorStatus" => rec.monitor_status = value.as_bool().unwrap_or(rec.monitor_status),
             "scheduledRecording" => rec.scheduled_recording = value.as_bool(),
+            "enabledMessagePush" => rec.enabled_message_push = value.as_bool(),
             "onlyNotifyNoRecord" => rec.only_notify_no_record = value.as_bool(),
             "flvUseDirectDownload" => rec.flv_use_direct_download = value.as_bool(),
-            "monitorHours" => rec.monitor_hours = value.as_i64().map(|v| v as i32),
+            "monitorHours" => rec.monitor_hours = value.as_str().map(str::to_owned),
             "videoBitrate" => rec.video_bitrate = value.as_i64(),
             _ => {}
         }
@@ -652,7 +738,7 @@ async fn update_settings(
 async fn get_cookies(State(state): State<ApiState>) -> ApiResult {
     let config = state.config.read().await;
     let cookies = config
-        .load_cookies()
+        .cookie_view()
         .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(Json(json!({ "cookies": cookies })))
 }
@@ -671,7 +757,7 @@ async fn update_cookies(
         let mut config = state.config.write().await;
         config
             .update_cookies(payload.cookies)
-            .map_err(|e| ApiError::internal(format!("写入 Cookie 失败: {e}")))?
+            .map_err(ApiError::storage)?
     };
     state.store.snack("Cookie 已保存");
     Ok(Json(json!({ "ok": true, "changed": changed })))
@@ -738,6 +824,232 @@ async fn delete_storage(
     Ok(Json(
         json!({"ok":true,"recycled":receipt.recycled,"recycledTo":receipt.recycled_to}),
     ))
+}
+
+async fn media_info(State(state): State<ApiState>, Query(query): Query<PathQuery>) -> ApiResult {
+    let root = state.config.read().await.recordings_root();
+    let info = state
+        .preview
+        .info(&state.storage, root, query.path)
+        .await
+        .map_err(ApiError::storage)?;
+    Ok(Json(
+        serde_json::to_value(info).map_err(|_| ApiError::internal("预览信息序列化失败"))?,
+    ))
+}
+async fn media_preview(State(state): State<ApiState>, Query(query): Query<PathQuery>) -> Response {
+    let root = state.config.read().await.recordings_root();
+    match state.preview.stream(&state.storage, root, query.path).await {
+        Ok(response) => response,
+        Err(error) => ApiError::storage(error).into_response(),
+    }
+}
+async fn media_jobs(State(state): State<ApiState>) -> Json<Value> {
+    Json(
+        json!({"jobs":state.scheduler.postprocess.jobs(),"ready":state.scheduler.postprocess.ready(),"activePreviews":state.preview.active()}),
+    )
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemuxPayload {
+    path: String,
+    #[serde(default, rename = "deleteOriginal")]
+    delete_original: bool,
+}
+async fn remux_media(
+    State(state): State<ApiState>,
+    Json(payload): Json<RemuxPayload>,
+) -> ApiResult {
+    let root = state.config.read().await.recordings_root();
+    let job = state
+        .scheduler
+        .postprocess
+        .enqueue_manual(root, &payload.path, payload.delete_original)
+        .await
+        .map_err(ApiError::storage)?;
+    Ok(Json(json!({"job":job})))
+}
+
+async fn media_transcode(
+    State(state): State<ApiState>,
+    Query(query): Query<PathQuery>,
+) -> Response {
+    let config = state.config.read().await;
+    let root = config.recordings_root();
+    let ffmpeg = crate::paths::find_ffmpeg(config.workspace());
+    drop(config);
+    let Some(ffmpeg) = ffmpeg else {
+        return ApiError::bad_request("此格式预览需要 FFmpeg").into_response();
+    };
+    match state
+        .preview
+        .transcode(&state.storage, root, query.path, ffmpeg)
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => ApiError::storage(error).into_response(),
+    }
+}
+async fn tools_status(State(state): State<ApiState>) -> Json<Value> {
+    let config = state.config.read().await;
+    let path = crate::paths::find_ffmpeg(config.workspace());
+    Json(
+        json!({"installation":state.tools.status(),"ffmpegReady":path.is_some(),"ffprobeReady":path.as_ref().is_some_and(|p|crate::paths::adjacent_ffprobe(p).is_some())}),
+    )
+}
+async fn install_tools(State(state): State<ApiState>) -> ApiResult {
+    state.tools.install().map_err(ApiError::bad_request)?;
+    Ok(Json(json!({"ok":true})))
+}
+async fn check_update() -> ApiResult {
+    let release = crate::tools::check_update()
+        .await
+        .map_err(ApiError::bad_request)?;
+    Ok(Json(
+        json!({"release":release,"currentVersion":env!("CARGO_PKG_VERSION")}),
+    ))
+}
+async fn account_summaries(State(state): State<ApiState>) -> ApiResult {
+    let value = state
+        .config
+        .read()
+        .await
+        .account_summaries()
+        .map_err(ApiError::storage)?;
+    Ok(Json(value))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AccountPayload {
+    platform: String,
+    changes: Map<String, Value>,
+}
+async fn save_account(
+    State(state): State<ApiState>,
+    Json(payload): Json<AccountPayload>,
+) -> ApiResult {
+    state
+        .config
+        .write()
+        .await
+        .save_account(&payload.platform, &payload.changes)
+        .map_err(ApiError::storage)?;
+    Ok(Json(json!({"ok":true})))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShutdownPayload {
+    hours: Option<f64>,
+}
+async fn schedule_shutdown(
+    State(state): State<ApiState>,
+    Json(payload): Json<ShutdownPayload>,
+) -> ApiResult {
+    if let Some(hours) = payload.hours {
+        if !hours.is_finite() || hours <= 0.0 || hours > 168.0 {
+            return Err(ApiError::bad_request(
+                "关机倒计时应大于 0 且不超过 168 小时",
+            ));
+        }
+        state
+            .config
+            .write()
+            .await
+            .update_user_config(
+                json!({"quick_shutdown_hours":hours.to_string()})
+                    .as_object()
+                    .expect("object")
+                    .clone(),
+            )
+            .map_err(ApiError::storage)?;
+        state
+            .store
+            .emit("settings", json!({"changed":["quick_shutdown_hours"]}));
+    }
+    state
+        .scheduler
+        .automation
+        .quick_shutdown(payload.hours)
+        .map_err(ApiError::bad_request)?;
+    Ok(Json(json!({"ok":true})))
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ScreenshotPayload {
+    path: String,
+    png_base64: String,
+}
+fn validate_screenshot(bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() > 8 * 1024 * 1024 {
+        return Err("截图超过大小限制".into());
+    }
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    decoder.set_limits(png::Limits {
+        bytes: 32 * 1024 * 1024,
+    });
+    let mut reader = decoder.read_info().map_err(|_| "截图 PNG 无效")?;
+    let info = reader.info();
+    if info.width == 0
+        || info.height == 0
+        || info.width > 4096
+        || info.height > 4096
+        || u64::from(info.width) * u64::from(info.height) > 4 * 1024 * 1024
+    {
+        return Err("截图尺寸超过限制".into());
+    }
+    let size = reader
+        .output_buffer_size()
+        .filter(|size| *size <= 32 * 1024 * 1024)
+        .ok_or("截图解码尺寸无效")?;
+    let mut buffer = vec![0; size];
+    reader
+        .next_frame(&mut buffer)
+        .map_err(|_| "截图 PNG 解码失败")?;
+    Ok(())
+}
+async fn save_screenshot(
+    State(state): State<ApiState>,
+    Json(payload): Json<ScreenshotPayload>,
+) -> ApiResult {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&payload.png_base64)
+        .map_err(|_| ApiError::bad_request("截图编码无效"))?;
+    validate_screenshot(&bytes).map_err(ApiError::bad_request)?;
+    let root = state.config.read().await.recordings_root();
+    let saved = state
+        .storage
+        .blocking(move |stop| {
+            crate::storage::check_cancel(&stop)?;
+            let source = crate::storage::checked_target(&root, &payload.path, false)?;
+            let parent = source
+                .parent()
+                .ok_or_else(|| std::io::Error::other("截图目录无效"))?;
+            let directory = parent.join("screenshots");
+            if directory.exists() {
+                if crate::storage::is_link(&std::fs::symlink_metadata(&directory)?) {
+                    return Err(std::io::Error::other("截图目录不能是链接"));
+                }
+            } else {
+                std::fs::create_dir(&directory)?;
+            }
+            let output = directory.join(format!(
+                "截图_{}_{}.png",
+                chrono::Local::now().format("%Y%m%d-%H%M%S"),
+                uuid::Uuid::new_v4()
+            ));
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&output)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            Ok(output.to_string_lossy().to_string())
+        })
+        .await
+        .map_err(ApiError::storage)?;
+    Ok(Json(json!({"path":saved})))
 }
 async fn stream_video(
     State(state): State<ApiState>,
@@ -973,12 +1285,16 @@ pub async fn bootstrap_with_resolver(
         recording_enabled.clone(),
     ));
 
+    let tools = crate::tools::Tools::new(workspace.clone());
+    let preview = crate::preview::Preview::new(engine.clone(), resolver.cancellation());
     Ok(ApiState {
         store,
         engine,
         config,
         scheduler,
         storage: crate::storage::Storage::new(resolver.cancellation()),
+        preview,
+        tools,
         resolver,
         workspace,
         recording_enabled,
@@ -992,8 +1308,13 @@ pub async fn shutdown(state: &ApiState) -> std::io::Result<()> {
         .store(false, std::sync::atomic::Ordering::SeqCst);
     state.engine.begin_shutdown();
     state.resolver.begin_shutdown();
-    tokio::join!(state.resolver.shutdown(), state.engine.stop_all(10));
+    tokio::join!(
+        state.resolver.shutdown(),
+        state.scheduler.stop_all_for_shutdown()
+    );
     state.scheduler.finish_background().await;
+    state.preview.shutdown().await;
+    state.tools.shutdown().await;
     state.storage.shutdown().await;
     for rec in state.store.all().await {
         state

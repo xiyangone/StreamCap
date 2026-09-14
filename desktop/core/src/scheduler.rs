@@ -6,6 +6,7 @@ use crate::engine::{
     build_filename, build_output_dir, with_segment_suffix, Engine, FolderOptions, RecordOptions,
     RecorderProcess,
 };
+use crate::postprocess::RemuxOptions;
 use crate::resolver::{ResolveRequest, Resolver};
 use crate::store::Store;
 use std::path::PathBuf;
@@ -27,6 +28,8 @@ pub enum CheckOutcome {
     StreamEnded,
     /// 解析失败
     Failed(String),
+    OutsideSchedule,
+    NotifyOnly,
 }
 
 impl CheckOutcome {
@@ -37,11 +40,24 @@ impl CheckOutcome {
             CheckOutcome::Offline => "未开播".into(),
             CheckOutcome::StreamEnded => "直播已结束，录制停止".into(),
             CheckOutcome::Failed(err) => format!("检测失败: {err}"),
+            CheckOutcome::OutsideSchedule => "当前不在定时录制时间段".into(),
+            CheckOutcome::NotifyOnly => "直播中，仅通知不录制".into(),
         }
     }
 }
 
 pub struct Scheduler {
+    pacer: crate::pacing::Pacer,
+    checks: Arc<
+        std::sync::Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>,
+    >,
+    schedule_edges: std::sync::Mutex<std::collections::HashMap<String, bool>>,
+    live_sources: tokio::sync::RwLock<
+        std::collections::HashMap<
+            String,
+            (String, std::time::Instant, crate::resolver::StreamInfo),
+        >,
+    >,
     store: Store,
     engine: Engine,
     config: Arc<RwLock<ConfigStore>>,
@@ -53,8 +69,82 @@ pub struct Scheduler {
     starting: Arc<tokio::sync::Mutex<()>>,
     interval_changed: tokio::sync::watch::Sender<u64>,
     storage: crate::storage::Storage,
+    pub postprocess: crate::postprocess::Postprocessor,
+    pub notifications: crate::notifications::Notifications,
+    pub automation: crate::automation::Automation,
+    conversion_plans: Arc<tokio::sync::Mutex<std::collections::HashMap<uuid::Uuid, FinishPlan>>>,
 }
 
+struct CheckLease {
+    id: String,
+    checks: Arc<
+        std::sync::Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>,
+    >,
+}
+impl Drop for CheckLease {
+    fn drop(&mut self) {
+        self.checks.lock().expect("active checks").remove(&self.id);
+    }
+}
+
+struct FinishPlan {
+    root: PathBuf,
+    convert: bool,
+    options: RemuxOptions,
+    script: Option<crate::automation::ScriptSpec>,
+    subtitles: Option<PathBuf>,
+}
+impl FinishPlan {
+    async fn dispatch(
+        mut self,
+        process: &Arc<RecorderProcess>,
+        postprocess: &crate::postprocess::Postprocessor,
+        automation: &crate::automation::Automation,
+        store: &Store,
+    ) {
+        if let Some(ffprobe) = &self.subtitles {
+            if let Err(error) = crate::subtitles::generate(
+                &self.root,
+                &process.output_path,
+                process.wall_started_at,
+                ffprobe,
+            )
+            .await
+            {
+                self.options.delete_original = false;
+                store.snack(format!("时间字幕未生成：{error}；本次源文件保留"));
+            }
+        }
+        if self.convert {
+            if let Err(error) = postprocess
+                .enqueue_recording_locked(
+                    &self.root,
+                    &process.output_path,
+                    &process.rec_id,
+                    self.options,
+                )
+                .await
+            {
+                store.snack(format!("自动转 MP4 未开始：{error}；原 TS 保留"));
+            }
+        }
+        if let Some(script) = self.script {
+            let room = store
+                .get(&process.rec_id)
+                .await
+                .map(|r| r.streamer_name)
+                .unwrap_or_default();
+            automation.after_recording(
+                script,
+                self.root,
+                process.output_path.clone(),
+                room,
+                process.rec_id.clone(),
+                postprocess.clone(),
+            );
+        }
+    }
+}
 impl Scheduler {
     pub fn new(
         store: Store,
@@ -65,7 +155,21 @@ impl Scheduler {
         recording_enabled: Arc<AtomicBool>,
     ) -> Self {
         let stopping = resolver.cancellation();
+        let postprocess = crate::postprocess::Postprocessor::new(
+            engine.clone(),
+            store.clone(),
+            ffmpeg.clone(),
+            config.clone(),
+        );
+        let notifications = crate::notifications::Notifications::new(config.clone(), store.clone());
+        let automation = crate::automation::Automation::new(config.clone(), store.clone());
         Self {
+            notifications,
+            automation,
+            pacer: crate::pacing::Pacer::default(),
+            checks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            schedule_edges: std::sync::Mutex::new(std::collections::HashMap::new()),
+            live_sources: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             store,
             engine,
             config,
@@ -75,6 +179,8 @@ impl Scheduler {
             storage: crate::storage::Storage::new(stopping.clone()),
             interval_changed: tokio::sync::watch::channel(0).0,
             stopping,
+            postprocess,
+            conversion_plans: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             background: tokio_util::task::TaskTracker::new(),
             starting: Arc::new(tokio::sync::Mutex::new(())),
         }
@@ -101,27 +207,38 @@ impl Scheduler {
             if !self.recording_enabled.load(Ordering::Relaxed) {
                 continue;
             }
-            for rec in self.store.all().await {
-                if self.stopping.is_cancelled() {
-                    return;
+            use futures::StreamExt;
+            let records = self.store.all().await;
+            let spacing = self
+                .config
+                .read()
+                .await
+                .get_i64("platform_request_interval", 3)
+                .clamp(0, 300) as u64;
+            futures::stream::iter(records.into_iter().filter(|r|r.monitor_status).enumerate()).for_each_concurrent(16,|(index,rec)|{
+                let scheduler=self.clone();async move{
+                    let delay=Duration::from_millis((index as u64*spacing*1000).min(interval*250));
+                    tokio::select!{biased;_=scheduler.stopping.cancelled()=>return,_=tokio::time::sleep(delay)=>{}}
+                    if let Err(error)=scheduler.check(rec.rec_id).await{log::debug!("检测失败: {error}");}
                 }
-                if !rec.monitor_status {
-                    continue;
-                }
-                if let Err(error) = self.check(rec.rec_id.clone()).await {
-                    log::debug!("检测 {} 失败: {error}", rec.streamer_name);
-                }
-            }
+            }).await;
         }
     }
 
     /// Detection and manual recording share metadata updates and name persistence.
     pub async fn check(&self, rec_id: String) -> Result<CheckOutcome, String> {
+        let _operation = self.begin_check(&rec_id)?;
         if self.stopping.is_cancelled() {
             return Err("应用正在退出".into());
         }
         if self.store.get(&rec_id).await.is_none() {
             return Err(format!("任务不存在: {rec_id}"));
+        }
+        if let Some(rec) = self.store.get(&rec_id).await {
+            if !crate::schedule::active(&rec)? {
+                self.stop_recording(&rec_id).await;
+                return Ok(CheckOutcome::OutsideSchedule);
+            }
         }
         let info = match self.resolve_for(&rec_id).await {
             Ok(info) => info,
@@ -140,11 +257,36 @@ impl Scheduler {
         if self.stopping.is_cancelled() {
             return Err("应用正在退出".into());
         }
+        if self
+            .checks
+            .lock()
+            .expect("active checks")
+            .get(&rec_id)
+            .is_some_and(|token| token.is_cancelled())
+        {
+            return Err("检测已取消".into());
+        }
+        let previous = self.store.get(&rec_id).await.map(|r| r.is_live);
         self.store
             .apply_stream_info(&rec_id, info)
             .await
             .map_err(|error| format!("保存主播名称失败，任务未改动: {error}"))?
             .ok_or_else(|| format!("任务不存在: {rec_id}"))?;
+        if let Some(rec) = self.store.get(&rec_id).await {
+            if info.is_live {
+                self.live_sources.write().await.insert(
+                    rec_id.clone(),
+                    (rec.url, std::time::Instant::now(), info.clone()),
+                );
+            } else {
+                self.live_sources.write().await.remove(&rec_id);
+            }
+        }
+        if previous.is_some_and(|old| old != info.is_live) {
+            if let Some(record) = self.store.get(&rec_id).await {
+                self.notifications.changed(&record, info.is_live).await;
+            }
+        }
         if !info.is_live {
             let was_recording = self.stop_recording_locked(&rec_id).await;
             return if manual {
@@ -159,6 +301,15 @@ impl Scheduler {
         }
         if self.engine.is_recording(&rec_id).await {
             return Ok(CheckOutcome::AlreadyRecording);
+        }
+        if !manual
+            && self
+                .store
+                .get(&rec_id)
+                .await
+                .is_some_and(|r| r.only_notify_no_record == Some(true))
+        {
+            return Ok(CheckOutcome::NotifyOnly);
         }
         self.start_recording_locked(rec_id, info).await?;
         Ok(CheckOutcome::RecordingStarted)
@@ -208,8 +359,14 @@ impl Scheduler {
         if self.stopping.is_cancelled() || !self.recording_enabled.load(Ordering::SeqCst) {
             return Err("已暂停录制或正在退出".into());
         }
-        let Some(ffmpeg) = self.ffmpeg.clone() else {
-            return Err("未找到 ffmpeg，请先安装或放入用户数据目录".into());
+        let ffmpeg = {
+            let config = self.config.read().await;
+            let bundled = config.workspace().user_data_dir.join("ffmpeg/ffmpeg.exe");
+            if bundled.is_file() {
+                Some(bundled)
+            } else {
+                self.ffmpeg.clone()
+            }
         };
 
         let Some(rec) = self.store.get(&rec_id).await else {
@@ -233,10 +390,29 @@ impl Scheduler {
             )
         };
 
-        let Some(record_url) = info.pick_record_url(prefer_flv) else {
+        let source_preference = self
+            .config
+            .read()
+            .await
+            .get_str("default_live_source", "FLV");
+        let selected = if source_preference == "HLS" && !info.m3u8_url.is_empty() {
+            Some(info.m3u8_url.clone())
+        } else {
+            info.pick_record_url(prefer_flv)
+        };
+        let Some(mut record_url) = selected else {
             return Err("解析结果中没有可用的录制地址".into());
         };
 
+        if self
+            .config
+            .read()
+            .await
+            .get_bool("force_https_recording", false)
+            && record_url.starts_with("http://")
+        {
+            record_url = record_url.replacen("http://", "https://", 1);
+        }
         let format = rec.record_format.clone().unwrap_or(config_snapshot);
         let anchor = if rec.streamer_name.is_empty() {
             info.anchor_name.clone()
@@ -257,17 +433,43 @@ impl Scheduler {
         };
 
         let now = chrono::Local::now();
-        let filename = build_filename(
+        let mut filename = build_filename(
             &anchor,
             title_for_filename,
             &now.format("%Y-%m-%d_%H-%M-%S").to_string(),
         );
 
-        let root = {
+        {
             let config = self.config.read().await;
-            config.recordings_root()
+            let template = config.get_str("custom_filename_template", "");
+            if !template.is_empty() {
+                filename = crate::engine::sanitize(
+                    &template
+                        .replace("{anchor_name}", &anchor)
+                        .replace("{title}", title_for_filename.unwrap_or(""))
+                        .replace("{time}", &now.format("%Y-%m-%d_%H-%M-%S").to_string())
+                        .replace("{platform}", &info.platform),
+                );
+            }
+            if config.get_bool("remove_emojis", false) {
+                filename = crate::engine::without_emojis(&filename);
+            }
+            if segment_record {
+                filename = format!("{filename}_{}", uuid::Uuid::new_v4());
+            }
+        }
+        let (root, convert_to_mp4, remux_options) = {
+            let config = self.config.read().await;
+            (
+                config.recordings_root(),
+                config.get_bool("convert_to_mp4", false) && format.eq_ignore_ascii_case("TS"),
+                RemuxOptions::from_config(&config),
+            )
         };
-        let output_dir = build_output_dir(
+        crate::media_safety::require_space(&root, remux_options.minimum_free_bytes, 0)
+            .map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+        let mut output_dir = build_output_dir(
             &root,
             &info.platform,
             &anchor,
@@ -275,6 +477,16 @@ impl Scheduler {
             &folder_opts,
         );
 
+        if self
+            .config
+            .read()
+            .await
+            .get_bool("folder_name_title", false)
+            && !info.title.is_empty()
+        {
+            output_dir.push(crate::engine::sanitize(&info.title));
+        }
+        std::fs::create_dir_all(&output_dir).map_err(|e| e.to_string())?;
         let base_path = output_dir
             .join(filename)
             .to_string_lossy()
@@ -285,14 +497,26 @@ impl Scheduler {
             format!("{base_path}.{}", format.to_ascii_lowercase())
         };
 
+        let root_real = root.canonicalize().map_err(|e| e.to_string())?;
+        let output_real = output_dir.canonicalize().map_err(|e| e.to_string())?;
+        let relative_parent = output_real
+            .strip_prefix(&root_real)
+            .map_err(|_| "录制目录越界")?;
+        let candidate = std::path::Path::new(&save_path)
+            .file_name()
+            .ok_or("录像文件名无效")?;
+        let save_path = crate::media_safety::unique_output(&root, &relative_parent.join(candidate))
+            .map_err(|e| e.to_string())?
+            .to_string_lossy()
+            .to_string();
         let options = RecordOptions {
             record_url,
             save_path,
             format: format.clone(),
             segment_record,
             segment_time: rec.segment_time.clone(),
-            headers: None,
-            proxy: None,
+            headers: recording_headers(rec.platform_key.as_deref()),
+            proxy: recording_proxy(&*self.config.read().await, rec.platform_key.as_deref())?,
             platform_key: rec.platform_key.clone(),
             video_bitrate: rec.video_bitrate,
             is_overseas: is_overseas_platform(rec.platform_key.as_deref()),
@@ -300,12 +524,58 @@ impl Scheduler {
 
         let output_dir_str = output_dir.to_string_lossy().to_string();
 
-        let process = self.engine.start(&ffmpeg, &rec_id, &options).await?;
+        let script = {
+            let config = self.config.read().await;
+            if config.get_bool("execute_custom_script", false) {
+                Some(crate::automation::ScriptSpec::parse(
+                    &config.get_str("custom_script_command", ""),
+                )?)
+            } else {
+                None
+            }
+        };
+        let subtitles = if self
+            .config
+            .read()
+            .await
+            .get_bool("generate_time_subtitle_file", false)
+        {
+            Some(
+                ffmpeg
+                    .as_ref()
+                    .and_then(|p| crate::paths::adjacent_ffprobe(p))
+                    .ok_or("时间字幕需要 FFmpeg 同目录的 ffprobe")?,
+            )
+        } else {
+            None
+        };
+        let process = if rec.flv_use_direct_download == Some(true) {
+            self.engine.start_direct(&rec_id, &options).await?
+        } else {
+            self.engine
+                .start(
+                    ffmpeg.as_deref().ok_or("未找到 ffmpeg，请先安装工具")?,
+                    &rec_id,
+                    &options,
+                )
+                .await?
+        };
         let run_id = process.run_id;
+        self.conversion_plans.lock().await.insert(
+            run_id,
+            FinishPlan {
+                root: root.clone(),
+                convert: convert_to_mp4,
+                options: remux_options,
+                script,
+                subtitles,
+            },
+        );
 
         self.store
             .update(&rec_id, move |r| {
                 r.is_recording = true;
+                r.recorded_seconds = 0.0;
                 r.recording_run = Some(run_id);
                 r.recording_error = None;
                 r.recording_dir = Some(output_dir_str.clone());
@@ -315,7 +585,7 @@ impl Scheduler {
 
         // 速率采样：ffmpeg 以 -loglevel error 运行，stderr 没有进度行，
         // 只能按产出目录的字节增量计算（Python 侧该字段一直是静态占位符，此处改为真实值）。
-        self.spawn_speed_sampler(process.clone(), output_dir.clone());
+        self.spawn_speed_sampler(process.clone());
 
         // 退出监听：ffmpeg 读完流会自行结束，必须感知并回写状态，
         // 否则任务会永远停留在「录制中」（对应 Python 每秒轮询 returncode 的处理）。
@@ -330,6 +600,9 @@ impl Scheduler {
         let store = self.store.clone();
         let engine = self.engine.clone();
         let starting = self.starting.clone();
+        let postprocess = self.postprocess.clone();
+        let conversion_plans = self.conversion_plans.clone();
+        let automation = self.automation.clone();
         let stopping = self.stopping.clone();
         self.background.spawn(async move {
             loop {
@@ -341,13 +614,20 @@ impl Scheduler {
                     _ = stopping.cancelled() => return,
                     guard = starting.lock() => guard,
                 };
+                let _filesystem = engine.filesystem_guard().await;
                 match engine.poll_state(&process).await {
                     crate::engine::ProcessState::Running => continue,
                     crate::engine::ProcessState::Exited { code, error } => {
+                        if let Some(plan) = conversion_plans.lock().await.remove(&process.run_id) {
+                            plan.dispatch(&process, &postprocess, &automation, &store)
+                                .await;
+                        }
                         log::info!("录制 {} 已结束（ffmpeg 退出码 {code:?}）", process.rec_id);
                         let updated = store
                             .update_for_run(&process.rec_id, process.run_id, |r| {
                                 r.is_recording = false;
+                                r.recorded_seconds = process.started_at.elapsed().as_secs_f64();
+                                r.last_duration = Some(r.recorded_seconds);
                                 r.recording_run = None;
                                 r.speed = None;
                                 r.recording_error = error.clone();
@@ -365,35 +645,22 @@ impl Scheduler {
     }
 
     /// 每 2 秒采样一次产出目录大小，换算为速率写回任务状态；录制结束后自行退出。
-    fn spawn_speed_sampler(&self, process: Arc<RecorderProcess>, output_dir: PathBuf) {
-        let rec_id = process.rec_id.clone();
+    fn spawn_speed_sampler(&self, process: Arc<RecorderProcess>) {
         let store = self.store.clone();
         let engine = self.engine.clone();
-
         let stopping = self.stopping.clone();
         let storage = self.storage.clone();
-        self.background.spawn(async move {
-            let Ok(mut previous) = storage.size(output_dir.clone()).await else {return};
-            let mut sampled_at=tokio::time::Instant::now();
-            loop {
-                tokio::select!{_=stopping.cancelled()=>return,_=tokio::time::sleep(Duration::from_secs(2))=>{}}
-
-                if !engine.is_current(&process).await {
-                    return;
-                }
-
-                let current=match storage.size(output_dir.clone()).await {Ok(size)=>size,Err(error)=>{if !stopping.is_cancelled(){log::warn!("统计录制目录失败: {error}");}return}};
-                let delta = current.saturating_sub(previous);
-                previous = current;
-
-                let elapsed=sampled_at.elapsed().as_secs_f64().max(0.001);
-                sampled_at=tokio::time::Instant::now();
-                let speed = format!("{:.0} KB/s", delta as f64 / elapsed / 1024.0);
-                store
-                    .update_for_run(&rec_id, process.run_id, move |r| {
-                        r.speed = Some(speed.clone());
-                    })
-                    .await;
+        self.background.spawn(async move{
+            let mut previous=0;let mut sampled_at=tokio::time::Instant::now();
+            loop{
+                tokio::select!{biased;_=stopping.cancelled()=>return,_=tokio::time::sleep(Duration::from_secs(2))=>{}}
+                if !engine.is_current(&process).await{return;}
+                let pattern=process.output_path.clone();
+                let current=match storage.blocking(move|cancel|{crate::storage::check_cancel(&cancel)?;crate::media_safety::output_bytes(&pattern)}).await{Ok(n)=>n,Err(e)=>{log::warn!("录制大小统计失败: {e}");continue;}};
+                let seconds=sampled_at.elapsed().as_secs_f64().max(0.001);sampled_at=tokio::time::Instant::now();
+                let speed=format!("{:.0} KB/s",current.saturating_sub(previous) as f64/seconds/1024.0);previous=current;
+                let elapsed=process.started_at.elapsed().as_secs_f64();
+                store.update_for_run(&process.rec_id,process.run_id,move|r|{r.speed=Some(speed);r.recorded_seconds=elapsed;}).await;
             }
         });
     }
@@ -401,6 +668,7 @@ impl Scheduler {
     /// 手动开始录制：忽略监控开关，立即解析并开录。
     /// 未开播时返回错误——对应 Python `recording_button_on_click` 的「该直播间未开播」提示。
     pub async fn force_start(&self, rec_id: String) -> Result<CheckOutcome, String> {
+        let _operation = self.begin_check(&rec_id)?;
         let info = self.resolve_for(&rec_id).await?;
         self.accept_resolved(rec_id, &info, true).await
     }
@@ -411,34 +679,107 @@ impl Scheduler {
             return Err(format!("任务不存在: {rec_id}"));
         };
 
-        let (proxy, quality) = {
+        let (proxy, quality, maximum, spacing) = {
             let config = self.config.read().await;
-            let proxy = if config.get_bool("enable_proxy", true) {
-                config.get_str("proxy_address", "")
-            } else {
-                String::new()
-            };
+            let proxy = recording_proxy(&config, rec.platform_key.as_deref())?;
             let quality = rec
                 .quality
                 .clone()
                 .unwrap_or_else(|| config.get_str("record_quality", "OD"));
-            (proxy, quality)
+            (
+                proxy,
+                quality,
+                config
+                    .get_i64("platform_max_concurrent_requests", 3)
+                    .clamp(1, 16) as usize,
+                config.get_i64("platform_request_interval", 3).clamp(0, 300) as u64,
+            )
         };
-
-        let cookie = rec
-            .platform_key
-            .as_ref()
-            .and_then(|key| self.cookie_for(key));
-
-        self.resolver
-            .resolve(ResolveRequest {
-                url: rec.url.clone(),
-                quality: Some(quality),
-                proxy: if proxy.is_empty() { None } else { Some(proxy) },
-                cookie,
-                platform: rec.platform_key.clone(),
-            })
+        let key = rec.platform_key.as_deref().unwrap_or("custom");
+        let stop = self
+            .checks
+            .lock()
+            .expect("active checks")
+            .get(rec_id)
+            .cloned()
+            .unwrap_or_else(|| self.stopping.clone());
+        let _permit = self
+            .pacer
+            .acquire(key, maximum, Duration::from_secs(spacing), &stop)
+            .await?;
+        let cookie = self
+            .config
+            .read()
             .await
+            .cookies_for_resolver()
+            .map_err(|_| "Cookie 配置无法读取，未发送匿名请求")?
+            .get(key)
+            .cloned();
+        let work = self.resolver.resolve(ResolveRequest {
+            account: self
+                .config
+                .read()
+                .await
+                .account(key)
+                .map_err(|_| "账号配置无法读取，未发送匿名请求")?,
+            url: rec.url.clone(),
+            quality: Some(quality),
+            proxy,
+            cookie,
+            platform: rec.platform_key.clone(),
+        });
+        let result = tokio::select! { biased; _=stop.cancelled()=>Err("检测已取消".into()), result=work=>result };
+        if self
+            .store
+            .get(rec_id)
+            .await
+            .is_none_or(|current| current.url != rec.url || current.quality != rec.quality)
+        {
+            return Err("任务已更新，旧检测结果已丢弃".into());
+        }
+        self.pacer.result(key, &result);
+        result
+    }
+    pub async fn enforce_windows(self: &Arc<Self>) {
+        self.automation.tick().await;
+        let records = self.store.all().await;
+        self.schedule_edges
+            .lock()
+            .expect("schedule edges")
+            .retain(|id, _| {
+                records.iter().any(|r| {
+                    &r.rec_id == id && r.scheduled_recording == Some(true) && r.monitor_status
+                })
+            });
+        for record in records {
+            if record.scheduled_recording != Some(true) {
+                continue;
+            }
+            let active = crate::schedule::active(&record).unwrap_or(false);
+            if record.is_recording && !active {
+                self.stop_recording(&record.rec_id).await;
+            }
+            if record.monitor_status {
+                let previous = self
+                    .schedule_edges
+                    .lock()
+                    .expect("schedule edges")
+                    .insert(record.rec_id.clone(), active)
+                    .unwrap_or(false);
+                if active && !previous && !record.is_recording {
+                    let _starting = self.starting.lock().await;
+                    if self.stopping.is_cancelled() {
+                        return;
+                    }
+                    let scheduler = self.clone();
+                    self.background.spawn(async move {
+                        if let Err(error) = scheduler.check(record.rec_id).await {
+                            log::debug!("定时检测未执行: {error}");
+                        }
+                    });
+                }
+            }
+        }
     }
 
     /// 停止录制并更新状态。
@@ -448,10 +789,28 @@ impl Scheduler {
     }
 
     async fn stop_recording_locked(&self, rec_id: &str) -> bool {
+        if let Some(token) = self.checks.lock().expect("active checks").get(rec_id) {
+            token.cancel();
+        }
+        let _filesystem = self.engine.filesystem_guard().await;
+        let process = self.engine.process(rec_id).await;
         let stopped = self.engine.stop(rec_id, 15).await;
+        let elapsed = process
+            .as_ref()
+            .map(|p| p.started_at.elapsed().as_secs_f64());
+        if let Some(process) = process {
+            if let Some(plan) = self.conversion_plans.lock().await.remove(&process.run_id) {
+                plan.dispatch(&process, &self.postprocess, &self.automation, &self.store)
+                    .await;
+            }
+        }
         self.store
             .update(rec_id, |r| {
                 r.is_recording = false;
+                if let Some(elapsed) = elapsed {
+                    r.recorded_seconds = elapsed;
+                    r.last_duration = Some(elapsed);
+                }
                 r.recording_run = None;
                 r.recording_error = None;
                 r.speed = None;
@@ -460,19 +819,62 @@ impl Scheduler {
         stopped
     }
 
+    pub async fn stop_all_for_shutdown(&self) {
+        let _starting = self.starting.lock().await;
+        for id in self.engine.active_ids().await {
+            self.stop_recording_locked(&id).await;
+        }
+        self.engine.stop_all(10).await;
+    }
+
     pub async fn finish_background(&self) {
         let _starting = self.starting.lock().await;
         self.background.close();
         drop(_starting);
         self.background.wait().await;
         self.storage.shutdown().await;
+        self.postprocess.shutdown(Duration::from_secs(30)).await;
+        self.automation.shutdown().await;
+        self.notifications.shutdown().await;
     }
 
-    fn cookie_for(&self, platform_key: &str) -> Option<String> {
-        self.config
-            .try_read()
-            .ok()
-            .and_then(|config| config.cookies_for_resolver().get(platform_key).cloned())
+    fn begin_check(&self, rec_id: &str) -> Result<CheckLease, String> {
+        if self.stopping.is_cancelled() {
+            return Err("应用正在退出".into());
+        }
+        let mut checks = self.checks.lock().expect("active checks");
+        if checks.contains_key(rec_id) {
+            return Err("此任务正在检测，请勿重复请求".into());
+        }
+        checks.insert(rec_id.to_owned(), self.stopping.child_token());
+        Ok(CheckLease {
+            id: rec_id.to_owned(),
+            checks: self.checks.clone(),
+        })
+    }
+    /// Preview reuses a fresh verified source and never performs a background room request.
+    pub async fn preview_input(&self, rec_id: &str) -> Result<crate::preview::LiveInput, String> {
+        let record = self.store.get(rec_id).await.ok_or("任务不存在")?;
+        let cache = self.live_sources.read().await;
+        let (url, when, info) = cache.get(rec_id).ok_or("请先检测直播状态，再预览直播源")?;
+        if &record.url != url || !record.is_live || when.elapsed() > Duration::from_secs(300) {
+            return Err("直播源已过期，请先手动检测状态".into());
+        }
+        let config = self.config.read().await;
+        let prefer_flv = config.get_str("default_live_source", "FLV") != "HLS";
+        let mut url = if !prefer_flv && !info.m3u8_url.is_empty() {
+            info.m3u8_url.clone()
+        } else {
+            info.pick_record_url(prefer_flv).ok_or("当前直播源不可用")?
+        };
+        if config.get_bool("force_https_recording", false) && url.starts_with("http://") {
+            url = url.replacen("http://", "https://", 1);
+        }
+        Ok(crate::preview::LiveInput {
+            url,
+            headers: recording_headers(record.platform_key.as_deref()),
+            proxy: recording_proxy(&config, record.platform_key.as_deref())?,
+        })
     }
 
     /// 磁盘剩余空间检查（对应 Python check_free_space）。
@@ -486,20 +888,17 @@ impl Scheduler {
         };
         let threshold: f64 = threshold_gb.parse().unwrap_or(2.0);
 
-        let free = free_space_gb(&root);
-        let Some(free) = free else {
-            return Ok(());
-        };
-
-        if free < threshold {
+        if let Err(error) = crate::media_safety::require_space(
+            &root,
+            (threshold * 1024.0 * 1024.0 * 1024.0) as u64,
+            0,
+        ) {
             self.recording_enabled.store(false, Ordering::Relaxed);
-            self.store
-                .snack(format!("磁盘剩余空间不足 {threshold}GB，已暂停录制"));
-            // 空间不足时停掉所有录制
+            self.store.snack(format!("录制空间保护：{error}"));
             for id in self.engine.active_ids().await {
                 self.stop_recording(&id).await;
             }
-            return Err(format!("剩余空间 {free:.2}GB 低于阈值 {threshold}GB"));
+            return Err(error.to_string());
         }
 
         self.recording_enabled.store(true, Ordering::Relaxed);
@@ -510,21 +909,8 @@ impl Scheduler {
 /// 海外平台使用更大的缓冲配置（与 Python is_overseas 取向一致）。
 fn is_overseas_platform(platform_key: Option<&str>) -> bool {
     const OVERSEAS: &[&str] = &[
-        "tiktok",
-        "soop",
-        "pandalive",
-        "winktv",
-        "flextv",
-        "popkontv",
-        "twitch",
-        "liveme",
-        "showroom",
-        "chzzk",
-        "shopee",
-        "youtube",
-        "lang",
-        "bigo",
-        "blued",
+        "tiktok", "soop", "pandatv", "winktv", "flextv", "popkontv", "twitch", "liveme",
+        "showroom", "chzzk", "shopee", "youtube", "langlive", "bigo", "blued",
     ];
     platform_key
         .map(|key| OVERSEAS.contains(&key))
@@ -532,6 +918,7 @@ fn is_overseas_platform(platform_key: Option<&str>) -> bool {
 }
 
 /// Query the Windows filesystem directly; no console subprocess or locale-dependent parsing.
+#[cfg(test)]
 fn free_space_gb(path: &std::path::Path) -> Option<f64> {
     #[cfg(windows)]
     {
@@ -561,6 +948,44 @@ fn free_space_gb(path: &std::path::Path) -> Option<f64> {
     }
 }
 
+fn recording_proxy(config: &ConfigStore, platform: Option<&str>) -> Result<Option<String>, String> {
+    if !config.get_bool("enable_proxy", false) {
+        return Ok(None);
+    }
+    let platforms = config.get_str("default_platform_with_proxy", "");
+    let selected = platforms
+        .split([',', '，'])
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(crate::platforms::catalog::canonical_key)
+        .collect::<Vec<_>>();
+    let key = crate::platforms::catalog::canonical_key(platform.unwrap_or("custom"));
+    if !selected.is_empty() && !selected.contains(&key) {
+        return Ok(None);
+    }
+    let address = config.get_str("proxy_address", "");
+    if address.trim().is_empty() {
+        return Err("已启用代理但地址为空，未直接联网".into());
+    }
+    let parsed = reqwest::Url::parse(&address).map_err(|_| "代理地址无效，未直接联网")?;
+    if !matches!(parsed.scheme(), "http" | "https" | "socks5" | "socks5h")
+        || parsed.host_str().is_none()
+    {
+        return Err("代理协议无效，未直接联网".into());
+    }
+    Ok(Some(address))
+}
+fn recording_headers(key: Option<&str>) -> Option<String> {
+    let referer = match key.unwrap_or("") {
+        "bilibili" => "https://live.bilibili.com/",
+        "douyin" => "https://live.douyin.com/",
+        "kuaishou" => "https://live.kuaishou.com/",
+        "huya" => "https://www.huya.com/",
+        "douyu" => "https://www.douyu.com/",
+        _ => return None,
+    };
+    Some(format!("Referer: {referer}\r\n"))
+}
 #[cfg(test)]
 mod tests {
     use super::*;
