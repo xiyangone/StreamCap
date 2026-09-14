@@ -275,6 +275,51 @@ try {
     await visible(page.getByText('模拟 FFmpeg 启动失败', { exact: true }));
     assert.equal(record('fixture-5').isRecording, false);
   });
+  await step('快手待验证不冒充未开播或录制失败，并保留手动验证入口', async () => {
+    const original=structuredClone(record('fixture-5'));
+    Object.assign(record('fixture-5'),{platformKey:'kuaishou',platform:'快手直播',checkError:'快手需要完成滑块验证（400002）',verificationRequired:true,isLive:true,isRecording:false,recordingError:null});h.emit('update',record('fixture-5'));
+    await visible(card('fixture-5').getByText('待验证',{exact:true}));
+    await visible(card('fixture-5').getByText('请在快手窗口完成验证',{exact:true}));
+    const attentionCount=state.recordings.filter(r=>!r.isRecording&&(r.verificationRequired||r.checkError||r.recordingError)).length;
+    const attentionTab=page.getByRole('button',{name:/^需关注/});
+    assert.ok((await attentionTab.innerText()).includes(String(attentionCount)));
+    await attentionTab.click();assert.equal(await page.locator('.recording-card').count(),attentionCount);
+    await visible(card('fixture-5'));
+    await navigate('总览');
+    assert.equal(await page.locator('.stat-item').filter({hasText:'需关注'}).locator('strong').innerText(),String(attentionCount));
+    await visible(page.getByText('有需要处理的任务，请查看下方提示。',{exact:true}));
+    assert.equal(await page.locator('.recording-card').first().getAttribute('data-rec-id'),'fixture-5');
+    await navigate('录制任务');
+    assert.equal(await card('fixture-5').getByRole('button',{name:'单次录制',exact:true}).isDisabled(),true);
+    assert.equal(await card('fixture-5').getByRole('button',{name:'检测直播状态',exact:true}).isDisabled(),true);
+    assert.equal(await card('fixture-5').locator('.card-recording-error').count(),0);
+    await card('fixture-5').getByRole('button',{name:'重新验证',exact:true}).click();
+    await waitState(()=>state.native.verification,v=>v?.active===true&&v.recId==='fixture-5','只打开当前快手验证入口');
+    await h.shot('kuaishou-verification-required');
+    Object.assign(record('fixture-5'),original);h.emit('update',record('fixture-5'));
+    await hidden(card('fixture-5').getByRole('button',{name:'重新验证',exact:true}));
+  });
+  await step('卡片操作区在列表和网格、宽窄窗口保持对齐', async () => {
+    for(const width of [1280,800,420]) {
+      await page.setViewportSize({width,height:960});
+      for(const list of [true,false]) {
+        await page.getByRole('button',{name:list?'列表视图':'网格视图',exact:true}).click();
+        const target=card('fixture-5');await target.scrollIntoViewIfNeeded();
+        const layout=await target.evaluate(card=>{
+          const rect=element=>{const r=element.getBoundingClientRect();return {left:r.left,right:r.right,top:r.top,bottom:r.bottom,cy:(r.top+r.bottom)/2};};
+          const actions=card.querySelector('.card-actions');const buttons=[...actions.querySelectorAll('button')].map(rect);
+          return {card:rect(card),buttons,primary:[...card.querySelectorAll('.card-primary-actions button')].map(rect),tools:[...card.querySelectorAll('.card-tools button')].map(rect),floating:card.querySelectorAll('.card-monitor-row button').length,overflow:document.documentElement.scrollWidth>innerWidth+1};
+        });
+        assert.equal(layout.floating,0);assert.equal(layout.overflow,false);
+        for(const button of layout.buttons) assert.ok(button.left>=layout.card.left&&button.right<=layout.card.right+1,'操作按钮不越过卡片');
+        for(const group of [layout.primary,layout.tools]) assert.ok(Math.max(...group.map(r=>r.cy))-Math.min(...group.map(r=>r.cy))<=1,'同组按钮中线对齐');
+        if(list&&width===1280)assert.ok(Math.max(...layout.buttons.map(r=>r.cy))-Math.min(...layout.buttons.map(r=>r.cy))<=1,'宽屏列表全部按钮同一中线');
+        await h.shot('actions-'+width+'-'+(list?'list':'grid'));
+      }
+    }
+    await page.setViewportSize({width:1280,height:900});
+    await page.getByRole('button',{name:'网格视图',exact:true}).click();
+  });
   await step('自动补名、直播中录制失败与重试恢复保持一致', async () => {
     const original = structuredClone(record('fixture-5'));
     Object.assign(record('fixture-5'), { streamerName: '', liveTitle: '测试直播标题', isLive: true, isRecording: false, recordingError: null });

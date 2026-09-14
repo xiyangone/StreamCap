@@ -186,6 +186,7 @@ h3 { font-size: 14px; font-weight: 600; }
 .badge.live { color: var(--danger); background: var(--danger-soft); }
 .badge.monitoring { color: var(--accent); background: var(--accent-soft); }
 .badge.stopped { color: var(--subtle); background: var(--surface-hover); }
+.badge.attention { color: var(--danger); background: var(--danger-soft); }
 .card-main { margin-top: 17px; min-width: 0; }
 .card-name { display: block; text-align: left; font-size: 15px; font-weight: 600; padding: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .card-name:hover { color: var(--accent); }
@@ -197,11 +198,14 @@ h3 { font-size: 14px; font-weight: 600; }
 .card-tags { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; }
 .card-tags span { padding: 2px 6px; border: 1px solid var(--line); background: var(--field); border-radius: 4px; color: var(--muted); font-size: 9px; }
 .card-speed { display: flex; gap: 4px; align-items: center; font-size: 9px; color: var(--success); white-space: nowrap; font-variant-numeric: tabular-nums; }
-.card-actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding-top: 12px; border-top: 1px solid var(--line); }
+.card-actions { display: flex; flex-direction: column; align-items: stretch; gap: 10px; padding-top: 12px; border-top: 1px solid var(--line); }
+.card-primary-actions { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.card-primary-actions > .button { flex: 1 0 auto; min-height: 34px; font-size: 11px; white-space: nowrap; }
+.card-primary-actions > .card-monitor { padding: 6px 10px; }
 .button.card-record { background: var(--accent-soft); color: var(--accent); min-height: 32px; padding: 6px 9px; font-size: 10px; border-radius: 8px; }
 .button.card-record.recording { background: var(--success-soft); color: var(--success); }
 .button.card-record:hover:not(:disabled) { border-color: currentColor; }
-.card-tools { display: flex; gap: 1px; }
+.card-tools { display: flex; align-items: center; gap: 5px; margin-left: auto; }
 .card-tools .icon-button { width: 28px; height: 30px; }
 .page-footer { display: flex; justify-content: space-between; gap: 15px; padding: 22px 1px 0; color: var(--subtle); font-size: 9px; }
 .page-footer span { display: flex; align-items: center; gap: 6px; }
@@ -666,7 +670,7 @@ textarea.input { resize: vertical; line-height: 1.65; }
   .list-view .card-monitor-row { grid-area: monitor; margin: 0; }
   .list-view .card-meta { grid-area: meta; display: flex; justify-content: flex-start; gap: 14px; padding: 0; margin: 0; }
   .list-view .card-actions { grid-area: actions; gap: 10px; }
-  .list-view .card-tools { max-width: none; flex-wrap: nowrap; gap: 1px; }
+  .list-view .card-tools { max-width: none; flex-wrap: nowrap; gap: 5px; }
 }
 
 /* Preview and post-processing remain part of the existing media surface. */
@@ -703,10 +707,15 @@ textarea.input { resize: vertical; line-height: 1.65; }
 .recording-plan .health-row > strong { text-align: right; overflow-wrap: anywhere; }
 .stat-icon.attention { color: var(--danger); background: var(--danger-soft); }
 .recording-card.needs-attention { border-color: color-mix(in srgb, var(--danger) 35%, var(--border)); }
-.card-monitor-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 12px; min-width: 0; }
+.card-monitor-row { display: flex; align-items: center; gap: 8px; margin-top: 12px; min-width: 0; }
 .card-monitor-row > span { display: inline-flex; align-items: center; gap: 5px; font-size: 10px; color: var(--muted); }
 .card-monitor-row > span.monitor-on { color: var(--success); }
-.card-monitor-row .text-button { padding: 5px 0 5px 6px; color: var(--accent); font-size: 10px; white-space: nowrap; flex-shrink: 0; }
+.card-check-error { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; color: var(--danger); margin-top: 7px; font-size: 11px; line-height: 1.6; }
+.card-check-error > span { display: flex; align-items: flex-start; gap: 5px; min-width: 0; overflow-wrap: anywhere; }
+.card-check-error > span > .icon { flex: 0 0 auto; margin-top: 2px; }
+.card-check-error .card-verify { min-height: 30px; white-space: nowrap; font-size: 11px; padding: 4px 8px; }
+@media (min-width: 1101px) { .list-view .card-actions { flex-direction: row; align-items: center; gap: 12px; } }
+@media (min-width: 761px) and (max-width: 1100px) { .list-view .recording-card { grid-template-columns: 100px minmax(100px,1fr) auto; column-gap: 12px; } }
 .card-duration { color: var(--text); font-variant-numeric: tabular-nums; margin-right: 5px; }
 .button.card-record:not(.recording) { background: var(--field); border-color: var(--border); color: var(--muted); }
 .card-tools { align-items: center; }
@@ -715,7 +724,7 @@ textarea.input { resize: vertical; line-height: 1.65; }
 .convert-action { margin-right: 8px; min-width: 88px; gap: 5px; }
 @media (max-width: 900px) { .workbench-overview { grid-template-columns: 1fr; } }
 @media (max-width: 760px) { .list-view .card-monitor-row { grid-column: 1 / -1; } }
-@media (max-width: 520px) { .card-monitor-row > span, .card-monitor-row .text-button { font-size: 11px; } .card-tools .card-preview { min-height: 36px; } .file-table .file-actions { width: 142px; min-width: 142px; } .convert-action { min-width: 78px; padding-inline: 7px; } }
+@media (max-width: 520px) { .card-monitor-row > span { font-size: 11px; } .card-primary-actions > .button, .card-tools .icon-button, .card-tools .card-preview { min-height: 40px; } .file-table .file-actions { width: 142px; min-width: 142px; } .convert-action { min-width: 78px; padding-inline: 7px; } }
 
 .seek-controls { display:flex;align-items:center;flex-wrap:wrap;gap:9px;padding:10px 12px;background:#101725;color:#ecf1fb; }
 .seek-button { flex:0 0 auto;min-height:32px;padding:5px 8px;border-radius:6px;font-size:11px;color:#ecf1fb;background:#253047; }

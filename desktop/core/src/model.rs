@@ -116,6 +116,10 @@ pub struct Recording {
     pub recorded_seconds: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recording_error: Option<String>,
+    #[serde(default, skip_deserializing)]
+    pub check_error: Option<String>,
+    #[serde(default, skip_deserializing)]
+    pub verification_required: bool,
     /// Internal attempt identity; never sent to the UI or persisted with user tasks.
     #[serde(skip)]
     pub(crate) recording_run: Option<uuid::Uuid>,
@@ -165,6 +169,8 @@ impl Recording {
             is_recording: false,
             recorded_seconds: 0.0,
             recording_error: None,
+            check_error: None,
+            verification_required: false,
             recording_run: None,
             live_title: None,
             speed: None,

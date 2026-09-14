@@ -274,6 +274,10 @@ async fn parse_failure_does_not_erase_last_verified_live_state() {
         scheduler.check("parse-error".into()).await.unwrap(),
         streamcap_core::scheduler::CheckOutcome::Failed(_)
     ));
+    let checked = state.store.get("parse-error").await.unwrap();
+    assert!(checked.check_error.is_some());
+    assert!(!checked.verification_required);
+    record.check_error = checked.check_error;
     assert_eq!(state.store.get("parse-error").await.unwrap(), record);
     assert!(scheduler.force_start("parse-error".into()).await.is_err());
     assert_eq!(state.store.get("parse-error").await.unwrap(), record);
@@ -414,4 +418,90 @@ async fn queued_paused_and_outside_schedule_tasks_do_not_start_recording() {
     assert!(!state.store.get("paused").await.unwrap().is_live);
     assert!(!state.store.get("scheduled").await.unwrap().is_live);
     streamcap_core::api::shutdown(&state).await.unwrap();
+}
+
+#[tokio::test]
+async fn verified_kuaishou_room_keeps_monitoring_intent_and_runtime_state_out_of_storage() {
+    use streamcap_core::{resolver::StreamInfo, scheduler::CheckOutcome};
+    for monitor in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::from_repo_root(dir.path());
+        let state = bootstrap(workspace.clone()).await.unwrap();
+        state
+            .config
+            .write()
+            .await
+            .update_user_config(
+                json!({"loop_time_seconds":"4500","convert_to_mp4":true,"delete_original":true})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )
+            .unwrap();
+        let mut record = Recording::new(
+            "verify".into(),
+            "https://live.kuaishou.com/u/fixture".into(),
+            "Fixture".into(),
+        );
+        record.platform_key = Some("kuaishou".into());
+        record.monitor_status = monitor;
+        record.only_notify_no_record = Some(true);
+        record.check_error =
+            Some(streamcap_core::platforms::kuaishou::VERIFICATION_REQUIRED.into());
+        record.verification_required = true;
+        state.store.insert(vec![record]).await.unwrap();
+        let expected = state.store.get("verify").await.unwrap();
+        let info = StreamInfo {
+            platform: "快手直播".into(),
+            anchor_name: "Fixture".into(),
+            is_live: true,
+            record_url: "https://media.invalid/verified.flv".into(),
+            ..Default::default()
+        };
+        let result = state
+            .scheduler
+            .accept_verified(&expected, &info)
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            if monitor {
+                CheckOutcome::NotifyOnly
+            } else {
+                CheckOutcome::MonitoringPaused
+            }
+        );
+        let current = state.store.get("verify").await.unwrap();
+        assert_eq!(current.monitor_status, monitor);
+        assert!(current.is_live);
+        assert!(!current.is_recording);
+        assert!(current.check_error.is_none());
+        assert!(!current.verification_required);
+        assert!(state.engine.active_ids().await.is_empty());
+        state.store.persist().await.unwrap();
+        let stored = std::fs::read_to_string(workspace.recordings_path()).unwrap();
+        assert!(
+            !stored.contains("checkError")
+                && !stored.contains("verificationRequired")
+                && !stored.contains("check_error")
+        );
+        assert_eq!(
+            state.config.read().await.get_str("loop_time_seconds", ""),
+            "4500"
+        );
+        assert!(state.config.read().await.get_bool("delete_original", false));
+        state
+            .store
+            .update("verify", |r| {
+                r.url = "https://live.kuaishou.com/u/changed".into()
+            })
+            .await;
+        assert!(state
+            .scheduler
+            .accept_verified(&expected, &info)
+            .await
+            .unwrap_err()
+            .contains("已更新"));
+        streamcap_core::api::shutdown(&state).await.unwrap();
+    }
 }

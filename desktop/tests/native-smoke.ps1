@@ -21,7 +21,7 @@ if($LASTEXITCODE -ne 0){throw 'Synthetic native preview fixture failed'}
 $stdout = Join-Path $run 'app.stdout.log'; $stderr = Join-Path $run 'app.stderr.log'
 $debugListener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0)
 $debugListener.Start(); $debugPort = $debugListener.LocalEndpoint.Port; $debugListener.Stop()
-$arguments = @('--data-dir',('"' + $profile + '"'),'--api-port','0','--smoke-seconds','90')
+$arguments = @('--data-dir',('"' + $profile + '"'),'--api-port','0','--smoke-seconds','120')
 $environment = @{TEMP=$temp;TMP=$temp;WEBVIEW2_USER_DATA_FOLDER=(Join-Path $profile 'webview');PATH=([IO.Path]::GetDirectoryName($testFfmpeg)+';'+$env:PATH);WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS="--remote-debugging-port=$debugPort --remote-debugging-address=127.0.0.1"}
 $process = Start-Process -FilePath $Executable -ArgumentList $arguments -WorkingDirectory $run -PassThru -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -Environment $environment
 $owned = @{}
@@ -94,6 +94,63 @@ try {
   assert.equal(await page.locator('.sidebar').evaluate(el=>getComputedStyle(el).borderRadius),'0px');
   await page.screenshot({path:path.join(output,'native-window.png'),fullPage:true,animations:'disabled'});
   // Actual WebView2 decoding and automatic conversion; only generated, loopback media is used.
+  let verificationMode='challenge',verificationRequests=0,verificationDelayMs=0;
+  const verificationSource=createServer((req,res)=>{
+    if(req.url!=='/kuaishou-fixture/room'){res.writeHead(404);res.end();return;}
+    verificationRequests++;
+    const room=verificationMode==='challenge'?{author:{},liveStream:{},isLiving:false,errorType:{type:400002,title:'请完成滑块验证'}}:{author:{name:'验证夹具'},liveStream:{},isLiving:false,errorType:{}};
+    const state={user:{userInfoQuery:{ownerInfo:{originUserId:'fixture-user',name:'验证账号'}}},liveroom:{playList:[room]}};
+    const send=()=>{if(res.destroyed)return;
+    res.writeHead(200,{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store',...(verificationMode==='offline'?{'Set-Cookie':'site_proof=fixture-verified; Path=/; SameSite=Lax'}:{})});
+    res.end('<!doctype html><html><head><title>本机快手验证夹具</title></head><body><h1>本机验证夹具</h1><p>'+ (verificationMode==='challenge'?'请完成滑块验证':'目标房间可读，当前未开播')+'</p><script>window.__INITIAL_STATE__ = '+JSON.stringify(state)+';</script></body></html>');};
+    if(verificationDelayMs)setTimeout(send,verificationDelayMs);else send();
+  });
+  await new Promise(resolve=>verificationSource.listen(0,'127.0.0.1',resolve));
+  const verificationUrl='http://127.0.0.1:'+verificationSource.address().port+'/kuaishou-fixture/room';
+  const verificationCall=args=>page.evaluate(async args=>(await import('/tauri-api/core.js')).invoke('desktop_kuaishou_verification',args),args);
+  const verificationStatus=()=>verificationCall({action:'status'});
+  const seedCookie='userId=fixture-user; kuaishou.live.web_st=fixture-session; did=fixture-device';
+  const setCookie=async cookie=>{const response=await fetch(base+'/api/cookies',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({cookies:{kuaishou:cookie}})});assert.equal(response.status,200);};
+  const readCookie=async()=>(await(await fetch(base+'/api/cookies')).json()).cookies.kuaishou;
+  await setCookie(seedCookie);
+  const verifyCreated=await fetch(base+'/api/recordings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:'https://live.kuaishou.com/u/fixture-verify',streamerName:'验证夹具'})});assert.equal(verifyCreated.status,200);
+  const verifyTask=(await verifyCreated.json()).created[0];
+  const paused=await fetch(base+'/api/recordings/'+verifyTask.recId+'/monitor',{method:'POST'});assert.equal(paused.status,200);
+  const openVerification=()=>verificationCall({action:'smoke-open',recId:verifyTask.recId,fixtureUrl:verificationUrl});
+  await openVerification();await openVerification();
+  const verificationPage=await eventually(()=>browser.contexts().flatMap(context=>context.pages()).find(candidate=>candidate.url()===verificationUrl),Boolean,'isolated verification window',20000);
+  await verificationPage.getByText('请完成滑块验证',{exact:true}).waitFor();
+  assert.equal(browser.contexts().flatMap(context=>context.pages()).filter(candidate=>candidate.url()===verificationUrl).length,1,'duplicate verification requests must share one window');
+  assert.ok(await verificationPage.evaluate(()=>document.cookie.includes('did=fixture-device')),'official page scripts retain access to their own device cookie');
+  const remoteIpcDenied=await verificationPage.evaluate(async()=>{if(!window.__TAURI_INTERNALS__?.invoke)return true;try{await window.__TAURI_INTERNALS__.invoke('desktop_window_action',{action:'close'});return false;}catch{return true;}});
+  assert.equal(remoteIpcDenied,true);assert.equal((await native()).closing,false);
+  const countBeforeVerify=verificationRequests;
+  await verificationCall({action:'complete'});
+  await eventually(verificationStatus,status=>status.active&&!status.busy,'challenge not mistaken for success');
+  assert.equal(verificationRequests,countBeforeVerify+1,'one page reload per explicit completion action');
+  assert.equal(await readCookie(),seedCookie,'challenge must not replace saved cookies');
+  await verificationPage.screenshot({path:path.join(output,'native-kuaishou-challenge.png'),fullPage:true});
+  await verificationCall({action:'smoke-close'});
+  await eventually(verificationStatus,status=>!status.active&&status.activeWorkers===0,'verification X cleans its window and workers');
+  assert.equal((await native()).closing,false);assert.equal(await readCookie(),seedCookie);
+  const requestsAfterClose=verificationRequests;await sleep(400);assert.equal(verificationRequests,requestsAfterClose,'cancelled verification must not continue network requests');
+  await openVerification();verificationDelayMs=1500;
+  const pendingVerification=await verificationCall({action:'complete'});assert.equal(pendingVerification.busy,true);
+  await verificationCall({action:'smoke-close'});
+  await eventually(verificationStatus,status=>!status.active&&status.activeWorkers===0,'X cancels an in-flight verification');
+  assert.equal(await readCookie(),seedCookie,'cancellation during verification does not save cookies');verificationDelayMs=0;
+  await openVerification();
+  await setCookie(seedCookie+'; updated=elsewhere');
+  await eventually(verificationStatus,status=>!status.active&&status.activeWorkers===0,'external session update cancels stale verification');
+  assert.equal(await readCookie(),seedCookie+'; updated=elsewhere');
+  await openVerification();
+  verificationMode='offline';
+  await verificationCall({action:'complete'});
+  await eventually(verificationStatus,status=>!status.active&&status.activeWorkers===0,'verified room closes its window',25000);
+  assert.ok((await readCookie()).includes('site_proof=fixture-verified'),'save only a verified same-site session');
+  const verifiedTask=(await(await fetch(base+'/api/recordings')).json()).find(task=>task.recId===verifyTask.recId);
+  assert.equal(verifiedTask.monitorStatus,false);assert.equal(verifiedTask.isRecording,false);assert.equal(verifiedTask.isLive,false);assert.equal(verifiedTask.verificationRequired,false);assert.equal(verifiedTask.checkError,null);
+  const verificationValidation={singleWindow:true,remoteIpcDenied,challengeNotOffline:true,explicitCompletionOnly:true,cancelPreservesCookie:true,pendingCancelCleansWorkers:true,staleSessionCancelled:true,verifiedCookieSaved:true,pausedTaskNotStarted:true};
   const fixture=await fs.readFile(path.join(output,'native-preview.ts'));
   const mediaSource=createServer((_req,res)=>{res.writeHead(200,{'Content-Type':'video/mp2t','Content-Length':fixture.length});res.end(fixture);});
   await new Promise(resolve=>mediaSource.listen(0,'127.0.0.1',resolve));
@@ -174,7 +231,10 @@ try {
     setTimeout(()=>finish(false),1000);
   }));
   assert.equal(security.inlineScriptBlocked,true);
-  const result={passed:true,security,mediaValidation,title:await page.title(),checks:['frameless-shell','maximize-restore','flush-layout','close-cancel','escape-cancel','tray-keeps-backend','remember-tray','close-preference-change',exitMode==='Tray'?'tray-menu-exit':'explicit-dialog-exit'],transport:stats,exitMode};
+  // Leave a verification window alive so both real exit paths must own and clean it.
+  verificationMode='challenge';await openVerification();
+  assert.equal((await verificationStatus()).active,true);
+  const result={passed:true,security,mediaValidation,verificationValidation,title:await page.title(),checks:['frameless-shell','maximize-restore','flush-layout','close-cancel','escape-cancel','tray-keeps-backend','remember-tray','close-preference-change',exitMode==='Tray'?'tray-menu-exit':'explicit-dialog-exit'],transport:stats,exitMode};
   await fs.writeFile(path.join(output,'ui-result.json'),JSON.stringify(result,null,2));
   if(exitMode==='Tray') {
     await requestClose();await modal.getByRole('button',{name:/最小化到托盘/}).click();await modal.waitFor({state:'hidden'});
@@ -193,7 +253,7 @@ try {
     [IO.File]::WriteAllText($probePath,$probe,[Text.UTF8Encoding]::new($false))
     $probeArguments=@(('"'+$probePath+'"'),"$debugPort",('"'+$run+'"'),"$base","$ExitMode")
     $probeProcess=Start-Process -FilePath (Get-Command node -ErrorAction Stop).Source -ArgumentList $probeArguments -WorkingDirectory $desktop -PassThru -WindowStyle Hidden -RedirectStandardOutput (Join-Path $run 'ui-probe.log') -RedirectStandardError (Join-Path $run 'ui-probe.error.log')
-    $probeDeadline=[DateTime]::UtcNow.AddSeconds(80)
+    $probeDeadline=[DateTime]::UtcNow.AddSeconds(110)
     while(-not $probeProcess.HasExited){
         Update-OwnedProcesses
         if([DateTime]::UtcNow -gt $probeDeadline){throw 'Native UI probe timed out'}
@@ -211,7 +271,7 @@ try {
     $process.WaitForExit()
     if ($process.ExitCode -ne 0) {throw "Application exit code=$($process.ExitCode)"}
     $shutdown = Get-Content -LiteralPath (Join-Path $profile 'shutdown.json') -Raw | ConvertFrom-Json
-    if (-not $shutdown.shutdownComplete -or $shutdown.activeRecordings -ne 0 -or $shutdown.pendingMediaJobs -ne 0 -or $shutdown.activePreviews -ne 0) {throw 'Ordered shutdown incomplete'}
+    if (-not $shutdown.shutdownComplete -or $shutdown.activeRecordings -ne 0 -or $shutdown.pendingMediaJobs -ne 0 -or $shutdown.activePreviews -ne 0 -or $shutdown.verification.active -or $shutdown.verification.activeWorkers -ne 0) {throw 'Ordered shutdown incomplete'}
     $remaining = @()
     for ($i=0;$i -lt 30;$i++) {
         $remaining=@($owned.Keys | Where-Object {Get-Process -Id $_ -ErrorAction SilentlyContinue})

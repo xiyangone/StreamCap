@@ -53,6 +53,10 @@ pub struct Recording {
     pub recorded_seconds: f64,
     #[serde(default)]
     pub recording_error: Option<String>,
+    #[serde(default)]
+    pub check_error: Option<String>,
+    #[serde(default)]
+    pub verification_required: bool,
     pub live_title: Option<String>,
     pub speed: Option<String>,
     pub recording_dir: Option<String>,
@@ -61,6 +65,18 @@ pub struct Recording {
 }
 
 impl Recording {
+    pub fn needs_attention(&self) -> bool {
+        !self.is_recording
+            && (self.verification_required
+                || self
+                    .check_error
+                    .as_ref()
+                    .is_some_and(|error| !error.is_empty())
+                || self
+                    .recording_error
+                    .as_ref()
+                    .is_some_and(|error| !error.is_empty()))
+    }
     pub fn name(&self) -> String {
         if self.streamer_name.trim().is_empty() {
             crate::app::i18n::t("未命名直播间").into()
@@ -74,6 +90,14 @@ impl Recording {
     pub fn status(&self) -> StatusKind {
         if self.is_recording {
             StatusKind::Recording
+        } else if self.verification_required {
+            StatusKind::Verification
+        } else if self
+            .check_error
+            .as_ref()
+            .is_some_and(|error| !error.is_empty())
+        {
+            StatusKind::CheckFailed
         } else if self.is_live {
             StatusKind::Live
         } else if self.monitor_status {
@@ -86,6 +110,8 @@ impl Recording {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusKind {
+    Verification,
+    CheckFailed,
     Recording,
     Live,
     Monitoring,
@@ -94,6 +120,8 @@ pub enum StatusKind {
 impl StatusKind {
     pub fn label(self) -> &'static str {
         match self {
+            Self::Verification => crate::app::i18n::t("待验证"),
+            Self::CheckFailed => crate::app::i18n::t("检测异常"),
             Self::Recording => crate::app::i18n::t("录制中"),
             Self::Live => crate::app::i18n::t("直播中"),
             Self::Monitoring => crate::app::i18n::t("监控中"),
@@ -102,6 +130,7 @@ impl StatusKind {
     }
     pub fn class(self) -> &'static str {
         match self {
+            Self::Verification | Self::CheckFailed => "badge attention",
             Self::Recording => "badge recording",
             Self::Live => "badge live",
             Self::Monitoring => "badge monitoring",

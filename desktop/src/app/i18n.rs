@@ -124,6 +124,25 @@ macro_rules! tr_format { ($template:literal $(, $($rest:tt)*)?) => { $crate::app
 mod tests {
     use super::*;
     #[test]
+    fn embedded_verification_translations_are_complete() {
+        for key in [
+            "待验证",
+            "检测异常",
+            "重新验证",
+            "检测失败：{}",
+            "请在快手窗口完成验证",
+            "已打开快手验证窗口",
+            "等待手动验证",
+            "等待检测恢复",
+            "有需要处理的任务，请查看下方提示。",
+        ] {
+            assert!(EN
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| !value.is_empty() && value != key));
+        }
+    }
+    #[test]
     fn placeholders_preserve_user_values() {
         assert_eq!(
             interpolate(

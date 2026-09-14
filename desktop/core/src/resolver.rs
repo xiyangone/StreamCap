@@ -102,6 +102,9 @@ impl Resolver {
         self.stop.cancel();
         self.login.shutdown().await;
     }
+    pub async fn kuaishou_session_changed(&self) {
+        self.kuaishou.reset_session().await;
+    }
     pub async fn healthy(&self) -> bool {
         !self.stop.is_cancelled()
     }

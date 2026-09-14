@@ -28,9 +28,7 @@ impl Filter {
             Self::Live => rec.is_live,
             Self::Monitoring => rec.monitor_status && !rec.is_recording,
             Self::Paused => !rec.monitor_status,
-            Self::Attention => {
-                !rec.is_recording && rec.recording_error.as_ref().is_some_and(|e| !e.is_empty())
-            }
+            Self::Attention => rec.needs_attention(),
         }
     }
 }

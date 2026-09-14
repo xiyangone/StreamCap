@@ -400,6 +400,93 @@ async fn login_flow(
     Ok(())
 }
 
+fn first_json_value(text: &str) -> Option<Value> {
+    serde_json::Deserializer::from_str(text.trim_start())
+        .into_iter::<Value>()
+        .next()?
+        .ok()
+}
+fn js_string(text: &str) -> Option<String> {
+    let text = text.trim_start();
+    if text.starts_with('"') {
+        return first_json_value(text)?.as_str().map(str::to_owned);
+    }
+    let bytes = text.as_bytes();
+    if bytes.first().copied()? != b'\'' {
+        return None;
+    }
+    let mut result = String::new();
+    let mut index = 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\'' => return Some(result),
+            b'\\' => {
+                index += 1;
+                let escaped = *bytes.get(index)?;
+                match escaped {
+                    b'n' => result.push('\n'),
+                    b'r' => result.push('\r'),
+                    b't' => result.push('\t'),
+                    b'b' => result.push('\u{0008}'),
+                    b'f' => result.push('\u{000C}'),
+                    b'\\' | b'\'' | b'"' | b'/' => result.push(escaped as char),
+                    b'u' => {
+                        let hex = std::str::from_utf8(bytes.get(index + 1..index + 5)?).ok()?;
+                        let code = u16::from_str_radix(hex, 16).ok()?;
+                        result.push(char::from_u32(code as u32)?);
+                        index += 4;
+                    }
+                    _ => result.push(escaped as char),
+                }
+            }
+            _ => {
+                let character = text.get(index..)?.chars().next()?;
+                result.push(character);
+                index += character.len_utf8() - 1;
+            }
+        }
+        index += 1;
+    }
+    None
+}
+fn assigned_json(text: &str) -> Option<Value> {
+    let text = text.trim_start();
+    let parse_tail = text
+        .strip_prefix("JSON.parse")
+        .map(str::trim_start)
+        .and_then(|tail| tail.strip_prefix('('));
+    if let Some(tail) = parse_tail {
+        let encoded = js_string(tail)?;
+        return first_json_value(&encoded);
+    }
+    first_json_value(text)
+}
+fn first_text_value(text: &str) -> Option<Value> {
+    first_json_value(text).or_else(|| js_string(text).map(Value::String))
+}
+pub(crate) fn initial_state(page: &str) -> Option<Value> {
+    for marker in [
+        "window.__INITIAL_STATE__",
+        "self.__INITIAL_STATE__",
+        "__INITIAL_STATE__",
+    ] {
+        let mut offset = 0;
+        while let Some(relative) = page.get(offset..)?.find(marker) {
+            let start = offset + relative + marker.len();
+            let tail = page.get(start..)?.trim_start();
+            let tail = tail
+                .strip_prefix('=')
+                .or_else(|| tail.strip_prefix(':'))
+                .map(str::trim_start);
+            if let Some(value) = tail.and_then(assigned_json) {
+                return Some(value);
+            }
+            offset = start;
+        }
+    }
+    None
+}
+
 /// Verify exact account identity in login-owned state only, never arbitrary room recommendations.
 /// Phone confirmation, token exchange and website login verification are independent stages.
 pub fn verify_login_page(page: &str, user_id: &str) -> Result<Option<String>, String> {
@@ -407,88 +494,6 @@ pub fn verify_login_page(page: &str, user_id: &str) -> Result<Option<String>, St
         "手机已确认，但直播站未返回可验证的登录状态。登录信息未保存，请稍后重试。";
     if user_id.is_empty() {
         return Err(UNVERIFIED.into());
-    }
-    fn first_json_value(text: &str) -> Option<Value> {
-        serde_json::Deserializer::from_str(text.trim_start())
-            .into_iter::<Value>()
-            .next()?
-            .ok()
-    }
-    fn js_string(text: &str) -> Option<String> {
-        let text = text.trim_start();
-        if text.starts_with('"') {
-            return first_json_value(text)?.as_str().map(str::to_owned);
-        }
-        let bytes = text.as_bytes();
-        if bytes.first().copied()? != b'\'' {
-            return None;
-        }
-        let mut result = String::new();
-        let mut index = 1;
-        while index < bytes.len() {
-            match bytes[index] {
-                b'\'' => return Some(result),
-                b'\\' => {
-                    index += 1;
-                    let escaped = *bytes.get(index)?;
-                    match escaped {
-                        b'n' => result.push('\n'),
-                        b'r' => result.push('\r'),
-                        b't' => result.push('\t'),
-                        b'b' => result.push('\u{0008}'),
-                        b'f' => result.push('\u{000C}'),
-                        b'\\' | b'\'' | b'"' | b'/' => result.push(escaped as char),
-                        b'u' => {
-                            let hex = std::str::from_utf8(bytes.get(index + 1..index + 5)?).ok()?;
-                            let code = u16::from_str_radix(hex, 16).ok()?;
-                            result.push(char::from_u32(code as u32)?);
-                            index += 4;
-                        }
-                        _ => result.push(escaped as char),
-                    }
-                }
-                byte => result.push(byte as char),
-            }
-            index += 1;
-        }
-        None
-    }
-    fn assigned_json(text: &str) -> Option<Value> {
-        let text = text.trim_start();
-        let parse_tail = text
-            .strip_prefix("JSON.parse")
-            .map(str::trim_start)
-            .and_then(|tail| tail.strip_prefix('('));
-        if let Some(tail) = parse_tail {
-            let encoded = js_string(tail)?;
-            return first_json_value(&encoded);
-        }
-        first_json_value(text)
-    }
-    fn first_text_value(text: &str) -> Option<Value> {
-        first_json_value(text).or_else(|| js_string(text).map(Value::String))
-    }
-    fn initial_state(page: &str) -> Option<Value> {
-        for marker in [
-            "window.__INITIAL_STATE__",
-            "self.__INITIAL_STATE__",
-            "__INITIAL_STATE__",
-        ] {
-            let mut offset = 0;
-            while let Some(relative) = page.get(offset..)?.find(marker) {
-                let start = offset + relative + marker.len();
-                let tail = page.get(start..)?.trim_start();
-                let tail = tail
-                    .strip_prefix('=')
-                    .or_else(|| tail.strip_prefix(':'))
-                    .map(str::trim_start);
-                if let Some(value) = tail.and_then(assigned_json) {
-                    return Some(value);
-                }
-                offset = start;
-            }
-        }
-        None
     }
     fn logged_out(value: &Value) -> bool {
         ["isLogin", "isLoggedIn", "loggedIn"].iter().any(|key| {

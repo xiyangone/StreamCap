@@ -32,14 +32,9 @@ pub fn HomeView() -> impl IntoView {
         })
     };
     let attention = move || {
-        state.recordings.with(|items| {
-            items
-                .iter()
-                .filter(|r| {
-                    !r.is_recording && r.recording_error.as_ref().is_some_and(|e| !e.is_empty())
-                })
-                .count()
-        })
+        state
+            .recordings
+            .with(|items| items.iter().filter(|r| r.needs_attention()).count())
     };
     let recent = move || {
         let mut items = state.recordings.get();
@@ -78,7 +73,7 @@ pub fn HomeView() -> impl IntoView {
                 <section class="capture-panel glass">
                     <div class="capture-copy"><span class="live-label"><i class="status-dot" />{t("自动录制")}</span>
                         <h2>{move || if active() > 0 { crate::tr_format!("{} 路直播，正在记录", active()) } else if waiting() > 0 { t("正在等待直播开播").into() } else { t("添加直播间，开始自动录制").into() }}</h2>
-                        <p>{move || if attention() > 0 { t("有录制未成功的任务，请查看下方提示。") } else if waiting() > 0 || active() > 0 { t("监控已开启，无需逐个点击录制。") } else { t("新增直播间会自动开启监控。") }}</p>
+                        <p>{move || if attention() > 0 { t("有需要处理的任务，请查看下方提示。") } else if waiting() > 0 || active() > 0 { t("监控已开启，无需逐个点击录制。") } else { t("新增直播间会自动开启监控。") }}</p>
                         <div class="workbench-actions"><a class="button secondary small" href="/recordings">{t("管理直播间")}<Icon name="arrow" size=15 /></a><a class="text-link" href="/storage">{t("打开媒体库")}<Icon name="folder" size=15 /></a></div>
                         <div class="workbench-service" role="status"><span class:healthy=move || state.status.get().ok><i class="status-dot" />{move || if state.status.get().ok { t("本地服务已连接") } else {t("本地服务未连接")}}</span><span class:unhealthy=move || !state.status.get().resolver_ready>{move || if state.status.get().resolver_ready {t("解析已就绪")} else {t("解析暂不可用")}}</span></div>
                     </div>

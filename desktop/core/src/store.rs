@@ -158,6 +158,8 @@ impl Store {
             updated.streamer_name = anchor.to_string();
             updated.update_title();
         }
+        updated.check_error = None;
+        updated.verification_required = false;
         updated.is_live = info.is_live;
         updated.live_title = (info.is_live && !info.title.is_empty()).then(|| info.title.clone());
         if !info.is_live {
