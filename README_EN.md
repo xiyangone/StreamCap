@@ -13,7 +13,7 @@ StreamCap uses **Rust, Tauri 2 and Leptos/WASM**. The supported release target i
 - Scheduled/countdown shutdown with a cancellable 60-second warning; recording and processing finish before shutdown, without forcing other applications closed.
 - Integrated window controls, close/tray preferences, native folder selection, Chinese/English UI, shortcuts, last-page restoration, explicit release checks and verified FFmpeg installation.
 
-Only the native Rust pipeline is maintained. Python/Flet, Docker Web and former macOS entrypoints are retired. Refreshing the interface no longer triggers platform checks; use monitoring or an explicit manual check.
+Only the native Rust pipeline is maintained. Python/Flet, Docker Web and former macOS entrypoints are retired. New or resumed monitors receive an initial check, then retain independent configured intervals and platform pacing. Refreshing the interface never triggers platform checks.
 
 ## Runtime
 
@@ -25,7 +25,7 @@ User data defaults to %APPDATA%\StreamCap. Builds never overwrite tasks, cookies
 
 Automatic conversion and cleanup are snapshotted when recording starts. Manual library conversion keeps TS by default. The exact source is removed only after the MP4 passes track, codec, packet-count, duration and full-decode checks and is published under protection. Failed cleanup keeps both files and reports the problem; existing MP4 files are never replaced.
 
-Active TS preview reads a bounded 4 MiB tail. Compatibility containers and live sources use owned FFmpeg pipes, which are stopped and joined when closed. Live-source cache entries expire after five minutes; preview never starts an implicit platform request. Timestamp SRT files use actual segment durations; subtitle failure keeps source media.
+TS and compatibility previews support time-based seeking, including already-recorded portions of a growing recording and a return-to-latest control. ffprobe reads the recorded duration; FFmpeg seeks directly and streams at most 120 seconds per preview segment, continuing as needed without downloading the entire recording or creating a full MP4. Preview processes are cancelled and joined on close. Live-source cache entries expire after five minutes; preview never starts an implicit platform request. Timestamp SRT files use actual segment durations; subtitle failure keeps source media.
 
 Shutdown waits up to 30 seconds for remux work. Interrupted jobs are persisted in media_jobs.json and may resume only in the same recordings root with unchanged file identities and no existing destination, retaining the original cleanup preference. Historical recordings are never scanned or converted automatically. A 4500-second setting is a platform-check interval, not a recording duration.
 

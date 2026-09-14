@@ -48,7 +48,7 @@ pub fn AddRecordingDialog(open: RwSignal<bool>) -> impl IntoView {
                     let _ = open.try_set(false);
                     let _ = urls.try_set(String::new());
                     let _ = name.try_set(String::new());
-                    state.notify(crate::tr_format!("已添加 {count} 个直播间"));
+                    state.notify(crate::tr_format!("已添加 {count} 个直播间，已开启自动监控"));
                     if let Err(message) = gateway::refresh_recordings(state).await {
                         state.fail(crate::tr_format!("任务已添加，列表同步失败：{message}"));
                     }
@@ -62,7 +62,7 @@ pub fn AddRecordingDialog(open: RwSignal<bool>) -> impl IntoView {
     };
     view! {
         <Dialog open=Signal::derive(move || open.get()) title=t("添加直播间") busy=busy on_close=Callback::new(move |_| { open.set(false); error.set(None); })>
-            <p class="dialog-description">{t("把喜欢的直播间加入工作空间，开播后自动开始录制。")}</p>
+            <p class="dialog-description">{t("添加后自动监控直播状态，检测到开播后自动录制，无需手动开始。")}</p>
             <form on:submit=submit>
                 <label class="field"><span>{t("直播间地址")}<span class="required">" *"</span></span>
                     <textarea class="input url-input" rows="6" autofocus placeholder=t("每行一个 HTTP 或 HTTPS 地址") prop:value=move || urls.get()

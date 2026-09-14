@@ -31,3 +31,5 @@ Platform fixtures inject per-protocol HTTP responses; no production platform or 
 Media gates exercise each recording format with and without segmentation, verified cleanup, failure/locking, queue recovery, timestamp subtitles, native FLV downloading, compatibility previews and cached live-source previews. UI tests run the real release WASM with mocked account/tool/shutdown APIs and verify screenshots, player switching after cleanup, language, shortcuts and page restoration. They send no real notifications, power actions or user scripts.
 
 The Windows process-tree gate starts only a synthetic sleeping pwsh fixture and proves its owned descendants terminate with the Job Object. Project-local cargo-audit 0.22.2 and npm audit can supplement validation; retain the advisory database revision and reports.
+
+Time-seek validation uses a synthetic red/blue TS larger than 600 MiB, seeks forward and backward, and decodes the first returned frame. Native smoke drags the growing-recording timeline, returns to latest, and verifies recording remains active; changing only the displayed time is not a pass.

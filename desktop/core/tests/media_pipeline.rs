@@ -295,7 +295,7 @@ async fn media_recording_preview_follows_growth_then_stop_converts_to_mp4() {
         .unwrap();
     assert_eq!(info["isRecording"], true);
     let response = client
-        .get(format!("http://{}/api/media/preview", server.address()))
+        .get(format!("http://{}/api/media/transcode", server.address()))
         .query(&[("path", path.as_ref())])
         .send()
         .await
@@ -392,30 +392,33 @@ async fn media_shutdown_finishes_current_recording_and_waits_for_conversion() {
 }
 
 #[tokio::test]
-async fn preview_rejects_traversal_and_releases_finite_readers() {
+async fn preview_rejects_traversal_invalid_time_and_releases_slots() {
     let directory = tempfile::tempdir().unwrap();
     let state = api::bootstrap(Workspace::from_repo_root(directory.path()))
         .await
         .unwrap();
     let root = directory.path().join("downloads");
-    std::fs::create_dir_all(&root).unwrap();
     std::fs::write(root.join("finite.ts"), vec![0x47; 188 * 2]).unwrap();
-    assert!(state
-        .preview
-        .stream(&state.storage, root.clone(), "../outside.ts".into())
-        .await
-        .is_err());
-    let response = state
-        .preview
-        .stream(&state.storage, root, "finite.ts".into())
-        .await
-        .unwrap();
-    assert_eq!(state.preview.active(), 1);
-    let bytes = axum::body::to_bytes(response.into_body(), 1024)
-        .await
-        .unwrap();
-    assert_eq!(bytes.len(), 376);
-    assert_eq!(state.preview.active(), 0);
+    let missing_ffmpeg = root.join("must-not-execute.exe");
+    for (path, start) in [
+        ("../outside.ts", 0.0),
+        ("finite.ts", -1.0),
+        ("finite.ts", f64::NAN),
+        ("finite.ts", f64::INFINITY),
+    ] {
+        assert!(state
+            .preview
+            .transcode(
+                &state.storage,
+                root.clone(),
+                path.into(),
+                missing_ffmpeg.clone(),
+                start
+            )
+            .await
+            .is_err());
+        assert_eq!(state.preview.active(), 0);
+    }
     api::shutdown(&state).await.unwrap();
 }
 
@@ -714,6 +717,7 @@ async fn media_compatibility_and_live_preview_release_owned_ffmpeg() {
             root.path().join("downloads"),
             "fixture.mkv".into(),
             ffmpeg(),
+            0.0,
         )
         .await
         .unwrap();
@@ -880,5 +884,206 @@ async fn media_native_flv_download_needs_no_recording_subprocess() {
         .await
         .unwrap();
     assert!(probe.status.success());
+    api::shutdown(&state).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires STREAMCAP_TEST_FFMPEG; proves creating a loopback room starts recording automatically"]
+async fn media_added_room_starts_without_manual_record_action() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = state(directory.path(), true).await;
+    let fixture = source(sample_ts("12").await).await;
+    let server = Server::start(
+        state.clone(),
+        ServerOptions {
+            port: 0,
+            monitoring: true,
+        },
+    )
+    .await
+    .unwrap();
+    let client = reqwest::Client::new();
+    let created: serde_json::Value = client
+        .post(format!("http://{}/api/recordings", server.address()))
+        .json(&json!({"url":fixture.url,"streamerName":"automatic"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = created["created"][0]["recId"].as_str().unwrap();
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while !state.store.get(id).await.unwrap().is_recording {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("new monitored room must start without /start");
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    server.shutdown().await.unwrap();
+    let jobs = state.scheduler.postprocess.jobs();
+    assert!(!jobs.is_empty());
+    assert!(jobs.iter().all(|job| job.state == MediaJobState::Complete));
+    assert_eq!(state.engine.active_ids().await.len(), 0);
+    assert_eq!(
+        state.config.read().await.get_i64("loop_time_seconds", 0),
+        4500
+    );
+}
+
+async fn preview_first_pixel(
+    state: &api::ApiState,
+    root: &Path,
+    path: &str,
+    start: f64,
+) -> [u8; 3] {
+    use tokio::io::AsyncWriteExt;
+    let response = state
+        .preview
+        .transcode(
+            &state.storage,
+            root.to_path_buf(),
+            path.into(),
+            ffmpeg(),
+            start,
+        )
+        .await
+        .unwrap();
+    let mut stream = response.into_body().into_data_stream();
+    let mut prefix = Vec::new();
+    tokio::time::timeout(Duration::from_secs(8), async {
+        while prefix.len() < 12 * 1024 {
+            match stream.next().await {
+                Some(Ok(bytes)) => prefix.extend_from_slice(&bytes),
+                Some(Err(error)) => panic!("{error}"),
+                None => break,
+            }
+        }
+    })
+    .await
+    .unwrap();
+    drop(stream);
+    assert!(
+        prefix.len() < 256 * 1024,
+        "seeking must not download the full source"
+    );
+    let mut child = command(&ffmpeg())
+        .args([
+            "-v",
+            "error",
+            "-f",
+            "mpegts",
+            "-i",
+            "pipe:0",
+            "-frames:v",
+            "1",
+            "-pix_fmt",
+            "rgb24",
+            "-f",
+            "rawvideo",
+            "pipe:1",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&prefix)
+        .await
+        .unwrap();
+    let decoded = child.wait_with_output().await.unwrap();
+    assert!(
+        decoded.status.success(),
+        "frame decode: {}",
+        String::from_utf8_lossy(&decoded.stderr)
+    );
+    assert!(decoded.stdout.len() >= 3);
+    [decoded.stdout[0], decoded.stdout[1], decoded.stdout[2]]
+}
+
+#[tokio::test]
+#[ignore = "requires STREAMCAP_TEST_FFMPEG; synthesizes a 600MiB TS and seeks without downloading it"]
+async fn media_large_ts_seeks_forward_and_backward_without_full_conversion() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path(), false).await;
+    let root = dir.path().join("downloads");
+    let file = root.join("large-seek.ts");
+    let result = command(&ffmpeg())
+        .args([
+            "-v",
+            "error",
+            "-nostdin",
+            "-n",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=red:size=160x120:rate=10:d=15",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=blue:size=160x120:rate=10:d=15",
+            "-filter_complex",
+            "[0:v][1:v]concat=n=2:v=1:a=0[v]",
+            "-map",
+            "[v]",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-g",
+            "10",
+            "-pix_fmt",
+            "yuv420p",
+            "-muxrate",
+            "170000000",
+            "-f",
+            "mpegts",
+        ])
+        .arg(&file)
+        .output()
+        .await
+        .unwrap();
+    assert!(result.status.success());
+    assert!(std::fs::metadata(&file).unwrap().len() > 600 * 1024 * 1024);
+    let before =
+        streamcap_core::storage::source_identity(&std::fs::File::open(&file).unwrap()).unwrap();
+    let info = state
+        .preview
+        .info(
+            &state.storage,
+            root.clone(),
+            "large-seek.ts".into(),
+            Some(ffmpeg()),
+        )
+        .await
+        .unwrap();
+    assert!(info.seekable);
+    assert!((29.0..31.0).contains(&info.duration_seconds.unwrap()));
+    let blue = preview_first_pixel(&state, &root, "large-seek.ts", 24.0).await;
+    assert!(
+        blue[2] > 200 && blue[0] < 40,
+        "24s must be blue, not the first red frame: {blue:?}"
+    );
+    let red = preview_first_pixel(&state, &root, "large-seek.ts", 2.0).await;
+    assert!(
+        red[0] > 200 && red[2] < 40,
+        "backward seek must return to red: {red:?}"
+    );
+    assert_eq!(
+        streamcap_core::storage::source_identity(&std::fs::File::open(&file).unwrap()).unwrap(),
+        before
+    );
+    assert_eq!(
+        std::fs::read_dir(&root).unwrap().count(),
+        1,
+        "no full-file conversion or cache file"
+    );
+    state.preview.shutdown().await;
+    assert_eq!(state.preview.active(), 0);
     api::shutdown(&state).await.unwrap();
 }

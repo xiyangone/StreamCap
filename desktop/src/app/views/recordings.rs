@@ -6,7 +6,7 @@ use crate::{
             AddRecordingDialog, BatchEditDialog, CardInfoDialog, ConfirmDialog,
             EditRecordingDialog, EmptyState, Icon, PreviewDialog, RecordingCard,
         },
-        labels::platform_label,
+        labels::{platform_label, recording_priority},
     },
 };
 use leptos::prelude::*;
@@ -18,6 +18,7 @@ enum Filter {
     Live,
     Monitoring,
     Paused,
+    Attention,
 }
 impl Filter {
     fn matches(self, rec: &Recording) -> bool {
@@ -25,8 +26,11 @@ impl Filter {
             Self::All => true,
             Self::Recording => rec.is_recording,
             Self::Live => rec.is_live,
-            Self::Monitoring => rec.monitor_status && !rec.is_recording && !rec.is_live,
+            Self::Monitoring => rec.monitor_status && !rec.is_recording,
             Self::Paused => !rec.monitor_status,
+            Self::Attention => {
+                !rec.is_recording && rec.recording_error.as_ref().is_some_and(|e| !e.is_empty())
+            }
         }
     }
 }
@@ -73,14 +77,7 @@ pub fn RecordingsView() -> impl IntoView {
         if sorting.get() == "name" {
             items.sort_by_key(|r| r.name().to_lowercase());
         } else {
-            items.sort_by_key(|r| {
-                (
-                    !r.is_recording,
-                    !r.is_live,
-                    !r.monitor_status,
-                    r.name().to_lowercase(),
-                )
-            });
+            items.sort_by_key(|r| (recording_priority(r), r.name().to_lowercase()));
         }
         items
     });
@@ -223,10 +220,10 @@ pub fn RecordingsView() -> impl IntoView {
     });
     view! {
         <div class="page recordings-page">
-            <header class="page-header"><div><h1>{t("录制任务")}<span class="heading-count">{move || state.recordings.get().len()}</span></h1><p>{t("管理你的直播间，让录制井然有序。")}</p></div><div class="header-actions"><button class="button secondary" disabled=move || busy.get() on:click=refresh><Icon name="refresh" size=17 />{t("刷新列表")}</button><button class="button primary" on:click=move |_| add.set(true)><Icon name="plus" size=18 />{t("添加直播间")}</button></div></header>
+            <header class="page-header"><div><h1>{t("录制任务")}<span class="heading-count">{move || state.recordings.get().len()}</span></h1><p>{t("新增直播间自动监控，开播后自动录制；单次录制用于手动操作。")}</p></div><div class="header-actions"><button class="button secondary" disabled=move || busy.get() on:click=refresh><Icon name="refresh" size=17 />{t("刷新列表")}</button><button class="button primary" on:click=move |_| add.set(true)><Icon name="plus" size=18 />{t("添加直播间")}</button></div></header>
             <section class="task-toolbar glass" aria-label=t("任务筛选")>
                 <div class="filter-tabs" role="group" aria-label=t("状态筛选")>
-                    {[(Filter::All,t("全部")),(Filter::Recording,t("录制中")),(Filter::Live,t("直播中")),(Filter::Monitoring,t("监控中")),(Filter::Paused,t("已暂停"))].into_iter().map(|(mode,label)| view! {
+                    {[(Filter::All,t("全部")),(Filter::Attention,t("需关注")),(Filter::Recording,t("录制中")),(Filter::Live,t("直播中")),(Filter::Monitoring,t("监控中")),(Filter::Paused,t("已暂停"))].into_iter().map(|(mode,label)| view! {
                         <button class="filter-tab" class:active=move || filter.get() == mode aria-pressed=move || (filter.get() == mode).to_string() on:click=move |_| filter.set(mode)>{label}<span>{move || state.recordings.with(|items| items.iter().filter(|r| mode.matches(r)).count())}</span></button>
                     }).collect_view()}
                 </div>

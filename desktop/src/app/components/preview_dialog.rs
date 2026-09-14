@@ -120,7 +120,6 @@ pub fn MediaPlayer(#[prop(into)] path: Signal<String>) -> impl IntoView {
 pub fn PreviewDialog(target: RwSignal<Option<Recording>>) -> impl IntoView {
     let state = gateway::app_state();
     let files = RwSignal::new(Vec::<RecordingFile>::new());
-    let directory = RwSignal::new(String::new());
     let playing = RwSignal::new(String::new());
     let loading = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
@@ -161,7 +160,6 @@ pub fn PreviewDialog(target: RwSignal<Option<Recording>>) -> impl IntoView {
         if previous.get_value() != current_id {
             files.set(Vec::new());
             playing.set(String::new());
-            directory.set(String::new());
             previous.set_value(current_id);
         }
         error.set(None);
@@ -177,7 +175,6 @@ pub fn PreviewDialog(target: RwSignal<Option<Recording>>) -> impl IntoView {
             }
             match result {
                 Ok(result) => {
-                    directory.set(result.dir.unwrap_or_default());
                     let current = playing.get_untracked();
                     if !current.is_empty()
                         && !current.starts_with("live:")
@@ -215,12 +212,6 @@ pub fn PreviewDialog(target: RwSignal<Option<Recording>>) -> impl IntoView {
             loading.set(false);
         });
     });
-    let processing = move || {
-        state.media_jobs.with(|jobs| {
-            jobs.iter()
-                .any(|j| j.source == playing.get() && j.pending())
-        })
-    };
     let media_message = move || {
         state.media_jobs.with(|jobs| {
             jobs.iter()
@@ -229,28 +220,6 @@ pub fn PreviewDialog(target: RwSignal<Option<Recording>>) -> impl IntoView {
                 .map(|j| j.message.clone())
                 .unwrap_or_default()
         })
-    };
-    let copy_directory = move |_| {
-        let text = directory.get_untracked();
-        leptos::task::spawn_local(async move {
-            match js_sys::futures::JsFuture::from(
-                window().navigator().clipboard().write_text(&text),
-            )
-            .await
-            {
-                Ok(_) => state.notify(t("保存目录已复制")),
-                Err(_) => state.fail(t("无法访问剪贴板，请手动复制保存目录")),
-            }
-        });
-    };
-    let convert = move |_| {
-        let current = playing.get_untracked();
-        leptos::task::spawn_local(async move {
-            match gateway::remux_file(&current).await {
-                Ok(()) => state.notify(t("已加入转 MP4 队列，原 TS 保留")),
-                Err(error) => state.fail(error),
-            }
-        });
     };
     view! {
         <Dialog open=Signal::derive(move || target.get().is_some()) title=t("录制预览") wide=true on_close=Callback::new(move |_| target.set(None))>
@@ -265,8 +234,6 @@ pub fn PreviewDialog(target: RwSignal<Option<Recording>>) -> impl IntoView {
                 view! { <button role="listitem" class="preview-file" class:active=move || playing.get() == active_path on:click=move |_| playing.set(path.clone())><Icon name="file" size=17 /><span>{file.name}</span><small>{human_size(file.size)}<br />{crate::app::labels::modified_time(Some(file.modified))}</small></button> }
             }).collect_view()}</div>
             <Show when=move || !media_message().is_empty()><p class="media-job-status" role="status">{media_message}</p></Show>
-            <Show when=move || !directory.get().is_empty()><div class="directory-note"><Icon name="folder" size=16 /><span>{move || directory.get()}</span><button class="icon-button" aria-label=t("复制保存目录") on:click=copy_directory><Icon name="copy" size=15 /></button></div></Show>
-            <footer class="modal-actions"><Show when=move || extension(&playing.get()) == "ts"><button class="button secondary" disabled=processing on:click=convert><Icon name="refresh" size=16 />{t("转为 MP4")}</button></Show><button class="button secondary" on:click=move |_| target.set(None)>{t("关闭预览")}</button></footer>
         </Dialog>
     }
 }

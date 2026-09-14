@@ -153,7 +153,6 @@ pub struct RecordingFile {
 }
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct RecordingFiles {
-    pub dir: Option<String>,
     #[serde(default)]
     pub files: Vec<RecordingFile>,
 }

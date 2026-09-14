@@ -192,9 +192,60 @@ pub fn parse_recordings(raw: &str) -> Result<Vec<NewRecording>, String> {
     Ok(items)
 }
 
+/// Keep failures and active captures visible in both dashboard and task sorting.
+pub fn recording_priority(record: &crate::api::gateway::Recording) -> u8 {
+    if !record.is_recording
+        && record
+            .recording_error
+            .as_ref()
+            .is_some_and(|e| !e.is_empty())
+    {
+        0
+    } else if record.is_recording {
+        1
+    } else if record.is_live && record.monitor_status {
+        2
+    } else if record.monitor_status {
+        3
+    } else {
+        4
+    }
+}
+
+pub fn monitoring_label(record: &crate::api::gateway::Recording) -> &'static str {
+    if !record.monitor_status {
+        t("监控已暂停")
+    } else if record.only_notify_no_record == Some(true) {
+        t("仅通知，不录制")
+    } else if record.scheduled_recording == Some(true) {
+        t("按时间段自动监控")
+    } else {
+        t("自动监控，开播即录")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn monitoring_labels_and_attention_order_are_explicit() {
+        use crate::api::gateway::Recording;
+        let mut record = Recording::default();
+        assert_eq!(monitoring_label(&record), "监控已暂停");
+        record.monitor_status = true;
+        assert_eq!(monitoring_label(&record), "自动监控，开播即录");
+        record.only_notify_no_record = Some(true);
+        assert_eq!(monitoring_label(&record), "仅通知，不录制");
+        record.only_notify_no_record = Some(false);
+        record.scheduled_recording = Some(true);
+        assert_eq!(monitoring_label(&record), "按时间段自动监控");
+        record.recording_error = Some("fixture".into());
+        assert_eq!(recording_priority(&record), 0);
+        record.is_recording = true;
+        assert_eq!(recording_priority(&record), 1);
+        assert_eq!(duration(3661.9), "01:01:01");
+        assert_eq!(duration(f64::INFINITY), "00:00:00");
+    }
     #[test]
     fn labels_are_readable() {
         assert_eq!(quality_label(Some("OD")), "原画");
@@ -225,7 +276,11 @@ mod tests {
 }
 
 pub fn duration(seconds: f64) -> String {
-    let seconds = seconds.max(0.0) as u64;
+    let seconds = if seconds.is_finite() {
+        seconds.max(0.0) as u64
+    } else {
+        0
+    };
     format!(
         "{:02}:{:02}:{:02}",
         seconds / 3600,

@@ -769,3 +769,70 @@ async fn media_conversion_and_explicit_cleanup_settings_are_valid() {
     )
     .is_ok());
 }
+
+#[tokio::test]
+async fn creating_and_resuming_a_monitor_schedules_checks_without_start_requests() {
+    use streamcap_core::service::{Server, ServerOptions};
+    let dir = tempfile::tempdir().unwrap();
+    let state = bootstrap(Workspace::from_repo_root(dir.path()))
+        .await
+        .unwrap();
+    state.config.write().await.update_user_config(json!({"loop_time_seconds":"4500","platform_request_interval":"0","only_notify_no_record":true}).as_object().unwrap().clone()).unwrap();
+    let server = Server::start(
+        state.clone(),
+        ServerOptions {
+            port: 0,
+            monitoring: true,
+        },
+    )
+    .await
+    .unwrap();
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", server.address());
+    let created: Value = client
+        .post(format!("{base}/api/recordings"))
+        .json(&json!({"url":"http://127.0.0.1:1/fixture.mp4","streamerName":"automatic"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = created["created"][0]["recId"].as_str().unwrap();
+    assert_eq!(created["created"][0]["monitorStatus"], true);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !state.store.get(id).await.unwrap().is_live {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(state.engine.active_ids().await.is_empty());
+    assert!(client
+        .post(format!("{base}/api/recordings/{id}/monitor"))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_success());
+    state.store.update(id, |r| r.is_live = false).await;
+    assert!(client
+        .post(format!("{base}/api/recordings/{id}/monitor"))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_success());
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !state.store.get(id).await.unwrap().is_live {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        state.config.read().await.get_i64("loop_time_seconds", 0),
+        4500
+    );
+    server.shutdown().await.unwrap();
+}
