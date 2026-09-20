@@ -117,8 +117,8 @@ pub fn RecordingCard(
                 <Show when=move || record.get().check_error.is_some()>
                     <div class="card-check-error" role="status" title=move || record.get().check_error.unwrap_or_default()>
                         <span><Icon name="alert" size=14 />{move || if record.get().verification_required { t("请在快手窗口完成验证").to_string() } else { crate::tr_format!("检测失败：{}",record.get().check_error.unwrap_or_default()) }}</span>
-                        <Show when=move || record.get().verification_required>
-                            <button class="button secondary small card-verify" type="button" disabled=move || busy.get() || !state.status.get().ok || !crate::api::desktop::state().available on:click=move |_|perform.run(Action::Verify)>{t("重新验证")}</button>
+                        <Show when=move || record.get().verification_required || matches!(record.get().access_state.as_str(), "pageCheck" | "unavailable" | "loginPrompt")>
+                            <button class="button secondary small card-verify" type="button" disabled=move || busy.get() || !state.status.get().ok || !crate::api::desktop::state().available on:click=move |_|perform.run(Action::Verify)>{move || if record.get().verification_required { t("重新验证") } else { t("检查页面") }}</button>
                         </Show>
                     </div>
                 </Show>
@@ -138,14 +138,47 @@ pub fn RecordingCard(
                     <Show when=move || record.get().is_recording fallback=|| view! { <Icon name="play" size=14 /> }><Icon name="stop" size=14 /></Show>{move || if record.get().is_recording { t("停止录制") } else { t("单次录制") }}
                 </button>
                 </div>
-                <div class="card-tools">
-                    <button class="icon-button" aria-label=t("检测直播状态") title=move || if record.get().monitor_status {t("检测状态（已开播时会启动录制）")} else {t("请先开启监控")} disabled=move || busy.get() || !record.get().monitor_status || record.get().verification_required || !state.status.get().resolver_ready on:click=move |_| perform.run(Action::Check)><Icon name="refresh" size=16 /></button>
-                    <button class="button secondary small card-preview" aria-label=t("预览录制文件") title=t("预览录制文件") on:click=move |_| on_preview.run(record.get_untracked())><Icon name="eye" size=16 />{t("预览")}</button>
-                    <button class="icon-button" aria-label=t("编辑任务") title=move || if record.get().is_recording { t("请先停止录制") } else { t("编辑任务") } disabled=move || busy.get() || record.get().is_recording || !state.status.get().ok on:click=move |_| on_edit.run(record.get_untracked())><Icon name="edit" size=16 /></button>
-                    <button class="icon-button danger-text" aria-label=t("删除任务") title=t("移除任务，保留录制文件") disabled=move || busy.get() || record.get().is_recording || !state.status.get().ok on:click=move |_| deleting.set(true)><Icon name="trash" size=16 /></button>
+                <div class="card-tools" role="group" aria-label=t("任务操作")>
+                    <CardTool label=t("检测直播状态") icon="refresh"
+                        hint=Signal::derive(move || if busy.get() { t("操作正在进行，请稍候") } else if !state.status.get().ok { t("本地服务未连接") } else if record.get().verification_required { t("请先完成快手验证") } else if !state.status.get().resolver_ready { t("直播解析服务尚未就绪") } else if !record.get().monitor_status { t("请先开启监控") } else { t("检测状态（已开播时会启动录制）") }.to_string())
+                        disabled=Signal::derive(move || busy.get() || !state.status.get().ok || !record.get().monitor_status || record.get().verification_required || !state.status.get().resolver_ready)
+                        on_click=Callback::new(move |_| perform.run(Action::Check)) />
+                    <CardTool label=t("预览录制文件") icon="eye"
+                        hint=Signal::derive(move || t("预览录制文件").to_string()) disabled=Signal::derive(|| false)
+                        on_click=Callback::new(move |_| on_preview.run(record.get_untracked())) />
+                    <CardTool label=t("编辑任务") icon="edit"
+                        hint=Signal::derive(move || if record.get().is_recording { t("请先停止录制") } else if busy.get() { t("操作正在进行，请稍候") } else if !state.status.get().ok { t("本地服务未连接") } else { t("编辑任务") }.to_string())
+                        disabled=Signal::derive(move || busy.get() || record.get().is_recording || !state.status.get().ok)
+                        on_click=Callback::new(move |_| on_edit.run(record.get_untracked())) />
+                    <CardTool label=t("删除任务") icon="trash" danger=true
+                        hint=Signal::derive(move || if record.get().is_recording { t("请先停止录制") } else if busy.get() { t("操作正在进行，请稍候") } else if !state.status.get().ok { t("本地服务未连接") } else { t("移除任务，保留录制文件") }.to_string())
+                        disabled=Signal::derive(move || busy.get() || record.get().is_recording || !state.status.get().ok)
+                        on_click=Callback::new(move |_| deleting.set(true)) />
                 </div>
             </div>
         </article>
         <ConfirmDialog open=deleting title=t("移除直播间") description=Signal::derive(move || crate::tr_format!("将从工作空间移除“{}”。已有录制文件不会被删除。", record.get().name())) busy=busy on_confirm=delete />
+    }
+}
+
+#[component]
+fn CardTool(
+    label: &'static str,
+    icon: &'static str,
+    hint: Signal<String>,
+    disabled: Signal<bool>,
+    on_click: Callback<()>,
+    #[prop(default = false)] danger: bool,
+) -> impl IntoView {
+    view! {
+        <span class="card-tool" data-tooltip=move || hint.get()
+            tabindex=move || if disabled.get() { "0" } else { "-1" }
+            role="group" aria-label=move || hint.get()>
+            <button class=if danger { "icon-button danger-text" } else { "icon-button" }
+                type="button" aria-label=label aria-description=move || hint.get()
+                disabled=move || disabled.get() on:click=move |_| on_click.run(())>
+                <Icon name=icon size=18 />
+            </button>
+        </span>
     }
 }

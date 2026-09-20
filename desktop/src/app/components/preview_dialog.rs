@@ -23,11 +23,13 @@ extern "C" {
         origin: &str,
         path: &str,
         on_state: &js_sys::Function,
+        on_capture: &js_sys::Function,
     ) -> js_sys::Function;
 }
 struct PlayerSession {
     dispose: js_sys::Function,
     _state: Closure<dyn FnMut(String, String)>,
+    _capture: Closure<dyn FnMut()>,
 }
 impl Drop for PlayerSession {
     fn drop(&mut self) {
@@ -86,15 +88,30 @@ pub fn MediaPlayer(#[prop(into)] path: Signal<String>) -> impl IntoView {
             let _ = phase.try_set(state);
             let _ = message.try_set(crate::app::i18n::message(text));
         });
+        let capture_path = current.clone();
+        let capture = Closure::<dyn FnMut()>::new(move || match capture_frame(&capture_path) {
+            Ok(image) => {
+                let current = capture_path.clone();
+                leptos::task::spawn_local(async move {
+                    match gateway::save_screenshot(&current, &image).await {
+                        Ok(_) => app.notify(t("截图已保存")),
+                        Err(error) => app.fail(error),
+                    }
+                });
+            }
+            Err(_) => app.fail(t("请先播放视频再截图")),
+        });
         let dispose = attach_media(
             element.unchecked_ref(),
             &gateway::gateway_base(),
             &current,
             callback.as_ref().unchecked_ref(),
+            capture.as_ref().unchecked_ref(),
         );
         session.set_value(Some(PlayerSession {
             dispose,
             _state: callback,
+            _capture: capture,
         }));
     });
     on_cleanup(move || {
@@ -109,7 +126,6 @@ pub fn MediaPlayer(#[prop(into)] path: Signal<String>) -> impl IntoView {
                     <div class="audio-art"><Icon name="volume" size=46 /><span>"AUDIO RECORDING"</span></div>
                     <audio class="audio-player" controls preload="metadata" aria-label=t("录制音频预览") src=move || gateway::video_url(&path.get()) on:error=move |_| { phase.set("error".into()); message.set(t("无法播放此音频，原始文件未改动。").into()); } />
                 </Show>
-                <Show when=move||!audio()&&!path.get().starts_with("live:")><button class="button secondary small" type="button" on:click=move |_|{let current=path.get_untracked();match capture_frame(&current){Ok(image)=>leptos::task::spawn_local(async move{match gateway::save_screenshot(&current,&image).await{Ok(_)=>app.notify(t("截图已保存")),Err(error)=>app.fail(error)}}),Err(_)=>app.fail(t("请先播放视频再截图"))}} >{t("保存截图")}</button></Show>
             <Show when=move || !message.get().is_empty()><div class="player-message" class:player-error=move || phase.get() == "error" role="status"><Icon name="info" size=17 /><span>{move || message.get()}</span></div></Show>
             </Show>
         </div>
@@ -124,8 +140,7 @@ pub fn PreviewDialog(target: RwSignal<Option<Recording>>) -> impl IntoView {
     let loading = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
     let revision = RwSignal::new(0_u32);
-    let refresh = RwSignal::new(0_u32);
-    let previous = StoredValue::new(None::<String>);
+    let target_id = Memo::new(move |_| target.get().map(|rec| rec.rec_id));
     Effect::new(move |_| {
         let current = playing.get();
         let jobs = state.media_jobs.get();
@@ -137,79 +152,68 @@ pub fn PreviewDialog(target: RwSignal<Option<Recording>>) -> impl IntoView {
             playing.set(job.output.clone());
         }
     });
-    let timer = StoredValue::new_local(Some(gloo_timers::callback::Interval::new(
-        2000,
-        move || {
-            if target.try_get_untracked().flatten().is_some() {
-                let _ = refresh.try_update(|v| *v = v.wrapping_add(1));
-            }
-        },
-    )));
-    on_cleanup(move || {
-        timer.update_value(|value| {
-            value.take();
-        });
-    });
     Effect::new(move |_| {
-        let current = target.get();
-        let _ = refresh.get();
-        let _ = state.media_jobs.get();
+        let current_id = target_id.get();
         let generation = revision.get_untracked().wrapping_add(1);
         revision.set(generation);
-        let current_id = current.as_ref().map(|r| r.rec_id.clone());
-        if previous.get_value() != current_id {
-            files.set(Vec::new());
-            playing.set(String::new());
-            previous.set_value(current_id);
-        }
+        files.set(Vec::new());
+        playing.set(String::new());
         error.set(None);
-        let Some(rec) = current else {
+        let Some(rec_id) = current_id else {
             loading.set(false);
             return;
         };
-        loading.set(files.get_untracked().is_empty());
+        loading.set(true);
         leptos::task::spawn_local(async move {
-            let result = gateway::fetch_recording_files(&rec.rec_id).await;
-            if revision.try_get_untracked() != Some(generation) {
-                return;
-            }
-            match result {
-                Ok(result) => {
-                    let current = playing.get_untracked();
-                    if !current.is_empty()
-                        && !current.starts_with("live:")
-                        && !result.files.iter().any(|f| f.path == current)
-                    {
-                        if let Some(job) = state
-                            .media_jobs
-                            .get_untracked()
-                            .iter()
-                            .rev()
-                            .find(|j| j.source == current && j.source_removed)
+            // One request per target; slow disks must not invalidate their own responses.
+            loop {
+                let result = gateway::fetch_recording_files(&rec_id).await;
+                if revision.try_get_untracked() != Some(generation) {
+                    return;
+                }
+                match result {
+                    Ok(result) => {
+                        error.set(None);
+                        let current = playing.get_untracked();
+                        if !current.is_empty()
+                            && !current.starts_with("live:")
+                            && !result.files.iter().any(|f| f.path == current)
                         {
-                            if result.files.iter().any(|f| f.path == job.output) {
-                                playing.set(job.output.clone());
+                            if let Some(job) = state
+                                .media_jobs
+                                .get_untracked()
+                                .iter()
+                                .rev()
+                                .find(|j| j.source == current && j.source_removed)
+                            {
+                                if result.files.iter().any(|f| f.path == job.output) {
+                                    playing.set(job.output.clone());
+                                } else {
+                                    playing.set(String::new());
+                                }
                             } else {
                                 playing.set(String::new());
                             }
-                        } else {
-                            playing.set(String::new());
                         }
+                        if playing.get_untracked().is_empty() {
+                            playing.set(
+                                result
+                                    .files
+                                    .first()
+                                    .map(|f| f.path.clone())
+                                    .unwrap_or_default(),
+                            );
+                        }
+                        files.set(result.files);
                     }
-                    if playing.get_untracked().is_empty() {
-                        playing.set(
-                            result
-                                .files
-                                .first()
-                                .map(|f| f.path.clone())
-                                .unwrap_or_default(),
-                        );
-                    }
-                    files.set(result.files);
+                    Err(message) => error.set(Some(message)),
                 }
-                Err(message) => error.set(Some(message)),
+                loading.set(false);
+                gateway::sleep_ms(2000).await;
+                if revision.try_get_untracked() != Some(generation) {
+                    return;
+                }
             }
-            loading.set(false);
         });
     });
     let media_message = move || {
@@ -223,12 +227,15 @@ pub fn PreviewDialog(target: RwSignal<Option<Recording>>) -> impl IntoView {
     };
     view! {
         <Dialog open=Signal::derive(move || target.get().is_some()) title=t("录制预览") wide=true on_close=Callback::new(move |_| target.set(None))>
-            <p class="dialog-description">{move || target.get().map(|rec| rec.name()).unwrap_or_default()}</p>
-            <Show when=move || target.get().is_some_and(|rec|rec.is_live)><button class="button secondary small" type="button" on:click=move |_|{if let Some(rec)=target.get_untracked(){playing.set(format!("live:{}",rec.rec_id));}}>{t("预览直播源")}</button><p class="field-hint">{t("直播源缓存有效期 5 分钟，过期后请先手动检测。预览不会新增录制文件。")}</p></Show>
+            <div class="preview-heading">
+                <div class="preview-context"><Icon name="video" size=21 /><div><span class="preview-eyebrow">{t("录制文件")}</span><p class="preview-title">{move || target.get().map(|rec| rec.name()).unwrap_or_default()}</p></div></div>
+                <Show when=move || target.get().is_some_and(|rec| rec.is_live)><button class="button secondary small" type="button" title=t("直播源缓存有效期 5 分钟，过期后请先手动检测。预览不会新增录制文件。") on:click=move |_| { if let Some(rec)=target.get_untracked() { playing.set(format!("live:{}",rec.rec_id)); } }><Icon name="video" size=15 />{t("预览直播源")}</button></Show>
+            </div>
             <Show when=move || loading.get()><div class="loading-state"><span class="spinner" />{t("正在读取录制文件…")}</div></Show>
             <Show when=move || error.get().is_some()><p class="field-error" role="alert">{move || error.get().unwrap_or_default()}</p></Show>
             <Show when=move || !loading.get() && error.get().is_none() && files.get().is_empty() && playing.get().is_empty()><EmptyState icon="video" title=t("还没有录制文件") description=t("TS 开始写入后可在这里预览，文件大小会自动更新。") /></Show>
             <Show when=move || !playing.get().is_empty()><MediaPlayer path=Signal::derive(move || playing.get()) /></Show>
+            <div class="preview-files-heading"><span>{t("录制文件")}<small>{move || files.get().len()}</small></span><span class="preview-current-file" title=move || playing.get()>{move || playing.get().rsplit(['/', '\\']).next().unwrap_or_default().to_string()}</span></div>
             <div class="preview-file-list" role="list" aria-label=t("录制文件")>{move || files.get().into_iter().map(|file| {
                 let path = file.path.clone(); let active_path = path.clone();
                 view! { <button role="listitem" class="preview-file" class:active=move || playing.get() == active_path on:click=move |_| playing.set(path.clone())><Icon name="file" size=17 /><span>{file.name}</span><small>{human_size(file.size)}<br />{crate::app::labels::modified_time(Some(file.modified))}</small></button> }

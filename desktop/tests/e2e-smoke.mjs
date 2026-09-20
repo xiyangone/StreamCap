@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { createHarness, eventually, go, hidden, inspectLayout, visible, waitTheme } from './ui-fixtures.mjs';
+import { EventEmitter } from 'node:events';
+import { createHarness, eventually, go, hidden, inspectLayout, streamPreviewFixture, visible, waitTheme } from './ui-fixtures.mjs';
 
 const h = await createHarness('interaction');
 const { page, state } = h;
@@ -10,6 +11,11 @@ const requests = (method, path) => state.requests.filter((r) => r.method === met
 const record = (id) => state.recordings.find((r) => r.recId === id);
 const waitState = (read, predicate, message) => eventually(read, predicate, message);
 const navigate = async (name) => { await page.getByRole('navigation', { name: '主导航' }).getByRole('link', { name }).click(); };
+const fetchFixture = route => {
+  const url = new URL(route.request().url());
+  // Route.fetch bypasses context routing; never contact the application's default port.
+  return route.fetch({ url: h.base + url.pathname + url.search, maxRedirects: 0, timeout: 5000 });
+};
 let failure;
 async function step(name, action) {
   await action();
@@ -19,6 +25,39 @@ async function step(name, action) {
 }
 
 try {
+  await step('预览夹具在准备中取消、流中取消和正常结束后均归零', async () => {
+    for (const phase of ['already-closed', 'preparing', 'streaming', 'complete']) {
+      const counters = { activePreviews: 0, maxActivePreviews: 0, previewStarts: [] };
+      const response = new EventEmitter();
+      const chunks = [];
+      response.destroyed = phase === 'already-closed';
+      response.writeHead = () => { assert.equal(response.destroyed, false); };
+      response.write = chunk => { assert.equal(response.destroyed, false); chunks.push(chunk); };
+      const close = () => { response.destroyed = true; response.emit('close'); };
+      response.end = close;
+      let release, prepared = false;
+      const bytes = new Promise(resolve => { release = resolve; });
+      const pending = streamPreviewFixture(response, () => { prepared = true; return bytes; }, counters, { path: '/api/media/transcode', start: 0 });
+      try {
+        assert.equal(prepared, phase !== 'already-closed');
+        if (phase === 'preparing') close();
+        release(Buffer.alloc(8192));
+        if (phase === 'streaming') {
+          await waitState(() => counters.activePreviews, n => n === 1, '流式夹具进入活动状态');
+          close();
+        }
+        await pending;
+        close();
+        assert.equal(counters.activePreviews, 0, phase + ' 不得泄漏或重复递减');
+        const started = phase === 'streaming' || phase === 'complete';
+        assert.equal(counters.maxActivePreviews, Number(started));
+        assert.equal(counters.previewStarts.length, Number(started));
+        assert.equal(chunks.length > 0, started);
+      } finally {
+        close(); release(Buffer.alloc(0)); await pending;
+      }
+    }
+  });
   await step('真实 WASM 启动、初始任务与 SSE 连接', async () => {
     await go(page, h.base, '/home');
     await waitState(() => page.locator('.recording-card').count(), (n) => n === 6, '初始任务数量');
@@ -26,6 +65,101 @@ try {
     const layout = await inspectLayout(page);
     assert.equal(layout.dialogs, 0); assert.ok(layout.glass.includes('blur'));
     await h.shot('01-home-light');
+  });
+  await step('慢于两秒的文件列表仍能加载，且只保留一个在途请求', async () => {
+    await navigate('录制任务');
+    const pattern = '**/api/recordings/fixture-1/files';
+    let active = 0, maximum = 0, completed = 0, count = 0;
+    const handler = async route => {
+      count++; active++; maximum = Math.max(maximum, active);
+      try {
+        const response = await fetchFixture(route);
+        await new Promise(resolve => setTimeout(resolve, 2600));
+        await route.fulfill({ response }); completed++;
+      } finally { active--; }
+    };
+    await page.route(pattern, handler);
+    const modal = dialog('录制预览');
+    try {
+      await card('fixture-1').getByRole('button', { name: '预览录制文件' }).click();
+      await visible(modal.locator('.loading-state'));
+      await waitState(() => modal.locator('.preview-file').count(), n => n > 0, '慢响应首次预览列表');
+      await hidden(modal.locator('.loading-state'));
+      await waitState(() => completed, n => n >= 2, '完成后才安排下一次刷新');
+      assert.equal(maximum, 1, '同一预览目标不得并发刷新');
+      await h.shot('regression-slow-preview');
+      await modal.getByRole('button', { name: '关闭对话框', exact: true }).click();
+      const closedCount = count;
+      await new Promise(resolve => setTimeout(resolve, 2250));
+      assert.equal(count, closedCount, '关闭弹窗后不得继续刷新');
+    } finally {
+      if (await modal.isVisible()) await page.keyboard.press('Escape');
+      await page.unroute(pattern, handler);
+    }
+  });
+  await step('旧列表快照不能恢复 SSE 已删除任务或回退更新', async () => {
+    const original = structuredClone(state.recordings);
+    const pattern = '**/api/recordings';
+    let release, captured;
+    const gate = new Promise(resolve => { release = resolve; });
+    const ready = new Promise(resolve => { captured = resolve; });
+    const handler = async route => {
+      const response = await fetchFixture(route);
+      captured(); await gate; await route.fulfill({ response });
+    };
+    await page.route(pattern, handler);
+    try {
+      const completed = page.waitForResponse(response => new URL(response.url()).pathname === '/api/recordings' && response.status() === 200);
+      h.emit('resync', {}); await ready;
+      state.recordings = state.recordings.filter(rec => rec.recId !== 'fixture-2');
+      h.emit('delete', ['fixture-2']);
+      record('fixture-3').streamerName = '更新不能被旧快照覆盖'; h.emit('update', record('fixture-3'));
+      await waitState(() => card('fixture-2').count(), n => n === 0, 'SSE 删除已应用');
+      await visible(card('fixture-3').getByRole('button', { name: '更新不能被旧快照覆盖', exact: true }));
+      release(); await completed;
+      await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+      assert.equal(await card('fixture-2').count(), 0, '删除任务被旧快照恢复');
+      await visible(card('fixture-3').getByRole('button', { name: '更新不能被旧快照覆盖', exact: true }));
+      await h.shot('regression-stale-recording-snapshot');
+    } finally {
+      release(); await page.unroute(pattern, handler);
+      state.recordings = original; h.emit('resync', {});
+      await waitState(() => page.locator('.recording-card').count(), n => n === original.length, '恢复隔离夹具');
+    }
+  });
+  await step('旧媒体队列快照不能回退 SSE 已完成状态', async () => {
+    const original = structuredClone(state.mediaJobs);
+    await card('fixture-1').getByRole('button', { name: '预览录制文件' }).click();
+    const modal = dialog('录制预览');
+    await visible(modal.locator('.media-preview'));
+    const source = await modal.locator('.media-preview').getAttribute('data-path');
+    const job = { id: 'snapshot-regression', taskId: 'fixture-1', source, output: source + '.mp4', state: 'waiting', sourceRemoved: false, deleteOriginal: false, message: '专项任务等待处理' };
+    state.mediaJobs.push(job); h.emit('mediaJob', job);
+    await visible(modal.getByText('专项任务等待处理', { exact: true }));
+    const pattern = '**/api/media/jobs';
+    let release, captured;
+    const gate = new Promise(resolve => { release = resolve; });
+    const ready = new Promise(resolve => { captured = resolve; });
+    const handler = async route => {
+      const response = await fetchFixture(route); captured(); await gate; await route.fulfill({ response });
+    };
+    await page.route(pattern, handler);
+    try {
+      const completed = page.waitForResponse(response => new URL(response.url()).pathname === '/api/media/jobs' && response.status() === 200);
+      h.emit('resync', {}); await ready;
+      job.state = 'complete'; job.message = '专项任务已经完成'; h.emit('mediaJob', job);
+      await visible(modal.getByText('专项任务已经完成', { exact: true }));
+      release(); await completed;
+      await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+      await visible(modal.getByText('专项任务已经完成', { exact: true }));
+      assert.equal(await modal.getByText('专项任务等待处理', { exact: true }).count(), 0);
+      await h.shot('regression-stale-job-snapshot');
+    } finally {
+      release(); await page.unroute(pattern, handler);
+      await modal.getByRole('button', { name: '关闭对话框', exact: true }).click();
+      state.mediaJobs = original; h.emit('resync', {});
+      await navigate('总览');
+    }
   });
   await step('明暗主题即时切换与样式实际生效', async () => {
     await page.getByRole('button', { name: '切换到深色' }).click();
@@ -70,19 +204,25 @@ try {
     await modal.getByRole('button', { name: '添加直播间', exact: true }).click();
     await visible(modal.getByRole('alert'));
     assert.equal(requests('POST', '/api/recordings').length, before);
-    await urls.fill('https://custom.example.invalid/one\nhttps://custom.example.invalid/one');
-    await modal.getByRole('button', { name: '添加直播间', exact: true }).click();
-    await visible(modal.getByText(/地址重复/));
-    await urls.fill('2,https://custom.example.invalid/one,测试甲\nhttps://custom.example.invalid/two,测试乙');
+    await urls.fill('2,https://custom.example.invalid/one,测试甲\nhttps://custom.example.invalid/two,测试乙\nhttps://custom.example.invalid/one,不应覆盖甲');
     await h.shot('04-add-dialog');
     await modal.getByRole('button', { name: '添加直播间', exact: true }).click();
     await hidden(modal);
     await waitState(() => state.recordings.length, (n) => n === 8, '添加两条任务');
+    await visible(page.getByText('已添加 2 个直播间，跳过 1 个重复地址',{exact:true}));
     const body = requests('POST', '/api/recordings').at(-1).body;
+    assert.equal(body.items.length,3,'send duplicate lines to the authoritative backend for counting');
     assert.equal(body.items[0].quality, 'HD'); assert.equal(body.items[1].streamerName, '测试乙');
     assert.equal(record('fixture-7').monitorStatus,true);assert.equal(record('fixture-8').monitorStatus,true);
     await visible(card('fixture-8').getByText('自动监控，开播即录',{exact:true}));
     assert.equal(requests('POST','/api/recordings/fixture-8/start').length,0,'添加不依赖手动开录请求');
+    const unchanged = structuredClone(state.recordings);
+    await page.getByRole('button', { name: '添加直播间', exact: true }).click();
+    await urls.fill('https://custom.example.invalid/one\nhttps://custom.example.invalid/one');
+    await modal.getByRole('button', { name: '添加直播间', exact: true }).click();
+    await hidden(modal);
+    await visible(page.getByText('已添加 0 个直播间，跳过 2 个重复地址',{exact:true}));
+    assert.deepEqual(state.recordings,unchanged,'all-duplicate imports must not mutate existing records');
   });
   await step('单项编辑、字段契约和实时卡片更新', async () => {
     await card('fixture-3').getByRole('button', { name: '编辑任务' }).click();
@@ -299,6 +439,18 @@ try {
     Object.assign(record('fixture-5'),original);h.emit('update',record('fixture-5'));
     await hidden(card('fixture-5').getByRole('button',{name:'重新验证',exact:true}));
   });
+  await step('限流、页面检查和登录提示不再冒充验证码', async () => {
+    const original=structuredClone(record('fixture-5'));
+    for(const [access,label,inspect] of [['cooldown','平台冷却中',false],['pageCheck','页面待检查',true],['loginRequired','需要登录',false],['loginPrompt','登录提示',true]]){
+      Object.assign(record('fixture-5'),{platformKey:'kuaishou',platform:'快手直播',accessState:access,checkError:'页面暂不可读',verificationRequired:false,isLive:true,isRecording:false,recordingError:null});h.emit('update',record('fixture-5'));
+      await visible(card('fixture-5').getByText(label,{exact:true}));
+      assert.equal(await card('fixture-5').getByRole('button',{name:'重新验证',exact:true}).count(),0);
+      assert.equal(await card('fixture-5').getByText('请在快手窗口完成验证',{exact:true}).count(),0);
+      assert.equal(await card('fixture-5').getByRole('button',{name:'检查页面',exact:true}).count(),inspect?1:0);
+      assert.equal(record('fixture-5').isLive,true,'an unreadable page is not evidence of offline');
+    }
+    Object.assign(record('fixture-5'),original,{accessState:original.accessState??''});h.emit('update',record('fixture-5'));
+  });
   await step('卡片操作区在列表和网格、宽窄窗口保持对齐', async () => {
     for(const width of [1280,800,420]) {
       await page.setViewportSize({width,height:960});
@@ -373,6 +525,18 @@ try {
     await waitState(() => requests('DELETE', '/api/recordings/fixture-7').length, (n) => n === before + 1, '仅删除选定任务');
     assert.ok(record('fixture-8'));
   });
+  await step('任务次要操作统一图标，悬停与键盘焦点显示禁用原因', async () => {
+    const tools=card('fixture-1').locator('.card-tools');
+    assert.equal(await tools.getByRole('button').count(),4);
+    const bounds=await tools.getByRole('button').evaluateAll(nodes=>nodes.map(node=>({width:node.getBoundingClientRect().width,height:node.getBoundingClientRect().height,text:node.textContent.trim()})));
+    assert.ok(bounds.every(item=>item.width===bounds[0].width&&item.height===bounds[0].height&&item.text===''));
+    const edit=tools.getByRole('button',{name:'编辑任务'});assert.equal(await edit.isDisabled(),true);
+    const hint=edit.locator('..');await hint.focus();
+    assert.equal(await hint.evaluate(node=>getComputedStyle(node,'::after').visibility),'visible');
+    assert.match(await hint.getAttribute('data-tooltip'),/请先停止录制/);
+    await tools.getByRole('button',{name:'预览录制文件'}).hover();
+    await h.shot('card-icon-toolbar');
+  });
   await step('TS 录后与录中预览实际播放，关闭后释放播放器', async () => {
     for(const live of [false,true]) {
       state.previewLive=live;
@@ -384,16 +548,41 @@ try {
       await page.waitForFunction(()=>{const video=document.querySelector('video');return video&&video.videoWidth===160&&video.currentTime>0.5;},null,{timeout:15000});
       const slider=modal.getByRole('slider',{name:'播放进度',exact:true});await visible(slider);
       for(const fraction of [.8,.2]){
-        const box=await slider.boundingBox();await page.mouse.move(box.x+box.width*.5,box.y+box.height/2);await page.mouse.down();await page.mouse.move(box.x+box.width*fraction,box.y+box.height/2,{steps:8});await page.mouse.up();
-        await page.waitForFunction(({fraction})=>{const video=document.querySelector('video');const at=Number(video?.dataset.seekOffset);return Math.abs(at-6*fraction)<.5&&video?.readyState>=2&&video.currentTime>.15;},{fraction},{timeout:15000});
+        const box=await slider.boundingBox();await page.mouse.move(box.x+box.width*.5,box.y+box.height/2);await page.mouse.down();await page.mouse.move(box.x+6+(box.width-12)*fraction,box.y+box.height/2,{steps:8});
+        await page.waitForFunction(({fraction})=>{const video=document.querySelector('video');const at=Number(video?.dataset.timelinePosition);return Math.abs(at-6*fraction)<.5&&video?.readyState>=2&&!video.seeking&&video.dataset.scrubbing==='true';},{fraction},{timeout:15000});
+        await page.mouse.up();
+        await page.waitForFunction(()=>!document.querySelector('video').paused);
       }
-      if(live){await modal.getByRole('button',{name:'回到最新',exact:true}).click();await page.waitForFunction(()=>{const video=document.querySelector('video');return Number(video?.dataset.seekOffset)>=2.8&&video?.readyState>=2&&video.currentTime>.15;});}
+      if(live){await modal.getByRole('button',{name:'回到最新',exact:true}).click();await page.waitForFunction(()=>{const video=document.querySelector('video');return Number(video?.dataset.timelinePosition)>=2.8&&video?.readyState>=2&&video.currentTime>.15;});}
       await h.shot(live?'preview-ts-growing':'preview-ts-completed');
+      if(!live){
+        await page.setViewportSize({width:1100,height:750});
+        const layout=await modal.evaluate(node=>{const body=node.querySelector('.modal-body').getBoundingClientRect(),files=node.querySelector('.preview-file-list').getBoundingClientRect(),controls=node.querySelector('.seek-controls').getBoundingClientRect();return {bottom:body.bottom,filesBottom:files.bottom,controlsBottom:controls.bottom};});
+        assert.ok(layout.filesBottom<=layout.bottom+1&&layout.controlsBottom<=layout.bottom+1,'默认桌面窗口应同时显示完整播放控件与当前文件列表');
+        await h.shot('preview-default-window');await page.setViewportSize({width:1280,height:900});
+      }
       await modal.getByRole('button',{name:'关闭对话框'}).click();await hidden(modal);
       await waitState(()=>page.evaluate(async()=> (await import('/media-player.js')).activePlayerCount()),count=>count===0,'播放器实例全部释放');
       await waitState(()=>state.activePreviews,n=>n===0,'关闭预览释放增量连接');
     }
     state.previewLive=false;
+  });
+  await step('全屏内操作及退出全屏保持同一个预览和播放位置', async () => {
+    await card('fixture-1').getByRole('button',{name:'预览录制文件'}).click();const modal=dialog('录制预览');
+    await page.waitForFunction(()=>document.querySelector('video')?.readyState>=2);
+    const source=await modal.locator('.media-preview').getAttribute('data-path');
+    await modal.getByRole('button',{name:'暂停',exact:true}).click();
+    await modal.getByRole('button',{name:'全屏',exact:true}).click();await page.waitForFunction(()=>Boolean(document.fullscreenElement));
+    await page.getByRole('button',{name:'前进 10 秒',exact:true}).click();
+    assert.equal(await modal.count(),1);assert.equal(await page.locator('video').count(),1);
+    await page.getByRole('button',{name:'退出全屏',exact:true}).click();await page.waitForFunction(()=>!document.fullscreenElement);
+    await visible(modal);assert.equal(await modal.locator('.media-preview').getAttribute('data-path'),source);
+    await modal.getByRole('combobox',{name:'播放速度'}).selectOption('1.5');
+    assert.equal(await modal.locator('video').evaluate(video=>video.playbackRate),1.5);
+    await modal.getByRole('button',{name:'全屏',exact:true}).click();await page.waitForFunction(()=>Boolean(document.fullscreenElement));
+    await page.keyboard.press('Escape');await page.waitForFunction(()=>!document.fullscreenElement);
+    await visible(modal);assert.equal(await modal.locator('.media-preview').getAttribute('data-path'),source);
+    await modal.getByRole('button',{name:'关闭对话框',exact:true}).click();await hidden(modal);
   });
   await step('媒体库筛选、目录导航与真正的内嵌音频加载', async () => {
     await navigate('媒体库');
@@ -457,14 +646,86 @@ try {
     record('fixture-2').streamerName = '阿鹿 · 实时更新'; h.emit('update', record('fixture-2'));
     await visible(page.getByText('阿鹿 · 实时更新', { exact: true }));
   });
-  await step('服务端列表失败停止骨架屏并展示错误', async () => {
-    h.failNext('GET', '/api/recordings', '模拟列表读取失败', 500);
-    h.failNext('GET', '/api/recordings', '模拟列表读取失败', 500);
-    await go(page, h.base, '/home');
-    await visible(page.locator('.connection-banner'));
-    assert.equal(await page.locator('.skeleton-grid').count(), 0);
-    await hidden(page.locator('.connection-banner'));
-    await waitState(() => page.locator('.recording-card').count(), (n) => n === Math.min(state.recordings.length, 6), '列表失败自动重试后恢复');
+  await step('轮询与 SSE 的四种启动交错均结束加载、保留错误并自动恢复', async () => {
+    for (const oldStatus of [200, 500]) {
+      for (const newestFirst of [false, true]) {
+        const pattern = '**/api/recordings', eventsPattern = '**/api/events';
+        const eventsGate = Promise.withResolvers(), oldGate = Promise.withResolvers(), latestGate = Promise.withResolvers(), recoveryGate = Promise.withResolvers();
+        const oldDone = Promise.withResolvers(), latestDone = Promise.withResolvers();
+        const routeErrors = [], oldSnapshot = structuredClone(state.recordings);
+        let count = 0;
+        const eventsHandler = async route => {
+          try { await eventsGate.promise; await route.fallback(); }
+          catch (error) { routeErrors.push(String(error)); }
+        };
+        const handler = async route => {
+          const attempt = ++count;
+          try {
+            if (attempt === 1) { eventsGate.resolve(); await oldGate.promise; }
+            else if (attempt === 2) await latestGate.promise;
+            else { await recoveryGate.promise; await route.fallback(); return; }
+            const status = attempt === 1 ? oldStatus : 500;
+            await route.fulfill({ status, contentType: 'application/json', headers: { 'Access-Control-Allow-Origin': '*' }, body: JSON.stringify(status === 200 ? oldSnapshot : { detail: '模拟启动快照失败' }) });
+          } catch (error) { routeErrors.push(String(error)); }
+          finally { if (attempt === 1) oldDone.resolve(); else if (attempt === 2) latestDone.resolve(); }
+        };
+        await page.route(eventsPattern, eventsHandler);
+        await page.route(pattern, handler);
+        try {
+          await page.goto(h.base + '/home', { waitUntil: 'domcontentloaded' });
+          await waitState(() => count, n => n === 2, '首次轮询和 SSE 快照均已进入受控交错');
+          const finishOld = async () => {
+            oldGate.resolve(); await oldDone.promise;
+            await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+          };
+          if (!newestFirst) await finishOld();
+          const statusCount = requests('GET', '/api/status').length;
+          latestGate.resolve(); await latestDone.promise;
+          await visible(page.locator('.connection-banner'));
+          await hidden(page.locator('.skeleton-grid'));
+          if (newestFirst) await finishOld();
+          await waitState(() => count, n => n >= 3, '最新快照失败后自动重试');
+          assert.ok(requests('GET', '/api/status').length > statusCount, '重试前已读取健康状态');
+          await visible(page.locator('.connection-banner'));
+          assert.equal(await page.locator('.skeleton-grid').count(), 0);
+          assert.equal(await page.locator('.recording-card').count(), 0, '旧快照不得冒充初始化成功');
+          await h.shot(`startup-error-${oldStatus}-${newestFirst ? 'latest-first' : 'old-first'}`);
+          const jobsRestored = page.waitForResponse(response => new URL(response.url()).pathname === '/api/media/jobs' && response.status() === 200);
+          recoveryGate.resolve();
+          await jobsRestored;
+          await waitState(() => page.locator('.recording-card').count(), n => n === Math.min(state.recordings.length, 6), '快照真实加载成功后恢复列表');
+          await hidden(page.locator('.connection-banner'));
+          assert.deepEqual(routeErrors, []);
+        } finally {
+          eventsGate.resolve(); oldGate.resolve(); latestGate.resolve(); recoveryGate.resolve();
+          await page.unroute(pattern, handler); await page.unroute(eventsPattern, eventsHandler);
+        }
+      }
+    }
+  });
+  await step('媒体队列快照失败保留已有任务，健康状态不会提前清除错误', async () => {
+    const pattern = '**/api/media/jobs', recoveryGate = Promise.withResolvers();
+    const routeErrors = [];
+    const before = await page.locator('.recording-card').count();
+    let count = 0;
+    const handler = async route => {
+      try {
+        if (++count === 1) await route.fulfill({ status: 500, contentType: 'application/json', headers: { 'Access-Control-Allow-Origin': '*' }, body: JSON.stringify({ detail: '模拟媒体队列读取失败' }) });
+        else { await recoveryGate.promise; await route.fallback(); }
+      } catch (error) { routeErrors.push(String(error)); }
+    };
+    await page.route(pattern, handler);
+    try {
+      h.emit('resync', {});
+      await visible(page.locator('.connection-banner'));
+      await waitState(() => count, n => n >= 2, '媒体队列失败后自动重试');
+      await visible(page.locator('.connection-banner'));
+      assert.equal(await page.locator('.recording-card').count(), before);
+      assert.equal(await page.locator('.skeleton-grid').count(), 0);
+      recoveryGate.resolve();
+      await hidden(page.locator('.connection-banner'));
+      assert.deepEqual(routeErrors, []);
+    } finally { recoveryGate.resolve(); await page.unroute(pattern, handler); }
   });
   await step('安装与关机都有准确确认文案，取消不产生副作用',async()=>{
     await navigate('偏好设置');
@@ -485,7 +746,12 @@ try {
     try {
       for(const theme of ['light','dark']){
         await page.locator('html').evaluate((el,value)=>{el.dataset.theme=value;},theme);
-        await waitState(()=>capture.evaluate(el=>({text:getComputedStyle(el).color,expected:getComputedStyle(document.body).color})),colors=>colors.text===colors.expected,'截图按钮在 '+theme+' 主题中使用可读文字颜色');
+        const contrast=await capture.evaluate(el=>{
+          const luminance=color=>{const channels=color.match(/[\d.]+/g).slice(0,3).map(Number).map(n=>{const s=n/255;return s<=.04045?s/12.92:((s+.055)/1.055)**2.4;});return channels[0]*.2126+channels[1]*.7152+channels[2]*.0722;};
+          const foreground=luminance(getComputedStyle(el).color),background=luminance(getComputedStyle(el.closest('.seek-controls')).backgroundColor);
+          return (Math.max(foreground,background)+.05)/(Math.min(foreground,background)+.05);
+        });
+        assert.ok(contrast>=4.5,'截图图标在 '+theme+' 主题的对比度必须达到 4.5:1');
       }
     } finally {await page.locator('html').evaluate((el,value)=>{if(value===null)delete el.dataset.theme;else el.dataset.theme=value;},initialTheme);}
     await capture.click();await waitState(()=>requests('POST','/api/media/screenshot').length,count=>count>=1,'截图已通过模拟 API');

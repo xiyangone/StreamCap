@@ -1,7 +1,6 @@
 //! Human-readable labels and pure presentation helpers.
 use crate::api::gateway::NewRecording;
 use crate::app::i18n::t;
-use std::collections::HashSet;
 
 pub const QUALITY_OPTIONS: &[(&str, &str)] = &[
     ("OD", "原画"),
@@ -134,7 +133,6 @@ pub fn valid_url(url: &str) -> bool {
 }
 pub fn parse_recordings(raw: &str) -> Result<Vec<NewRecording>, String> {
     let mut items = Vec::new();
-    let mut seen = HashSet::new();
     for (index, line) in raw
         .lines()
         .enumerate()
@@ -159,9 +157,6 @@ pub fn parse_recordings(raw: &str) -> Result<Vec<NewRecording>, String> {
                 "第 {} 行不是有效的 HTTP / HTTPS 地址",
                 index + 1
             ));
-        }
-        if !seen.insert(url.to_string()) {
-            return Err(crate::tr_format!("第 {} 行的地址重复", index + 1));
         }
         let quality = quality.map(|q| {
             match q {
@@ -210,8 +205,22 @@ pub fn recording_priority(record: &crate::api::gateway::Recording) -> u8 {
 pub fn monitoring_label(record: &crate::api::gateway::Recording) -> &'static str {
     if !record.monitor_status {
         t("监控已暂停")
+    } else if record.check_state == "checking" {
+        t("检测中")
     } else if record.verification_required {
         t("等待手动验证")
+    } else if record.access_state == "cooldown" {
+        t("等待平台冷却")
+    } else if record.access_state == "pageCheck" {
+        t("等待页面检查")
+    } else if record.access_state == "loginRequired" {
+        t("请在设置中检查登录状态")
+    } else if record.access_state == "loginPrompt" {
+        t("登录提示不代表登录失效")
+    } else if record.check_state == "queued" {
+        t("排队中")
+    } else if record.check_state == "waiting" {
+        t("等待首检")
     } else if record
         .check_error
         .as_ref()
@@ -273,9 +282,16 @@ mod tests {
         assert_eq!(items[2].quality, None);
     }
     #[test]
-    fn imports_reject_duplicates_and_invalid_input() {
+    fn imports_preserve_duplicates_for_server_accounting_and_reject_invalid_input() {
         assert!(parse_recordings("file:///private").is_err());
-        assert!(parse_recordings("https://live.douyin.com/1\nhttps://live.douyin.com/1").is_err());
+        let items = parse_recordings(
+            "https://live.douyin.com/1,甲\nhttps://live.douyin.com/1,乙\nhttps://live.douyin.com/2",
+        )
+        .unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].url, items[1].url);
+        assert_eq!(items[0].streamer_name.as_deref(), Some("甲"));
+        assert_eq!(items[1].streamer_name.as_deref(), Some("乙"));
         assert!(parse_recordings("OD,https://live.douyin.com/1").is_ok());
         assert!(!valid_url("https://user:password@live.example.com"));
         assert!(!valid_url("https://"));

@@ -10,8 +10,9 @@
     "tauri:build": "tauri build --no-bundle",
     "test:ui": "node tests/e2e-smoke.mjs",
     "test:smoke": "node tests/white-screen-smoke.mjs",
-    "test": "npm run test:ui && npm run test:smoke",
-    "verify": "pwsh -NoProfile -File scripts/verify-native.ps1"
+    "test": "npm run test:player && npm run test:ui && npm run test:smoke",
+    "verify": "pwsh -NoProfile -File scripts/verify-native.ps1",
+    "test:player": "node tests/player-regression.mjs"
   },
   "devDependencies": {
     "@tauri-apps/api": "^2.11.1",

@@ -9,7 +9,13 @@ use axum::{
 };
 use futures::stream;
 use serde::Serialize;
-use std::{io, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::VecDeque,
+    io,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 use tokio::{io::AsyncReadExt, sync::Semaphore};
 use tokio_util::sync::CancellationToken;
 
@@ -19,6 +25,7 @@ pub struct Preview {
     stop: CancellationToken,
     slots: Arc<Semaphore>,
     probe_slots: Arc<Semaphore>,
+    durations: Arc<std::sync::Mutex<DurationCache>>,
     workers: tokio_util::task::TaskTracker,
     admission: Arc<std::sync::Mutex<()>>,
 }
@@ -26,6 +33,44 @@ pub struct LiveInput {
     pub url: String,
     pub headers: Option<String>,
     pub proxy: Option<String>,
+}
+
+#[derive(Clone, PartialEq)]
+struct FileStamp {
+    size: u64,
+    modified: Option<SystemTime>,
+    created: Option<SystemTime>,
+}
+impl FileStamp {
+    fn read(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            size: metadata.len(),
+            modified: metadata.modified().ok(),
+            created: metadata.created().ok(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct DurationCache(VecDeque<(PathBuf, FileStamp, f64)>);
+impl DurationCache {
+    fn get(&mut self, path: &std::path::Path, stamp: &FileStamp) -> Option<f64> {
+        let index = self
+            .0
+            .iter()
+            .position(|(p, s, _)| p == path && s == stamp)?;
+        let entry = self.0.remove(index)?;
+        let duration = entry.2;
+        self.0.push_back(entry);
+        Some(duration)
+    }
+    fn insert(&mut self, path: PathBuf, stamp: FileStamp, duration: f64) {
+        self.0.retain(|(p, _, _)| p != &path);
+        self.0.push_back((path, stamp, duration));
+        while self.0.len() > 32 {
+            self.0.pop_front();
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -45,6 +90,7 @@ impl Preview {
             stop,
             slots: Arc::new(Semaphore::new(4)),
             probe_slots: Arc::new(Semaphore::new(4)),
+            durations: Arc::new(std::sync::Mutex::new(DurationCache::default())),
             workers: tokio_util::task::TaskTracker::new(),
             admission: Arc::new(std::sync::Mutex::new(())),
         }
@@ -90,7 +136,8 @@ impl Preview {
                 "按时间预览需要 FFmpeg 和同目录 ffprobe",
             )
         })?;
-        let duration = self.probe_duration(ffprobe, target.clone()).await?;
+        let stamp = FileStamp::read(&lease.metadata()?);
+        let duration = self.probe_duration(ffprobe, target.clone(), stamp).await?;
         if start_seconds >= duration {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -114,7 +161,7 @@ impl Preview {
                 "-ss",
             ])
             .arg(format!("{start_seconds:.3}"))
-            .args(["-re", "-i"])
+            .arg("-i")
             .arg(&target)
             .args(["-t", &format!("{playback_seconds:.3}")])
             .args([
@@ -133,6 +180,7 @@ impl Preview {
                 "-pix_fmt",
                 "yuv420p",
                 "-threads", "2",
+                "-g", "48",
                 "-c:a",
                 "aac",
                 "-f",
@@ -267,12 +315,12 @@ impl Preview {
         relative: String,
         ffmpeg: Option<PathBuf>,
     ) -> io::Result<PreviewInfo> {
-        let (target, size) = storage
+        let (target, stamp) = storage
             .blocking(move |stop| {
                 storage::check_cancel(&stop)?;
                 let target = storage::checked_target(&root, &relative, false)?;
                 let file = storage::open_file(&root, &relative)?;
-                Ok((target, file.metadata()?.len()))
+                Ok((target, FileStamp::read(&file.metadata()?)))
             })
             .await?;
         let format = target
@@ -289,7 +337,7 @@ impl Preview {
         let mut seek_error = None;
         if needs_timeline {
             match ffmpeg.and_then(|path| crate::paths::adjacent_ffprobe(&path)) {
-                Some(ffprobe) => match self.probe_duration(ffprobe, target).await {
+                Some(ffprobe) => match self.probe_duration(ffprobe, target, stamp.clone()).await {
                     Ok(duration) => duration_seconds = Some(duration),
                     Err(error) => seek_error = Some(error.to_string()),
                 },
@@ -299,14 +347,29 @@ impl Preview {
         Ok(PreviewInfo {
             format,
             is_recording,
-            size,
+            size: stamp.size,
             duration_seconds,
             seekable: duration_seconds.is_some(),
             seek_error,
         })
     }
 
-    async fn probe_duration(&self, ffprobe: PathBuf, target: PathBuf) -> io::Result<f64> {
+    async fn probe_duration(
+        &self,
+        ffprobe: PathBuf,
+        target: PathBuf,
+        stamp: FileStamp,
+    ) -> io::Result<f64> {
+        storage::check_cancel(&self.stop)?;
+        if let Some(duration) = self
+            .durations
+            .lock()
+            .expect("preview durations")
+            .get(&target, &stamp)
+        {
+            return Ok(duration);
+        }
+        let cache_path = target.clone();
         let permit = self.probe_slots.clone().try_acquire_owned().map_err(|_| {
             io::Error::new(io::ErrorKind::WouldBlock, "媒体信息读取繁忙，请稍后重试")
         })?;
@@ -343,7 +406,12 @@ impl Preview {
                 let _=sender.send(result);
             });
         }
-        receiver.await.map_err(io::Error::other)?
+        let duration = receiver.await.map_err(io::Error::other)??;
+        self.durations
+            .lock()
+            .expect("preview durations")
+            .insert(cache_path, stamp, duration);
+        Ok(duration)
     }
 }
 
@@ -361,5 +429,46 @@ struct CancelOnDrop(CancellationToken);
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
         self.0.cancel();
+    }
+}
+
+#[cfg(test)]
+mod preview_cache_tests {
+    use super::*;
+
+    #[test]
+    fn duration_cache_is_bounded_and_invalidates_changed_recordings() {
+        let stamp = FileStamp {
+            size: 10,
+            modified: Some(SystemTime::UNIX_EPOCH),
+            created: None,
+        };
+        let mut cache = DurationCache::default();
+        for index in 0..40 {
+            cache.insert(
+                PathBuf::from(format!("{index}.ts")),
+                stamp.clone(),
+                index as f64 + 1.0,
+            );
+        }
+        assert_eq!(cache.0.len(), 32);
+        assert_eq!(cache.get(std::path::Path::new("0.ts"), &stamp), None);
+        assert_eq!(cache.get(std::path::Path::new("39.ts"), &stamp), Some(40.0));
+        let mut changed = stamp.clone();
+        changed.size += 1;
+        assert_eq!(cache.get(std::path::Path::new("39.ts"), &changed), None);
+        changed = stamp.clone();
+        changed.modified = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1));
+        assert_eq!(cache.get(std::path::Path::new("39.ts"), &changed), None);
+        changed = stamp.clone();
+        changed.created = Some(SystemTime::UNIX_EPOCH);
+        assert_eq!(cache.get(std::path::Path::new("39.ts"), &changed), None);
+        cache.insert(PathBuf::from("39.ts"), changed.clone(), 41.0);
+        assert_eq!(cache.get(std::path::Path::new("39.ts"), &stamp), None);
+        assert_eq!(
+            cache.get(std::path::Path::new("39.ts"), &changed),
+            Some(41.0)
+        );
+        assert_eq!(cache.0.len(), 32);
     }
 }

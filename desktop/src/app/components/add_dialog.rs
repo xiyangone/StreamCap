@@ -25,30 +25,25 @@ pub fn AddRecordingDialog(open: RwSignal<bool>) -> impl IntoView {
                 return;
             }
         };
-        let existing = state.recordings.get_untracked();
-        if items
-            .iter()
-            .any(|item| existing.iter().any(|rec| rec.url == item.url))
-        {
-            error.set(Some(t("其中有已添加的直播间，请移除重复地址后重试").into()));
-            return;
-        }
         let default_name = name.get_untracked().trim().to_string();
         for item in &mut items {
             if item.streamer_name.is_none() && !default_name.is_empty() {
                 item.streamer_name = Some(default_name.clone());
             }
         }
-        let count = items.len();
         busy.set(true);
         error.set(None);
         leptos::task::spawn_local(async move {
             match gateway::create_recordings(items).await {
-                Ok(()) => {
+                Ok(result) => {
                     let _ = open.try_set(false);
                     let _ = urls.try_set(String::new());
                     let _ = name.try_set(String::new());
-                    state.notify(crate::tr_format!("已添加 {count} 个直播间，已开启自动监控"));
+                    state.notify(crate::tr_format!(
+                        "已添加 {} 个直播间，跳过 {} 个重复地址",
+                        result.created.len(),
+                        result.skipped.len()
+                    ));
                     if let Err(message) = gateway::refresh_recordings(state).await {
                         state.fail(crate::tr_format!("任务已添加，列表同步失败：{message}"));
                     }

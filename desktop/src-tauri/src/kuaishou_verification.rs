@@ -2,10 +2,7 @@
 use serde::Serialize;
 use serde_json::Value;
 use std::{
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
-    },
+    sync::{atomic::Ordering, Arc, Mutex},
     time::Duration,
 };
 use streamcap_core::{api::ApiState, model::Recording, platforms::kuaishou};
@@ -17,15 +14,43 @@ use tauri::{
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 pub const LABEL: &str = "kuaishou-verification";
+
+#[derive(Default)]
+struct StableChallenge {
+    first: Option<std::time::Instant>,
+    last: Option<std::time::Instant>,
+    samples: u32,
+}
+impl StableChallenge {
+    fn observe(&mut self, now: std::time::Instant, visible: bool) -> bool {
+        if !visible {
+            *self = Self::default();
+            return false;
+        }
+        if self
+            .last
+            .is_some_and(|last| now.duration_since(last) > Duration::from_millis(2500))
+        {
+            *self = Self::default();
+        }
+        let first = *self.first.get_or_insert(now);
+        self.last = Some(now);
+        self.samples = self.samples.saturating_add(1);
+        self.samples >= 3 && now.duration_since(first) >= Duration::from_secs(3)
+    }
+}
+
 #[derive(Clone)]
 struct Session {
     id: u64,
     record: Recording,
     target: Url,
     original_cookie: Option<String>,
-    loaded: Arc<AtomicU64>,
+    auto_running: Arc<std::sync::atomic::AtomicBool>,
+    surfaced: Arc<std::sync::atomic::AtomicBool>,
     stop: CancellationToken,
     busy: bool,
+    _page_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
 }
 #[derive(Default)]
 struct State {
@@ -39,6 +64,7 @@ pub struct Verification {
     stop: CancellationToken,
     tasks: TaskTracker,
     smoke: bool,
+    opening: tokio::sync::Mutex<()>,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -47,6 +73,7 @@ pub struct Status {
     busy: bool,
     rec_id: Option<String>,
     active_workers: usize,
+    visible: bool,
 }
 impl Verification {
     pub fn new(core: ApiState, smoke: bool) -> Self {
@@ -56,6 +83,7 @@ impl Verification {
             stop: CancellationToken::new(),
             tasks: TaskTracker::new(),
             smoke,
+            opening: tokio::sync::Mutex::new(()),
         }
     }
     pub fn status(&self) -> Status {
@@ -65,6 +93,7 @@ impl Verification {
             busy: state.active.as_ref().is_some_and(|s| s.busy),
             rec_id: state.active.as_ref().map(|s| s.record.rec_id.clone()),
             active_workers: self.tasks.len(),
+            visible: false,
         }
     }
 }
@@ -127,7 +156,7 @@ pub fn automatic(app: &AppHandle, rec_id: String) {
     let handle = app.clone();
     spawn(app, async move {
         if let Err(error) = open(&handle, &rec_id, false, None).await {
-            handle.state::<Verification>().core.store.snack(error);
+            log::debug!("快手自动页面检查未启动: {error}");
         }
     });
 }
@@ -149,6 +178,7 @@ async fn open_inner(
     fixture: Option<&str>,
 ) -> Result<(), String> {
     let owner = app.state::<Verification>();
+    let _opening = owner.opening.lock().await;
     if owner.stop.is_cancelled() {
         return Err("应用正在退出".into());
     }
@@ -173,9 +203,17 @@ async fn open_inner(
         .map_err(|_| "无法读取快手会话")?
         .get("kuaishou")
         .cloned();
-    let session = {
-        let mut state = owner.state.lock().map_err(|_| "验证状态异常")?;
-        if state.active.is_some() {
+    {
+        let state = owner.state.lock().map_err(|_| "验证状态异常")?;
+        if let Some(active) = &state.active {
+            if active.record.rec_id != record.rec_id {
+                return Err("另一个快手页面检查正在进行，未打开其他房间".into());
+            }
+            if manual {
+                if let Some(session) = &state.active {
+                    session.surfaced.store(true, Ordering::SeqCst);
+                }
+            }
             drop(state);
             if manual {
                 if let Some(window) = app.get_webview_window(LABEL) {
@@ -185,18 +223,50 @@ async fn open_inner(
             }
             return Ok(());
         }
-        if state.dismissed && !manual {
+        if owner.smoke && state.dismissed && !manual {
             return Ok(());
         }
+    }
+    let permit = if owner.smoke {
+        None
+    } else {
+        let interval = owner
+            .core
+            .config
+            .read()
+            .await
+            .get_i64("loop_time_seconds", 4500)
+            .max(1) as u64;
+        match owner
+            .core
+            .resolver
+            .kuaishou_begin_page_check(cookie.as_deref(), Duration::from_secs(interval))
+            .await
+        {
+            Ok(permit) => Some(Arc::new(permit)),
+            Err(error) => {
+                owner
+                    .core
+                    .scheduler
+                    .report_kuaishou_access(&record, &error)
+                    .await;
+                return Err(error);
+            }
+        }
+    };
+    let session = {
+        let mut state = owner.state.lock().map_err(|_| "验证状态异常")?;
         state.next_id = state.next_id.wrapping_add(1);
         let session = Session {
             id: state.next_id,
             record,
             target,
             original_cookie: cookie,
-            loaded: Arc::new(AtomicU64::new(0)),
+            auto_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            surfaced: Arc::new(std::sync::atomic::AtomicBool::new(manual)),
             stop: owner.stop.child_token(),
             busy: false,
+            _page_permit: permit,
         };
         state.active = Some(session.clone());
         state.dismissed = false;
@@ -207,30 +277,24 @@ async fn open_inner(
         dispose(app, session.id, true);
         return Err(error);
     }
-    log::info!("快手手动验证窗口已打开");
+    log::info!("快手页面检查已开始 visible={manual}");
     Ok(())
 }
 async fn create_window(app: &AppHandle, session: &Session, smoke: bool) -> Result<(), String> {
-    let complete = MenuItem::with_id(
-        app,
-        "kuaishou-complete",
-        "已完成验证，继续",
-        true,
-        None::<&str>,
-    )
-    .map_err(|_| "无法创建验证操作")?;
+    let complete = MenuItem::with_id(app, "kuaishou-complete", "检查当前页面", true, None::<&str>)
+        .map_err(|_| "无法创建验证操作")?;
     let cancel = MenuItem::with_id(app, "kuaishou-cancel", "取消验证", true, None::<&str>)
         .map_err(|_| "无法创建验证操作")?;
     let menu = Menu::with_items(app, &[&complete, &cancel]).map_err(|_| "无法创建验证菜单")?;
     let smoke_origin = smoke.then(|| session.target.origin().ascii_serialization());
     let navigation_origin = smoke_origin.clone();
-    let loaded = session.loaded.clone();
+    let automatic_target = session.target.clone();
     let mut builder = WebviewWindowBuilder::new(
         app,
         LABEL,
         WebviewUrl::External(Url::parse("about:blank").expect("static URL")),
     )
-    .title("快手验证 · 手动完成后点击顶部“已完成验证，继续”")
+    .title("快手验证 · 页面正常后会自动恢复，也可点击顶部“检查当前页面”")
     .inner_size(1060.0, 760.0)
     .min_inner_size(720.0, 520.0)
     .visible(false)
@@ -244,9 +308,11 @@ async fn create_window(app: &AppHandle, session: &Session, smoke: bool) -> Resul
     .incognito(true)
     .menu(menu)
     .on_navigation(move |url| allowed_navigation(url, navigation_origin.as_deref()))
-    .on_page_load(move |_, payload| {
-        if matches!(payload.event(), PageLoadEvent::Finished) {
-            loaded.fetch_add(1, Ordering::SeqCst);
+    .on_page_load(move |window, payload| {
+        if matches!(payload.event(), PageLoadEvent::Finished)
+            && window.url().ok().as_ref() == Some(&automatic_target)
+        {
+            schedule_automatic_check(window.app_handle().clone(), window.label().to_owned());
         }
     })
     .on_menu_event(|window, event| match event.id.as_ref() {
@@ -294,7 +360,8 @@ async fn create_window(app: &AppHandle, session: &Session, smoke: bool) -> Resul
     }
     let window = builder.build().map_err(|_| "无法打开快手验证窗口")?;
     // Keep credentials out of page scripts and IPC. Reconstruct only this platform's cookies.
-    let cookie = session.original_cookie.clone().unwrap_or_default();
+    let cookie =
+        kuaishou::canonical_cookie_header(session.original_cookie.as_deref().unwrap_or_default())?;
     let cookie_window = window.clone();
     let host = if smoke {
         session.target.host_str().unwrap_or_default().to_owned()
@@ -302,12 +369,11 @@ async fn create_window(app: &AppHandle, session: &Session, smoke: bool) -> Resul
         ".kuaishou.com".into()
     };
     tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
-        let mut seen = std::collections::HashSet::new();
         for pair in cookie.split(';').map(str::trim) {
             let Some((name, value)) = pair.split_once('=') else {
                 continue;
             };
-            if name.is_empty() || !seen.insert(name.to_owned()) {
+            if name.is_empty() {
                 continue;
             }
             cookie_window
@@ -331,8 +397,11 @@ async fn create_window(app: &AppHandle, session: &Session, smoke: bool) -> Resul
     window
         .navigate(session.target.clone())
         .map_err(|_| "无法打开快手网页")?;
-    window.show().map_err(|_| "无法显示验证窗口")?;
-    let _ = window.set_focus();
+    if session.surfaced.load(Ordering::SeqCst) {
+        window.show().map_err(|_| "无法显示验证窗口")?;
+        let _ = window.set_focus();
+    }
+    schedule_automatic_check(app.clone(), LABEL.into());
     Ok(())
 }
 pub fn begin_complete(app: &AppHandle) -> Result<(), String> {
@@ -358,6 +427,10 @@ pub fn begin_complete(app: &AppHandle) -> Result<(), String> {
                 dispose(&handle, session.id, false);
             }
             Err(error) => {
+                if terminal_page_problem(&error) {
+                    dispose(&handle, session.id, true);
+                    return;
+                }
                 let owner = handle.state::<Verification>();
                 let mut state = owner.state.lock().expect("verification state");
                 if let Some(current) = state
@@ -367,10 +440,10 @@ pub fn begin_complete(app: &AppHandle) -> Result<(), String> {
                 {
                     current.busy = false;
                     drop(state);
-                    owner.core.store.snack(error);
+                    log::info!("快手页面手动检查未完成: {error}");
+                    owner.core.store.snack(error.clone());
                     if let Some(window) = handle.get_webview_window(LABEL) {
-                        let _ =
-                            window.set_title("快手验证未完成 · 请验证后再点顶部“已完成验证，继续”");
+                        let _ = window.set_title(&format!("快手页面检查 · {error}"));
                     }
                 }
             }
@@ -378,12 +451,170 @@ pub fn begin_complete(app: &AppHandle) -> Result<(), String> {
     });
     Ok(())
 }
+fn schedule_automatic_check(app: AppHandle, label: String) {
+    if label != LABEL {
+        return;
+    }
+    let session = {
+        let owner = app.state::<Verification>();
+        let state = owner.state.lock().expect("verification state");
+        let Some(session) = state.active.as_ref() else {
+            return;
+        };
+        if session.auto_running.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        session.clone()
+    };
+    let handle = app.clone();
+    spawn(&app, async move {
+        let mut last_error = None;
+        let started = std::time::Instant::now();
+        let mut challenge = StableChallenge::default();
+        let mut challenge_reported = false;
+        loop {
+            tokio::select! {
+                biased;
+                _ = session.stop.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_millis(1000)) => {}
+            }
+            // Manual checks and this local DOM observer share one in-flight slot.
+            // Login can complete without navigation, so keep observing until close.
+            {
+                let owner = handle.state::<Verification>();
+                let mut state = owner.state.lock().expect("verification state");
+                let Some(current) = state.active.as_mut().filter(|s| s.id == session.id) else {
+                    break;
+                };
+                if current.busy {
+                    challenge.observe(std::time::Instant::now(), false);
+                    continue;
+                }
+                current.busy = true;
+            }
+            let result = tokio::select! {
+                biased;
+                _ = session.stop.cancelled() => break,
+                result = evaluate_current_page(&handle, &session) => result
+            };
+            if !matches!(&result, Ok(Some(_))) {
+                let owner = handle.state::<Verification>();
+                let mut state = owner.state.lock().expect("verification state");
+                if let Some(current) = state.active.as_mut().filter(|s| s.id == session.id) {
+                    current.busy = false;
+                }
+            }
+            match result {
+                Ok(Some(message)) => {
+                    handle.state::<Verification>().core.store.snack(message);
+                    dispose(&handle, session.id, false);
+                    return;
+                }
+                Ok(None) => {
+                    if challenge.observe(std::time::Instant::now(), true)
+                        && !session.stop.is_cancelled()
+                    {
+                        if let Some(window) = handle.get_webview_window(LABEL) {
+                            let _ = window.set_title(
+                                "快手验证 · 仅页面出现滑块时需要操作；完成后点“检查当前页面”",
+                            );
+                            if !challenge_reported {
+                                handle
+                                    .state::<Verification>()
+                                    .core
+                                    .scheduler
+                                    .report_kuaishou_access(
+                                        &session.record,
+                                        kuaishou::VERIFICATION_REQUIRED,
+                                    )
+                                    .await;
+                                challenge_reported = true;
+                            }
+                            if !session.stop.is_cancelled()
+                                && !session.surfaced.swap(true, Ordering::SeqCst)
+                            {
+                                let _ = window.show();
+                                let _ = window.set_focus();
+                            }
+                        }
+                    }
+                    last_error = None;
+                }
+                Err(error) => {
+                    challenge.observe(std::time::Instant::now(), false);
+                    challenge_reported = false;
+                    if terminal_page_problem(&error) {
+                        log::info!("快手页面检查已停止: {error}");
+                        dispose(&handle, session.id, true);
+                        return;
+                    }
+                    if last_error.as_ref() != Some(&error) {
+                        log::info!("快手页面自动检查未完成: {error}");
+                        if let Some(window) = handle.get_webview_window(LABEL) {
+                            let _ = window.set_title(&format!("快手页面检查 · {error}"));
+                        }
+                        last_error = Some(error);
+                    }
+                }
+            }
+            if !session.surfaced.load(Ordering::SeqCst)
+                && started.elapsed() >= Duration::from_secs(30)
+            {
+                handle
+                    .state::<Verification>()
+                    .core
+                    .store
+                    .snack("快手页面暂不可读，自动检查已停止；可在任务中手动重试");
+                handle
+                    .state::<Verification>()
+                    .core
+                    .scheduler
+                    .report_kuaishou_access(&session.record, kuaishou::PAGE_UNAVAILABLE)
+                    .await;
+                dispose(&handle, session.id, true);
+                return;
+            }
+        }
+        session.auto_running.store(false, Ordering::SeqCst);
+    });
+}
 async fn snapshot(window: &WebviewWindow) -> Result<Value, String> {
     let (send, receive) = tokio::sync::oneshot::channel();
     let send = Mutex::new(Some(send));
     window
         .eval_with_callback(
-            "JSON.stringify({href:location.href,html:document.documentElement.outerHTML})",
+            r#"(() => {
+                const pinia=document.querySelector('#app')?.__vue_app__?.config?.globalProperties?.$pinia;
+                const state=pinia?.state?.value || window.__INITIAL_STATE__;
+                const index=state?.liveroom?.activeIndex ?? 0;
+                const raw=Array.isArray(state?.liveroom?.playList) ? state.liveroom.playList[index] : state?.room;
+                const stream=raw?.liveStream;
+                // Project only target-room fields; never copy login or websocket tokens.
+                const room=raw ? {
+                    author:{id:raw.author?.id,name:raw.author?.name},
+                    isLiving:raw.isLiving,
+                    errorType:{type:raw.errorType?.type,title:raw.errorType?.title,content:raw.errorType?.content},
+                    liveStream:stream ? {
+                        caption:stream.caption,title:stream.title,living:stream.living,
+                        user:{user_name:stream.user?.user_name},
+                        playUrls:stream.playUrls,multiResolutionPlayUrls:stream.multiResolutionPlayUrls,
+                        multiResolutionHlsPlayUrls:stream.multiResolutionHlsPlayUrls
+                    } : null
+                } : null;
+                const visible=el=>{
+                    const r=el.getBoundingClientRect();
+                    if(r.width<=20||r.height<=20||r.bottom<=0||r.right<=0||r.top>=innerHeight||r.left>=innerWidth)return false;
+                    for(let p=el;p;p=p.parentElement){const s=getComputedStyle(p);if(s.display==='none'||s.visibility==='hidden'||Number(s.opacity||1)===0)return false;}
+                    return true;
+                };
+                const player=document.querySelector('.swiper-slide-active .player');
+                return JSON.stringify({
+                    href:location.href,state:{room},
+                    text:(player?.innerText||'').slice(0,262144),
+                    loginPromptVisible:Array.from(document.querySelectorAll('[role="dialog"],[class*="login" i]')).some(el=>visible(el)&&/快手APP登录/.test(el.innerText||'')&&/手机号登录/.test(el.innerText||'')),
+                    challengeVisible:Array.from(document.querySelectorAll('iframe[src*="captcha" i],iframe[src*="verify" i],iframe[title*="验证"],[class*="captcha" i],[id*="captcha" i],[class*="geetest" i],[id*="geetest" i],[class*="slider-verify" i],[id*="slider-verify" i]')).some(visible)
+                });
+            })()"#,
             move |value| {
                 if let Some(send) = send.lock().ok().and_then(|mut slot| slot.take()) {
                     let _ = send.send(value);
@@ -401,28 +632,22 @@ async fn snapshot(window: &WebviewWindow) -> Result<Value, String> {
     let inner: String = serde_json::from_str(&result).map_err(|_| "验证页面尚未就绪")?;
     serde_json::from_str(&inner).map_err(|_| "验证页面数据无效".into())
 }
+
 async fn complete(app: &AppHandle, session: &Session) -> Result<String, String> {
     let window = app.get_webview_window(LABEL).ok_or("验证窗口已关闭")?;
-    let epoch = session.loaded.load(Ordering::SeqCst);
     window
-        .set_title("快手验证 · 正在核实目标直播间")
+        .set_title("快手验证 · 正在检查当前页面")
         .map_err(|_| "验证窗口已关闭")?;
-    // One same-session navigation per explicit user completion action. No request polling or CAPTCHA automation.
-    window
-        .navigate(session.target.clone())
-        .map_err(|_| "无法重新核实快手房间")?;
-    tokio::time::timeout(Duration::from_secs(25), async {
-        loop {
-            if session.loaded.load(Ordering::SeqCst) > epoch
-                && window.url().ok().as_ref() == Some(&session.target)
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await
-    .map_err(|_| "快手网页载入超时，未更改登录信息")?;
+    evaluate_current_page(app, session)
+        .await?
+        .ok_or_else(|| "页面仍有可见验证码，请在该页面手动完成".into())
+}
+
+async fn evaluate_current_page(
+    app: &AppHandle,
+    session: &Session,
+) -> Result<Option<String>, String> {
+    let window = app.get_webview_window(LABEL).ok_or("验证窗口已关闭")?;
     let data = snapshot(&window).await?;
     let href = data["href"]
         .as_str()
@@ -431,11 +656,38 @@ async fn complete(app: &AppHandle, session: &Session) -> Result<String, String> 
     if href != session.target {
         return Err("当前页面不是目标直播间，未应用验证结果".into());
     }
-    let html = data["html"]
-        .as_str()
-        .filter(|s| s.len() <= 4 * 1024 * 1024)
-        .ok_or("验证页面数据无效或过大")?;
-    let info = kuaishou::parse_page(html, session.record.quality.as_deref())?;
+    let official = room_url(&session.record.url)?;
+    let expected_id = official
+        .path()
+        .strip_prefix("/u/")
+        .ok_or("目标主播地址无效")?;
+    let visible_text = data["text"].as_str().unwrap_or_default();
+    let challenge_visible = data["challengeVisible"].as_bool().unwrap_or(false);
+    let info = match kuaishou::evaluate_verification_page(
+        &data["state"],
+        expected_id,
+        visible_text,
+        challenge_visible,
+        session.record.quality.as_deref(),
+    ) {
+        kuaishou::VerificationPage::Challenge => return Ok(None),
+        kuaishou::VerificationPage::RateLimited => {
+            report_page_problem(app, session, kuaishou::RATE_LIMITED).await?;
+            return Err(kuaishou::RATE_LIMITED.into());
+        }
+        kuaishou::VerificationPage::LoginRequired => {
+            report_page_problem(app, session, kuaishou::LOGIN_REQUIRED).await?;
+            return Err(kuaishou::LOGIN_REQUIRED.into());
+        }
+        kuaishou::VerificationPage::Room(info) => *info,
+        kuaishou::VerificationPage::Unknown(_)
+            if data["loginPromptVisible"].as_bool() == Some(true) =>
+        {
+            report_page_problem(app, session, kuaishou::LOGIN_PROMPT).await?;
+            return Err(kuaishou::LOGIN_PROMPT.into());
+        }
+        kuaishou::VerificationPage::Unknown(error) => return Err(error),
+    };
     let read_window = window.clone();
     let url = session.target.clone();
     let cookies = tauri::async_runtime::spawn_blocking(move || read_window.cookies_for_url(url))
@@ -448,13 +700,7 @@ async fn complete(app: &AppHandle, session: &Session) -> Result<String, String> 
         "userId",
     );
     let actual_id = cookie_value(&header, "userId");
-    if let Some(expected) = expected_id {
-        if actual_id.as_deref() != Some(expected.as_str()) {
-            return Err("验证账号与原快手账号不一致，登录信息未替换".into());
-        }
-        streamcap_core::platforms::kuaishou_login::verify_login_page(html, &expected)
-            .map_err(|_| "房间已可读，但快手账号尚未验证，请在此窗口完成登录")?;
-    }
+    let persist_session = can_save_page_session(expected_id.as_deref(), actual_id.as_deref())?;
     if session.stop.is_cancelled() {
         return Err("验证已取消".into());
     }
@@ -471,7 +717,7 @@ async fn complete(app: &AppHandle, session: &Session) -> Result<String, String> 
     {
         return Err("任务已更新，验证结果未应用".into());
     }
-    {
+    let saved_session = {
         let mut config = owner.core.config.write().await;
         let saved = config
             .cookies_for_resolver()
@@ -484,24 +730,90 @@ async fn complete(app: &AppHandle, session: &Session) -> Result<String, String> 
         if session.stop.is_cancelled() {
             return Err("验证已取消".into());
         }
-        config
-            .update_cookies(serde_json::Map::from_iter([(
-                "kuaishou".into(),
-                Value::String(header),
-            )]))
-            .map_err(|_| "快手验证成功，但会话保存失败")?;
-    }
-    owner.core.resolver.kuaishou_session_changed().await;
+        if persist_session && saved.as_deref() != Some(header.as_str()) {
+            config
+                .update_cookies(serde_json::Map::from_iter([(
+                    "kuaishou".into(),
+                    Value::String(header.clone()),
+                )]))
+                .map_err(|_| "快手验证成功，但会话保存失败")?;
+        }
+        if persist_session {
+            Some(header.clone())
+        } else {
+            saved
+        }
+    };
+    owner
+        .core
+        .resolver
+        .kuaishou_page_session(saved_session.as_deref(), &header)
+        .await?;
     let result = owner
         .core
         .scheduler
         .accept_verified(&session.record, &info)
         .await;
+    if result.is_ok() {
+        let pending = owner
+            .core
+            .store
+            .all()
+            .await
+            .into_iter()
+            .filter(|record| {
+                record.rec_id != session.record.rec_id
+                    && record.platform_key.as_deref() == Some("kuaishou")
+                    && (record.verification_required || record.access_state == "pageCheck")
+                    && record.monitor_status
+                    && !record.is_recording
+            })
+            .map(|record| record.rec_id);
+        owner.core.scheduler.request_monitoring(pending);
+    }
     log::info!("快手目标房间验证完成");
-    Ok(match result {
-        Ok(outcome) => format!("快手验证完成；{}", outcome.message()),
-        Err(_) => "快手验证完成；当前任务未恢复，请查看任务状态".into(),
-    })
+    Ok(Some(match result {
+        Ok(outcome) => format!("快手页面已恢复；{}", outcome.message()),
+        Err(_) => "快手页面已恢复；当前任务未恢复，请查看任务状态".into(),
+    }))
+}
+fn terminal_page_problem(error: &str) -> bool {
+    matches!(
+        error,
+        kuaishou::RATE_LIMITED | kuaishou::LOGIN_REQUIRED | kuaishou::LOGIN_PROMPT
+    )
+}
+async fn report_page_problem(
+    app: &AppHandle,
+    session: &Session,
+    error: &str,
+) -> Result<(), String> {
+    let owner = app.state::<Verification>();
+    let config = owner.core.config.read().await;
+    let saved = config
+        .cookies_for_resolver()
+        .map_err(|_| "无法核对快手会话")?
+        .get("kuaishou")
+        .cloned();
+    if session.stop.is_cancelled() || saved != session.original_cookie {
+        return Err("旧页面检查已失效，未应用结果".into());
+    }
+    owner.core.resolver.kuaishou_page_problem(error).await;
+    owner
+        .core
+        .scheduler
+        .report_kuaishou_access(&session.record, error)
+        .await;
+    Ok(())
+}
+fn can_save_page_session(expected: Option<&str>, actual: Option<&str>) -> Result<bool, String> {
+    match (expected, actual) {
+        (Some(expected), Some(actual)) if expected != actual => {
+            Err("验证账号与原快手账号不一致，登录信息未替换".into())
+        }
+        (Some(_), None) => Ok(false),
+        _ => Ok(true),
+    }
 }
 fn cookie_value(header: &str, key: &str) -> Option<String> {
     header
@@ -524,7 +836,16 @@ fn cookie_header(cookies: &[Cookie<'static>]) -> Result<String, String> {
                 .is_none_or(|expires| i128::from(expires.unix_timestamp()) > now)
         })
         .collect::<Vec<_>>();
-    cookies.sort_by_key(|cookie| std::cmp::Reverse(cookie.path().unwrap_or("/").len()));
+    cookies.sort_by_key(|cookie| {
+        std::cmp::Reverse((
+            cookie.path().unwrap_or("/").len(),
+            cookie
+                .domain()
+                .unwrap_or_default()
+                .trim_start_matches('.')
+                .len(),
+        ))
+    });
     let header = cookies
         .iter()
         .map(|cookie| format!("{}={}", cookie.name(), cookie.value()))
@@ -533,7 +854,7 @@ fn cookie_header(cookies: &[Cookie<'static>]) -> Result<String, String> {
     if header.is_empty() || header.len() > 65536 || header.contains(['\r', '\n']) {
         return Err("验证未返回有效快手会话，登录信息未保存".into());
     }
-    Ok(header)
+    kuaishou::canonical_cookie_header(&header)
 }
 fn dispose(app: &AppHandle, id: u64, dismissed: bool) {
     let owner = app.state::<Verification>();
@@ -598,12 +919,39 @@ pub async fn wait_shutdown(app: &AppHandle) {
     app.state::<Verification>().tasks.wait().await;
 }
 pub fn status(app: &AppHandle) -> Status {
-    app.state::<Verification>().status()
+    let mut status = app.state::<Verification>().status();
+    status.visible = app
+        .get_webview_window(LABEL)
+        .is_some_and(|window| window.is_visible().unwrap_or(false));
+    status
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn automatic_challenge_requires_stable_consecutive_observations() {
+        let now = std::time::Instant::now();
+        let mut challenge = StableChallenge::default();
+        assert!(!challenge.observe(now, true));
+        assert!(!challenge.observe(now + Duration::from_secs(1), true));
+        assert!(!challenge.observe(now + Duration::from_secs(2), false));
+        // Disappearance or an unreadable snapshot breaks the sequence.
+        assert!(!challenge.observe(now + Duration::from_secs(3), true));
+        assert!(!challenge.observe(now + Duration::from_secs(4), true));
+        assert!(!challenge.observe(now + Duration::from_secs(5), true));
+        assert!(challenge.observe(now + Duration::from_secs(6), true));
+        // A stalled observer is not proof that the challenge stayed visible.
+        assert!(!challenge.observe(now + Duration::from_secs(10), true));
+        assert!(!challenge.observe(now + Duration::from_secs(11), true));
+    }
+    #[test]
+    fn public_room_readability_never_overwrites_saved_login_or_requires_an_unneeded_login() {
+        assert!(!can_save_page_session(Some("original"), None).unwrap());
+        assert!(can_save_page_session(Some("original"), Some("original")).unwrap());
+        assert!(can_save_page_session(Some("original"), Some("other")).is_err());
+        assert!(can_save_page_session(None, None).unwrap());
+    }
     #[test]
     fn navigation_never_grants_external_or_insecure_destinations() {
         for url in [
@@ -626,12 +974,23 @@ mod tests {
         assert!(fixture_target("http://127.0.0.1:9876/api/cookies").is_err());
     }
     #[test]
-    fn cookie_export_preserves_same_name_scopes_without_exposing_other_data() {
+    fn cookie_export_uses_the_same_specific_scope_as_the_http_client() {
         let cookies = vec![
             Cookie::build(("did", "parent")).path("/").build(),
             Cookie::build(("did", "room")).path("/u/").build(),
         ];
-        assert_eq!(cookie_header(&cookies).unwrap(), "did=room; did=parent");
+        assert_eq!(cookie_header(&cookies).unwrap(), "did=room");
+        let domains = vec![
+            Cookie::build(("did", "parent"))
+                .domain(".kuaishou.com")
+                .path("/")
+                .build(),
+            Cookie::build(("did", "host"))
+                .domain("live.kuaishou.com")
+                .path("/")
+                .build(),
+        ];
+        assert_eq!(cookie_header(&domains).unwrap(), "did=host");
         assert_eq!(
             cookie_value("userId=fixture; did=other", "userId").as_deref(),
             Some("fixture")

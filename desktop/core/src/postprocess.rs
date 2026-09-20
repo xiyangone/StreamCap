@@ -584,6 +584,7 @@ impl Postprocessor {
             return Err(invalid("源文件位置已改变"));
         }
         let source_info = probe(&ffprobe, &input.source, "mpegts", &self.inner.stop).await?;
+        self.transition(id, MediaJobState::Running, "正在无损转封装为 MP4");
         if std::fs::symlink_metadata(&input.output).is_ok() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -596,6 +597,11 @@ impl Postprocessor {
                 "-v",
                 "error",
                 "-nostdin",
+                "-nostats",
+                "-progress",
+                "pipe:1",
+                "-stats_period",
+                "2",
                 "-n",
                 "-protocol_whitelist",
                 "file",
@@ -617,9 +623,14 @@ impl Postprocessor {
                 "mp4",
             ])
             .arg(&input.temporary);
-        run(command, &self.inner.stop)
-            .await
-            .map_err(|error| io::Error::other(format!("FFmpeg 转封装未完成: {error}")))?;
+        run_tool(
+            command,
+            &self.inner.stop,
+            true,
+            media_idle_budget(before.len()),
+        )
+        .await
+        .map_err(|error| io::Error::other(format!("FFmpeg 转封装未完成: {error}")))?;
         let temporary_relative = input
             .temporary
             .strip_prefix(input.root.canonicalize()?)
@@ -656,12 +667,18 @@ impl Postprocessor {
             return Err(io::Error::new(io::ErrorKind::Interrupted, "已取消"));
         }
         if input.options.delete_original {
+            self.transition(id, MediaJobState::Running, "正在校验 MP4 完整性");
             let mut verify = self::command(&ffmpeg);
             verify
                 .args([
                     "-v",
                     "error",
                     "-nostdin",
+                    "-nostats",
+                    "-progress",
+                    "pipe:1",
+                    "-stats_period",
+                    "2",
                     "-xerror",
                     "-protocol_whitelist",
                     "file",
@@ -683,9 +700,14 @@ impl Postprocessor {
                     "null",
                     "-",
                 ]);
-            run(verify, &self.inner.stop)
-                .await
-                .map_err(|_| invalid("MP4 完整解码校验失败，源 TS 保留"))?;
+            run_tool(
+                verify,
+                &self.inner.stop,
+                true,
+                media_idle_budget(before.len()),
+            )
+            .await
+            .map_err(|_| invalid("MP4 完整解码校验失败，源 TS 保留"))?;
         }
         let identity = storage::source_identity(&verified_output)?;
         drop(verified_output);
@@ -729,7 +751,46 @@ pub(crate) fn command(program: &Path) -> Command {
     command.creation_flags(0x08000000);
     command
 }
-pub(crate) async fn run(mut command: Command, stop: &CancellationToken) -> io::Result<Vec<u8>> {
+fn media_idle_budget(bytes: u64) -> Duration {
+    // Faststart can relocate the complete output without advancing media time.
+    Duration::from_secs((180 + bytes / (16 * 1024 * 1024)).min(3600))
+}
+fn probe_budget(bytes: u64) -> Duration {
+    Duration::from_secs((600 + bytes / (1024 * 1024)).min(7200))
+}
+async fn drain_bounded(
+    mut reader: impl tokio::io::AsyncRead + Unpin,
+    limit: usize,
+) -> io::Result<Vec<u8>> {
+    let mut retained = Vec::new();
+    let mut buffer = [0; 8192];
+    loop {
+        let count = reader.read(&mut buffer).await?;
+        if count == 0 {
+            return Ok(retained);
+        }
+        let keep = count.min((limit + 1).saturating_sub(retained.len()));
+        retained.extend_from_slice(&buffer[..keep]);
+    }
+}
+async fn wait_for_stall(advanced: Arc<Mutex<tokio::time::Instant>>, budget: Duration) {
+    loop {
+        let deadline = *advanced.lock().expect("media progress") + budget;
+        tokio::time::sleep_until(deadline).await;
+        if advanced.lock().expect("media progress").elapsed() >= budget {
+            return;
+        }
+    }
+}
+pub(crate) async fn run(command: Command, stop: &CancellationToken) -> io::Result<Vec<u8>> {
+    run_tool(command, stop, false, Duration::from_secs(600)).await
+}
+async fn run_tool(
+    mut command: Command,
+    stop: &CancellationToken,
+    progress: bool,
+    budget: Duration,
+) -> io::Result<Vec<u8>> {
     let mut child = command.spawn()?;
     let stdout = child
         .stdout
@@ -739,25 +800,34 @@ pub(crate) async fn run(mut command: Command, stop: &CancellationToken) -> io::R
         .stderr
         .take()
         .ok_or_else(|| io::Error::other("无法读取处理错误"))?;
+    let advanced = Arc::new(Mutex::new(tokio::time::Instant::now()));
+    let reader_progress = advanced.clone();
     let out = tokio::spawn(async move {
-        let mut data = Vec::new();
-        stdout
-            .take(1024 * 1024 + 1)
-            .read_to_end(&mut data)
-            .await
-            .map(|_| data)
+        if !progress {
+            return drain_bounded(stdout, 1024 * 1024).await;
+        }
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let mut lines = BufReader::new(stdout).lines();
+        let mut previous = 0;
+        while let Some(line) = lines.next_line().await? {
+            if let Some(value) = line
+                .strip_prefix("out_time_us=")
+                .and_then(|n| n.trim().parse::<u64>().ok())
+            {
+                if value > previous {
+                    previous = value;
+                    *reader_progress.lock().expect("media progress") = tokio::time::Instant::now();
+                }
+            }
+        }
+        Ok(Vec::new())
     });
-    let err = tokio::spawn(async move {
-        let mut data = Vec::new();
-        stderr
-            .take(64 * 1024 + 1)
-            .read_to_end(&mut data)
-            .await
-            .map(|_| data)
-    });
+    let err = tokio::spawn(drain_bounded(stderr, 64 * 1024));
     let status = tokio::select! { biased;
         _ = stop.cancelled() => { let _ = child.start_kill(); let _ = child.wait().await; None },
-        result = tokio::time::timeout(Duration::from_secs(600), child.wait()) => match result { Ok(value) => Some(value), Err(_) => { let _ = child.start_kill(); let _ = child.wait().await; None } },
+        _ = wait_for_stall(advanced, budget) => { let _ = child.start_kill(); let _ = child.wait().await; None },
+        _ = tokio::time::sleep(Duration::from_secs(86400)) => { let _ = child.start_kill(); let _ = child.wait().await; None },
+        result = child.wait() => Some(result),
     };
     let stdout = out.await.map_err(io::Error::other)??;
     let stderr = err.await.map_err(io::Error::other)??;
@@ -796,7 +866,13 @@ async fn probe(
         "json",
     ])
     .arg(file);
-    let raw = run(cmd, stop).await?;
+    let raw = run_tool(
+        cmd,
+        stop,
+        false,
+        probe_budget(std::fs::metadata(file)?.len()),
+    )
+    .await?;
     let value: Value = serde_json::from_slice(&raw).map_err(io::Error::other)?;
     let mut streams: Vec<_> = value["streams"]
         .as_array()
@@ -834,6 +910,38 @@ async fn probe(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn continuing_progress_outlives_old_total_timeout_but_idle_still_expires() {
+        let advanced = Arc::new(Mutex::new(tokio::time::Instant::now()));
+        let clock = advanced.clone();
+        let waiter = tokio::spawn(wait_for_stall(clock, Duration::from_secs(180)));
+        for _ in 0..8 {
+            tokio::time::advance(Duration::from_secs(100)).await;
+            *advanced.lock().unwrap() = tokio::time::Instant::now();
+            tokio::task::yield_now().await;
+            assert!(!waiter.is_finished());
+        }
+        tokio::time::advance(Duration::from_secs(179)).await;
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        waiter.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bounded_output_keeps_draining_after_its_retention_limit() {
+        use tokio::io::AsyncWriteExt;
+        let (mut writer, reader) = tokio::io::duplex(32);
+        let producer = tokio::spawn(async move {
+            writer.write_all(&vec![b'x'; 131072]).await.unwrap();
+        });
+        let output = tokio::time::timeout(Duration::from_secs(2), drain_bounded(reader, 64))
+            .await
+            .unwrap()
+            .unwrap();
+        producer.await.unwrap();
+        assert_eq!(output, vec![b'x'; 65]);
+    }
     #[tokio::test]
     async fn queued_jobs_are_protected_deduplicated_and_cancelled_at_shutdown() {
         let dir = tempfile::tempdir().unwrap();

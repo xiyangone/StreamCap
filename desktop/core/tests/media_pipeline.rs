@@ -174,6 +174,163 @@ fn recordings(root: &Path) -> Vec<PathBuf> {
 }
 
 #[tokio::test]
+#[ignore = "requires STREAMCAP_TEST_FFMPEG and rustc; real local recording with a gated slow subtitle probe"]
+async fn media_slow_finish_publishes_stop_releases_global_locks_and_is_awaited_at_shutdown() {
+    let tools = tempfile::tempdir().unwrap();
+    let local_ffmpeg = tools.path().join(if cfg!(windows) {
+        "ffmpeg.exe"
+    } else {
+        "ffmpeg"
+    });
+    std::fs::copy(ffmpeg(), &local_ffmpeg).unwrap();
+    let probe = local_ffmpeg.with_file_name(if cfg!(windows) {
+        "ffprobe.exe"
+    } else {
+        "ffprobe"
+    });
+    let source_file = tools.path().join("slow_probe.rs");
+    std::fs::write(
+        &source_file,
+        r#"
+fn main() {
+    let root = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
+    std::fs::write(root.join("entered"), b"ready").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
+    while !root.join("release").exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    println!("2.0");
+}
+"#,
+    )
+    .unwrap();
+    let compiled = command(Path::new("rustc"))
+        .arg("--crate-name")
+        .arg("slow_probe")
+        .arg(&source_file)
+        .arg("-o")
+        .arg(&probe)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    for manual in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = state(root.path(), false).await;
+        state
+            .config
+            .write()
+            .await
+            .update_user_config(
+                json!({"generate_time_subtitle_file":true})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )
+            .unwrap();
+        state.scheduler = Arc::new(Scheduler::new(
+            state.store.clone(),
+            state.engine.clone(),
+            state.config.clone(),
+            state.resolver.clone(),
+            Some(local_ffmpeg.clone()),
+            state.recording_enabled.clone(),
+        ));
+        let stream = source(sample_ts(if manual { "20" } else { "2.2" }).await).await;
+        add(&state, stream.url.clone(), false).await;
+        state
+            .scheduler
+            .start_recording(
+                "media".into(),
+                &streamcap_core::resolver::StreamInfo {
+                    is_live: true,
+                    record_url: stream.url.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        if manual {
+            tokio::time::timeout(Duration::from_secs(15), async {
+                while !recordings(root.path())
+                    .iter()
+                    .any(|p| p.metadata().is_ok_and(|m| m.len() > 1880))
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(tokio::time::timeout(
+                Duration::from_secs(3),
+                state.scheduler.stop_recording("media")
+            )
+            .await
+            .unwrap());
+        }
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !tools.path().join("entered").exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !state.store.get("media").await.unwrap().is_recording,
+            "manual={manual}: pending subtitles are not recording"
+        );
+        assert!(state.engine.active_ids().await.is_empty());
+        assert!(state.store.get("media").await.unwrap().speed.is_none());
+        let guard =
+            tokio::time::timeout(Duration::from_millis(500), state.engine.filesystem_guard())
+                .await
+                .expect("slow subtitles must not hold the filesystem lock");
+        let outputs: Vec<_> = recordings(root.path())
+            .into_iter()
+            .map(|path| path.canonicalize().unwrap())
+            .collect();
+        assert!(!outputs.is_empty());
+        for output in &outputs {
+            assert!(
+                state.engine.protects_path(output).await,
+                "unfinished media remains protected"
+            );
+        }
+        drop(guard);
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            state.scheduler.stop_recording("unrelated"),
+        )
+        .await
+        .expect("unrelated operations must not wait for subtitles");
+        let closing = state.clone();
+        let shutdown = tokio::spawn(async move { api::shutdown(&closing).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !shutdown.is_finished(),
+            "shutdown must await the tracked finish task"
+        );
+        std::fs::write(tools.path().join("release"), b"continue").unwrap();
+        tokio::time::timeout(Duration::from_secs(8), shutdown)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        for output in outputs {
+            assert!(output.exists());
+            assert!(output.with_extension("srt").exists());
+            assert!(!state.engine.protects_path(&output).await);
+        }
+        std::fs::remove_file(tools.path().join("entered")).unwrap();
+        std::fs::remove_file(tools.path().join("release")).unwrap();
+    }
+}
+
+#[tokio::test]
 #[ignore = "requires STREAMCAP_TEST_FFMPEG; synthetic local TS only"]
 async fn media_manual_conversion_preserves_ts_and_never_overwrites_mp4() {
     let directory = tempfile::tempdir().unwrap();
@@ -343,9 +500,17 @@ async fn media_natural_end_and_segmented_output_convert_each_completed_file() {
     let source = source(sample_ts("5").await).await;
     add(&state, source.url.clone(), true).await;
     state.scheduler.force_start("media".into()).await.unwrap();
+    state
+        .store
+        .update("media", |record| {
+            record.live_title = Some("stale title before natural EOF".into());
+            record.check_error = Some("stale detection before natural EOF".into());
+        })
+        .await;
     tokio::time::timeout(Duration::from_secs(18), async {
         loop {
-            if !state.store.get("media").await.unwrap().is_recording {
+            let record = state.store.get("media").await.unwrap();
+            if !record.is_recording && record.live_title.is_none() && record.check_error.is_none() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -354,6 +519,14 @@ async fn media_natural_end_and_segmented_output_convert_each_completed_file() {
     .await
     .unwrap();
     wait_jobs(&state).await;
+    assert!(
+        state.engine.active_ids().await.is_empty(),
+        "post-EOF state refresh must not restart the finite source"
+    );
+    assert_eq!(
+        state.config.read().await.get_i64("loop_time_seconds", 0),
+        4500
+    );
     let files = recordings(directory.path());
     assert!(
         files.len() >= 2,
@@ -1086,4 +1259,52 @@ async fn media_large_ts_seeks_forward_and_backward_without_full_conversion() {
     state.preview.shutdown().await;
     assert_eq!(state.preview.active(), 0);
     api::shutdown(&state).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires STREAMCAP_TEST_FFMPEG; verifies local preview is not throttled to playback speed"]
+async fn media_preview_buffers_ahead_and_keeps_source_unchanged() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = state(temp.path(), false).await;
+    let root = temp.path().join("downloads");
+    let original = sample_ts("12").await;
+    std::fs::write(root.join("buffer-ahead.ts"), &original).unwrap();
+    let info = state
+        .preview
+        .info(
+            &state.storage,
+            root.clone(),
+            "buffer-ahead.ts".into(),
+            Some(ffmpeg()),
+        )
+        .await
+        .unwrap();
+    assert!(info.duration_seconds.unwrap() >= 11.5);
+    let started = std::time::Instant::now();
+    let response = state
+        .preview
+        .transcode(
+            &state.storage,
+            root.clone(),
+            "buffer-ahead.ts".into(),
+            ffmpeg(),
+            0.0,
+        )
+        .await
+        .unwrap();
+    let bytes = tokio::time::timeout(
+        Duration::from_secs(8),
+        axum::body::to_bytes(response.into_body(), 32 * 1024 * 1024),
+    )
+    .await
+    .expect("local buffering must not take the 12-second playback duration")
+    .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(8));
+    assert!(bytes.len() > 1880);
+    assert_eq!(
+        std::fs::read(root.join("buffer-ahead.ts")).unwrap(),
+        original
+    );
+    state.preview.shutdown().await;
+    assert_eq!(state.preview.active(), 0);
 }

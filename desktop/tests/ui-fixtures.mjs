@@ -48,7 +48,7 @@ function initialState({ empty = false, offline = false } = {}) {
   return {
     recordings: empty ? [] : seedRecordings(), userConfig: {}, defaultConfig: structuredClone(defaults),
     cookies: { douyin: 'fixture-douyin-not-a-credential', bilibili: 'fixture-bilibili-not-a-credential' },
-    offline, resolverReady: true, requests: [], unexpected: [], nextId: 7, mediaJobs: [], previewLive: false, activePreviews: 0,
+    offline, resolverReady: true, requests: [], unexpected: [], nextId: 7, mediaJobs: [], previewLive: false, activePreviews: 0, maxActivePreviews: 0, previewStarts: [],
     failures: [], delays: [], qrPhase: 'waiting', qrCancelled: 0, accounts: {}, quickShutdown: null, installation: {state:'idle',message:'FFmpeg 与 ffprobe 已就绪',bytes:0},
     native: { maximized: false, visible: true, closing: false, trayAvailable: true, pending: false, calls: [], failRemember: false, systemShutdown:false, shutdownSeconds:null },
     files: [
@@ -69,6 +69,28 @@ function wave() {
   bytes.writeUInt16LE(2, 32); bytes.writeUInt16LE(16, 34); bytes.write('data', 36);
   bytes.writeUInt32LE(16000, 40);
   return bytes;
+}
+
+export async function streamPreviewFixture(res, prepareBytes, state, preview) {
+  if (res.destroyed) return;
+  let closed = false, counted = false;
+  // Preparation can outlive the client; observe closure before the first await.
+  res.once('close', () => {
+    closed = true;
+    if (counted) { state.activePreviews--; counted = false; }
+  });
+  const bytes = await prepareBytes();
+  if (closed || res.destroyed) return;
+  counted = true;
+  state.activePreviews++;
+  state.maxActivePreviews = Math.max(state.maxActivePreviews, state.activePreviews);
+  state.previewStarts.push(preview);
+  res.writeHead(200, { 'Content-Type': 'video/mp2t' });
+  for (let offset = 0; offset < bytes.length && !closed; offset += 4096) {
+    res.write(bytes.subarray(offset, offset + 4096));
+    await delay(60);
+  }
+  if (!closed) res.end();
 }
 
 export async function createHarness(label, options = {}) {
@@ -165,14 +187,16 @@ export async function createHarness(label, options = {}) {
       }
       if (path === '/api/recordings' && method === 'GET') { json(res, state.recordings); return; }
       if (path === '/api/recordings' && method === 'POST') {
-        const created = (body.items ?? []).map((item) => {
+        const created = [], skipped = [];
+        for (const item of body.items ?? []) {
+          if (state.recordings.some(record => record.url === item.url)) { skipped.push({url:item.url,reason:'duplicate'}); continue; }
           const base = seedRecordings()[2];
           const record = { ...base, recId: 'fixture-' + state.nextId++, url: item.url, streamerName: item.streamerName || '新直播间', platform: '自定义流', platformKey: 'custom', monitorStatus: true, liveTitle: null, inheritedFields: Object.keys(inheritance) };
           updateInherited(record);
           if (item.quality) { record.quality = item.quality; record.inheritedFields = record.inheritedFields.filter((key) => key !== 'quality'); }
-          state.recordings.push(record); emit('update', record); return record;
-        });
-        json(res, { created }); return;
+          state.recordings.push(record); created.push(record); emit('update', record);
+        }
+        json(res, { created, skipped }); return;
       }
       if (path === '/api/recordings/batch-edit' && method === 'POST') {
         const ids = body.recIds;
@@ -244,8 +268,9 @@ export async function createHarness(label, options = {}) {
         setTimeout(()=>{job.state='complete';job.message='MP4 已生成并校验；原 TS 保留';state.files.push({name:output.split('/').at(-1),isDir:false,size:24000,path:output,modified:sampleDate});emit('mediaJob',job);},300);return;
       }
       if (path === '/api/media/transcode' || /^\/api\/recordings\/[^/]+\/preview$/.test(path)) {
-        const bytes=path==='/api/media/transcode'?await segmentBytes(Number(url.searchParams.get('start')||0)):await tsBytes();state.activePreviews++;let closed=false;res.once('close',()=>{closed=true;state.activePreviews--;});res.writeHead(200,{'Content-Type':'video/mp2t'});
-        for(let offset=0;offset<bytes.length&&!closed;offset+=4096){res.write(bytes.subarray(offset,offset+4096));await delay(60);}if(!closed)res.end();return;
+        const start = Number(url.searchParams.get('start') || 0);
+        await streamPreviewFixture(res, () => path === '/api/media/transcode' ? segmentBytes(start) : tsBytes(), state, { start, path });
+        return;
       }
       if (path === '/api/videos') {
         const file=url.searchParams.get('path')??'';
