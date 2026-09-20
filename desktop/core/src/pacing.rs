@@ -6,6 +6,48 @@ use std::{
 };
 use tokio::{sync::Notify, time::Instant};
 use tokio_util::sync::CancellationToken;
+
+/// Automatic room checks share one queue across platforms and event sources.
+/// Jitter spreads their starts; it never shortens a room's configured poll interval.
+#[derive(Clone)]
+pub(crate) struct AutomaticPacer {
+    next: Arc<tokio::sync::Mutex<Instant>>,
+}
+impl Default for AutomaticPacer {
+    fn default() -> Self {
+        Self {
+            next: Arc::new(tokio::sync::Mutex::new(Instant::now())),
+        }
+    }
+}
+pub(crate) struct AutomaticPermit {
+    next: tokio::sync::OwnedMutexGuard<Instant>,
+}
+impl Drop for AutomaticPermit {
+    fn drop(&mut self) {
+        let seconds = 20 + (uuid::Uuid::new_v4().as_u128() % 21) as u64;
+        *self.next = Instant::now() + Duration::from_secs(seconds);
+    }
+}
+impl AutomaticPacer {
+    pub(crate) async fn acquire(
+        &self,
+        cancel: &CancellationToken,
+    ) -> Result<AutomaticPermit, String> {
+        let next = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err("自动检测已取消".into()),
+            next = self.next.clone().lock_owned() => next,
+        };
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err("自动检测已取消".into()),
+            _ = tokio::time::sleep_until(*next) => {},
+        }
+        Ok(AutomaticPermit { next })
+    }
+}
+
 struct GateState {
     active: usize,
     next: Instant,
@@ -106,6 +148,46 @@ impl Pacer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn automatic_checks_are_serial_and_wait_twenty_to_forty_seconds_after_completion() {
+        let pacer = AutomaticPacer::default();
+        let first = pacer.acquire(&CancellationToken::new()).await.unwrap();
+        let next = pacer.clone();
+        let waiter =
+            tokio::spawn(async move { next.acquire(&CancellationToken::new()).await.unwrap() });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert!(
+            !waiter.is_finished(),
+            "only one automatic check may run at a time"
+        );
+        drop(first);
+        tokio::time::advance(Duration::from_secs(19)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "queued checks must not start in a burst"
+        );
+        tokio::time::advance(Duration::from_secs(21)).await;
+        drop(waiter.await.unwrap());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn automatic_queue_wait_is_cancelled_without_waiting_for_the_next_slot() {
+        let pacer = AutomaticPacer::default();
+        let first = pacer.acquire(&CancellationToken::new()).await.unwrap();
+        let stop = CancellationToken::new();
+        let waiting = pacer.clone();
+        let token = stop.clone();
+        let waiter = tokio::spawn(async move { waiting.acquire(&token).await.is_err() });
+        tokio::task::yield_now().await;
+        stop.cancel();
+        assert!(waiter.await.unwrap());
+        drop(first);
+        let stopped = CancellationToken::new();
+        stopped.cancel();
+        assert!(pacer.acquire(&stopped).await.is_err());
+    }
     #[tokio::test]
     async fn shared_limit_and_spacing_apply_to_all_callers() {
         let p = Pacer::default();

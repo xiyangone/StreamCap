@@ -57,6 +57,16 @@ pub struct Recording {
     pub check_error: Option<String>,
     #[serde(default)]
     pub verification_required: bool,
+    #[serde(default)]
+    pub access_state: String,
+    #[serde(default)]
+    pub check_state: String,
+    #[serde(default)]
+    pub last_check_at: Option<i64>,
+    #[serde(default)]
+    pub last_success_at: Option<i64>,
+    #[serde(default)]
+    pub next_check_at: Option<i64>,
     pub live_title: Option<String>,
     pub speed: Option<String>,
     pub recording_dir: Option<String>,
@@ -90,16 +100,36 @@ impl Recording {
     pub fn status(&self) -> StatusKind {
         if self.is_recording {
             StatusKind::Recording
+        } else if self.check_state == "checking" {
+            StatusKind::Checking
         } else if self.verification_required {
             StatusKind::Verification
+        } else if self.access_state == "cooldown" {
+            StatusKind::Cooldown
+        } else if self.access_state == "pageCheck" {
+            StatusKind::PageCheck
+        } else if self.access_state == "loginRequired" {
+            StatusKind::LoginRequired
+        } else if self.access_state == "loginPrompt" {
+            StatusKind::LoginPrompt
         } else if self
             .check_error
             .as_ref()
             .is_some_and(|error| !error.is_empty())
         {
             StatusKind::CheckFailed
+        } else if self.check_state == "queued" && self.monitor_status {
+            StatusKind::Queued
         } else if self.is_live {
             StatusKind::Live
+        } else if self
+            .recording_error
+            .as_ref()
+            .is_some_and(|error| !error.is_empty())
+        {
+            StatusKind::RecordingFailed
+        } else if self.check_state == "waiting" && self.monitor_status {
+            StatusKind::Waiting
         } else if self.monitor_status {
             StatusKind::Monitoring
         } else {
@@ -110,6 +140,14 @@ impl Recording {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusKind {
+    Cooldown,
+    PageCheck,
+    LoginRequired,
+    LoginPrompt,
+    Waiting,
+    Queued,
+    Checking,
+    RecordingFailed,
     Verification,
     CheckFailed,
     Recording,
@@ -120,6 +158,14 @@ pub enum StatusKind {
 impl StatusKind {
     pub fn label(self) -> &'static str {
         match self {
+            Self::Cooldown => crate::app::i18n::t("平台冷却中"),
+            Self::PageCheck => crate::app::i18n::t("页面待检查"),
+            Self::LoginRequired => crate::app::i18n::t("需要登录"),
+            Self::LoginPrompt => crate::app::i18n::t("登录提示"),
+            Self::Waiting => crate::app::i18n::t("等待首检"),
+            Self::Queued => crate::app::i18n::t("排队中"),
+            Self::Checking => crate::app::i18n::t("检测中"),
+            Self::RecordingFailed => crate::app::i18n::t("录制异常"),
             Self::Verification => crate::app::i18n::t("待验证"),
             Self::CheckFailed => crate::app::i18n::t("检测异常"),
             Self::Recording => crate::app::i18n::t("录制中"),
@@ -130,12 +176,58 @@ impl StatusKind {
     }
     pub fn class(self) -> &'static str {
         match self {
-            Self::Verification | Self::CheckFailed => "badge attention",
+            Self::Verification
+            | Self::CheckFailed
+            | Self::RecordingFailed
+            | Self::Cooldown
+            | Self::LoginRequired
+            | Self::LoginPrompt => "badge attention",
             Self::Recording => "badge recording",
             Self::Live => "badge live",
-            Self::Monitoring => "badge monitoring",
+            Self::Monitoring | Self::Waiting | Self::Queued | Self::Checking | Self::PageCheck => {
+                "badge monitoring"
+            }
             Self::Stopped => "badge stopped",
         }
+    }
+}
+
+#[cfg(test)]
+mod detection_status_tests {
+    use super::*;
+    #[test]
+    fn page_rate_limit_login_and_captcha_have_distinct_statuses() {
+        for (access, expected) in [
+            ("pageCheck", StatusKind::PageCheck),
+            ("cooldown", StatusKind::Cooldown),
+            ("loginRequired", StatusKind::LoginRequired),
+            ("loginPrompt", StatusKind::LoginPrompt),
+        ] {
+            let record = Recording {
+                access_state: access.into(),
+                check_error: Some("unreadable".into()),
+                ..Default::default()
+            };
+            assert_eq!(record.status(), expected);
+            assert!(!record.verification_required);
+        }
+    }
+    #[test]
+    fn active_check_is_visible_over_previous_errors_but_not_an_active_recording() {
+        let mut record = Recording {
+            check_state: "checking".into(),
+            check_error: Some("previous failure".into()),
+            verification_required: true,
+            ..Default::default()
+        };
+        assert_eq!(record.status(), StatusKind::Checking);
+        record.check_state = "idle".into();
+        assert_eq!(record.status(), StatusKind::Verification);
+        record.verification_required = false;
+        assert_eq!(record.status(), StatusKind::CheckFailed);
+        record.check_state = "checking".into();
+        record.is_recording = true;
+        assert_eq!(record.status(), StatusKind::Recording);
     }
 }
 
@@ -144,6 +236,8 @@ impl StatusKind {
 pub struct GatewayStatus {
     pub ok: bool,
     pub version: String,
+    #[serde(default)]
+    pub build_id: String,
     pub active_recordings: usize,
     pub total_recordings: usize,
     #[serde(default)]
@@ -220,11 +314,204 @@ pub struct Notice {
     pub kind: NoticeKind,
 }
 
+/// Keep only the latest delta for each entity while a snapshot is in flight.
+/// A newer request supersedes older responses without starving under frequent SSE updates.
+#[derive(Debug)]
+struct SnapshotMerge<T> {
+    generation: u64,
+    pending: bool,
+    loaded: bool,
+    error: Option<String>,
+    changes: Vec<(String, Option<T>)>,
+}
+impl<T> Default for SnapshotMerge<T> {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            pending: false,
+            loaded: false,
+            error: None,
+            changes: Vec::new(),
+        }
+    }
+}
+impl<T> SnapshotMerge<T> {
+    fn begin(&mut self) -> u64 {
+        self.generation = self.generation.wrapping_add(1);
+        self.pending = true;
+        self.changes.clear();
+        self.generation
+    }
+    fn observe(&mut self, id: String, value: Option<T>) {
+        if !self.pending {
+            return;
+        }
+        if let Some((_, current)) = self.changes.iter_mut().find(|(key, _)| key == &id) {
+            *current = value;
+        } else {
+            self.changes.push((id, value));
+        }
+    }
+    fn needs_refresh(&self) -> bool {
+        !self.loaded || self.error.is_some()
+    }
+    fn fail(&mut self, generation: u64, error: String) -> bool {
+        if generation != self.generation || !self.pending {
+            return false;
+        }
+        self.pending = false;
+        self.error = Some(error);
+        self.changes.clear();
+        true
+    }
+    fn finish(
+        &mut self,
+        generation: u64,
+        mut list: Vec<T>,
+        key: impl Fn(&T) -> &str,
+    ) -> Option<Vec<T>> {
+        if generation != self.generation || !self.pending {
+            return None;
+        }
+        self.pending = false;
+        self.loaded = true;
+        self.error = None;
+        for (id, value) in self.changes.drain(..) {
+            match value {
+                None => list.retain(|item| key(item) != id),
+                Some(value) => {
+                    if let Some(item) = list.iter_mut().find(|item| key(item) == id) {
+                        *item = value;
+                    } else {
+                        list.push(value);
+                    }
+                }
+            }
+        }
+        Some(list)
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::SnapshotMerge;
+    type Item = (String, u32);
+    fn item(id: &str, value: u32) -> Item {
+        (id.into(), value)
+    }
+    fn key(item: &Item) -> &str {
+        &item.0
+    }
+
+    #[test]
+    fn delayed_snapshot_cannot_restore_deleted_entities_or_old_values() {
+        let mut sync = SnapshotMerge::default();
+        let generation = sync.begin();
+        sync.observe("removed".into(), None);
+        sync.observe("updated".into(), Some(item("updated", 2)));
+        sync.observe("added".into(), Some(item("added", 3)));
+        assert_eq!(
+            sync.finish(
+                generation,
+                vec![item("removed", 0), item("updated", 0), item("untouched", 1)],
+                key
+            )
+            .unwrap(),
+            vec![item("updated", 2), item("untouched", 1), item("added", 3)]
+        );
+        assert!(!sync.pending && sync.changes.is_empty());
+    }
+    #[test]
+    fn frequent_events_are_coalesced_without_starving_initial_snapshot() {
+        let mut sync = SnapshotMerge::default();
+        let generation = sync.begin();
+        for value in 0..10_000 {
+            sync.observe("progress".into(), Some(item("progress", value)));
+        }
+        assert_eq!(sync.changes.len(), 1);
+        assert_eq!(
+            sync.finish(generation, vec![item("untouched", 1)], key)
+                .unwrap(),
+            vec![item("untouched", 1), item("progress", 9_999)]
+        );
+    }
+    #[test]
+    fn older_requests_and_errors_cannot_overwrite_a_newer_refresh() {
+        let mut sync = SnapshotMerge::default();
+        let old = sync.begin();
+        let current = sync.begin();
+        sync.observe("removed".into(), None);
+        assert!(!sync.fail(old, "old error".into()));
+        assert!(sync.finish(old, vec![item("removed", 0)], key).is_none());
+        assert_eq!(
+            sync.finish(current, vec![item("removed", 0), item("kept", 1)], key)
+                .unwrap(),
+            vec![item("kept", 1)]
+        );
+    }
+    #[test]
+    fn completed_or_failed_requests_do_not_keep_an_event_backlog() {
+        let mut sync = SnapshotMerge::default();
+        let generation = sync.begin();
+        sync.observe("job".into(), Some(item("job", 1)));
+        assert!(sync.fail(generation, "request failed".into()));
+        sync.observe("job".into(), Some(item("job", 2)));
+        assert!(sync.changes.is_empty());
+        assert!(sync.finish(generation, vec![], key).is_none());
+    }
+    #[test]
+    fn superseded_startup_responses_never_complete_initialization() {
+        for old_succeeds in [false, true] {
+            for newest_finishes_first in [false, true] {
+                let mut sync = SnapshotMerge::default();
+                let old = sync.begin();
+                let current = sync.begin();
+                if newest_finishes_first {
+                    assert!(sync.fail(current, "current failure".into()));
+                }
+                if old_succeeds {
+                    assert!(sync.finish(old, vec![item("old", 0)], key).is_none());
+                } else {
+                    assert!(!sync.fail(old, "old failure".into()));
+                }
+                if !newest_finishes_first {
+                    assert!(sync.fail(current, "current failure".into()));
+                }
+                assert!(!sync.loaded && !sync.pending && sync.needs_refresh());
+                assert_eq!(sync.error.as_deref(), Some("current failure"));
+                let retry = sync.begin();
+                assert!(sync.pending && sync.needs_refresh());
+                assert_eq!(sync.error.as_deref(), Some("current failure"));
+                assert_eq!(sync.finish(retry, vec![], key), Some(vec![]));
+                assert!(sync.loaded && !sync.needs_refresh());
+                assert!(sync.error.is_none());
+            }
+        }
+    }
+    #[test]
+    fn failed_refresh_preserves_loaded_data_and_retries_until_current_success() {
+        let mut sync = SnapshotMerge::default();
+        let initial = sync.begin();
+        assert!(sync.finish(initial, vec![item("kept", 1)], key).is_some());
+        let failed = sync.begin();
+        assert!(sync.fail(failed, "refresh failed".into()));
+        assert!(sync.loaded && sync.needs_refresh());
+        let recovery = sync.begin();
+        assert_eq!(sync.error.as_deref(), Some("refresh failed"));
+        assert!(sync.finish(recovery, vec![item("kept", 2)], key).is_some());
+        assert!(!sync.fail(failed, "late failure".into()));
+        assert!(sync.loaded && !sync.pending && !sync.needs_refresh());
+        assert!(sync.error.is_none());
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct AppState {
     pub status: RwSignal<GatewayStatus>,
     pub recordings: RwSignal<Vec<Recording>>,
     pub media_jobs: RwSignal<Vec<MediaJob>>,
+    recordings_snapshot: StoredValue<SnapshotMerge<Recording>>,
+    jobs_snapshot: StoredValue<SnapshotMerge<MediaJob>>,
     pub settings: RwSignal<Map<String, Value>>,
     pub settings_version: RwSignal<u32>,
     pub notice: RwSignal<Option<Notice>>,
@@ -238,6 +525,39 @@ pub struct AppState {
     pub grid_view: RwSignal<bool>,
 }
 impl AppState {
+    fn snapshots_need_refresh(self) -> bool {
+        self.recordings_snapshot
+            .with_value(SnapshotMerge::needs_refresh)
+            || self.jobs_snapshot.with_value(SnapshotMerge::needs_refresh)
+    }
+    fn snapshot_pending(self) -> bool {
+        self.recordings_snapshot.with_value(|sync| sync.pending)
+            || self.jobs_snapshot.with_value(|sync| sync.pending)
+    }
+    fn snapshot_error(self) -> Option<String> {
+        self.recordings_snapshot
+            .with_value(|sync| sync.error.clone())
+            .or_else(|| self.jobs_snapshot.with_value(|sync| sync.error.clone()))
+    }
+    fn publish_snapshot_result(self) {
+        if self
+            .recordings_snapshot
+            .with_value(|sync| sync.loaded || sync.error.is_some())
+        {
+            self.loading.set(false);
+        }
+        let error = self.snapshot_error();
+        if error.is_some() || self.status.get_untracked().ok {
+            self.error.set(error);
+        }
+    }
+    fn recount_recordings(self) {
+        let list = self.recordings.get_untracked();
+        self.status.update(|status| {
+            status.total_recordings = list.len();
+            status.active_recordings = list.iter().filter(|record| record.is_recording).count();
+        });
+    }
     pub fn is_dark(self) -> bool {
         match self.theme.get().as_str() {
             "dark" => true,
@@ -319,6 +639,8 @@ pub fn provide_app_state() -> AppState {
         status: RwSignal::new(GatewayStatus::default()),
         recordings: RwSignal::new(Vec::new()),
         media_jobs: RwSignal::new(Vec::new()),
+        recordings_snapshot: StoredValue::new(SnapshotMerge::default()),
+        jobs_snapshot: StoredValue::new(SnapshotMerge::default()),
         settings: RwSignal::new(Map::new()),
         settings_version: RwSignal::new(0),
         notice: RwSignal::new(None),
@@ -397,12 +719,20 @@ async fn call<T: DeserializeOwned>(
         None => builder.build(),
     }
     .map_err(|_| crate::app::i18n::t("无法构造请求").to_string())?;
-    let timer = gloo_timers::callback::Timeout::new(12_000, move || abort.abort());
+    let timeout_ms = if path == "/api/tools/install" {
+        600_000
+    } else if method == "GET" {
+        12_000
+    } else {
+        120_000
+    };
+    let timer = gloo_timers::callback::Timeout::new(timeout_ms, move || abort.abort());
     let response = request.send().await.map_err(|_| {
         crate::app::i18n::t("本地服务未响应；请刷新确认操作结果后再重试").to_string()
     })?;
+    let result = decode(response).await;
     drop(timer);
-    decode(response).await
+    result
 }
 
 pub async fn fetch_status() -> Result<GatewayStatus, String> {
@@ -415,37 +745,86 @@ pub async fn fetch_settings() -> Result<SettingsPayload, String> {
     call("GET", "/api/settings", None).await
 }
 pub async fn refresh_recordings(state: AppState) -> Result<(), String> {
-    let list = fetch_recordings().await?;
-    state.status.update(|s| {
-        s.total_recordings = list.len();
-        s.active_recordings = list.iter().filter(|r| r.is_recording).count();
-    });
+    let Some(generation) = state
+        .recordings_snapshot
+        .try_update_value(SnapshotMerge::begin)
+    else {
+        return Ok(());
+    };
+    let list = match fetch_recordings().await {
+        Ok(list) => list,
+        Err(error) => {
+            if state
+                .recordings_snapshot
+                .try_update_value(|sync| sync.fail(generation, error.clone()))
+                == Some(true)
+            {
+                state.publish_snapshot_result();
+                return Err(error);
+            }
+            return Ok(());
+        }
+    };
+    let Some(list) = state
+        .recordings_snapshot
+        .try_update_value(|sync| sync.finish(generation, list, |record| &record.rec_id))
+        .flatten()
+    else {
+        return Ok(());
+    };
     state.recordings.set(list);
-    let jobs: MediaJobs = call("GET", "/api/media/jobs", None).await?;
-    state.media_jobs.set(jobs.jobs);
-    state.loading.set(false);
+    state.recount_recordings();
+    state.publish_snapshot_result();
+    let Some(generation) = state.jobs_snapshot.try_update_value(SnapshotMerge::begin) else {
+        return Ok(());
+    };
+    let jobs = match call::<MediaJobs>("GET", "/api/media/jobs", None).await {
+        Ok(jobs) => jobs,
+        Err(error) => {
+            if state
+                .jobs_snapshot
+                .try_update_value(|sync| sync.fail(generation, error.clone()))
+                == Some(true)
+            {
+                state.publish_snapshot_result();
+                return Err(error);
+            }
+            return Ok(());
+        }
+    };
+    if let Some(mut jobs) = state
+        .jobs_snapshot
+        .try_update_value(|sync| sync.finish(generation, jobs.jobs, |job| &job.id))
+        .flatten()
+    {
+        if jobs.len() > 256 {
+            jobs.drain(..jobs.len() - 256);
+        }
+        state.media_jobs.set(jobs);
+        state.publish_snapshot_result();
+    }
     Ok(())
 }
 
 pub async fn poll_connection(state: AppState) {
-    let mut initialized = false;
+    let mut settings_loaded = false;
     loop {
         match fetch_status().await {
             Ok(status) => {
                 let recovered = !state.status.get_untracked().ok;
                 state.status.set(status);
-                state.error.set(None);
-                if !initialized || recovered || !state.events_connected.get_untracked() {
-                    initialized = match refresh_recordings(state).await {
-                        Ok(()) => true,
-                        Err(error) => {
-                            state.loading.set(false);
-                            state.error.set(Some(error));
-                            false
-                        }
-                    };
+                state.error.set(state.snapshot_error());
+                let refresh = state.snapshots_need_refresh()
+                    || recovered
+                    || !state.events_connected.get_untracked();
+                // An ignored old response is not initialization; only applied snapshots count.
+                if refresh && !state.snapshot_pending() {
+                    let _ = refresh_recordings(state).await;
+                }
+                if !settings_loaded || refresh {
                     if let Ok(settings) = fetch_settings().await {
                         state.apply_settings(settings);
+                        settings_loaded = true;
                     }
                 }
             }
@@ -458,7 +837,12 @@ pub async fn poll_connection(state: AppState) {
                 state.loading.set(false);
             }
         }
-        sleep_ms(if initialized { 5000 } else { 1500 }).await;
+        sleep_ms(if state.snapshots_need_refresh() {
+            1500
+        } else {
+            5000
+        })
+        .await;
     }
 }
 
@@ -469,10 +853,15 @@ pub struct NewRecording {
     pub streamer_name: Option<String>,
     pub quality: Option<String>,
 }
-pub async fn create_recordings(items: Vec<NewRecording>) -> Result<(), String> {
-    call::<Value>("POST", "/api/recordings", Some(json!({"items":items})))
-        .await
-        .map(|_| ())
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ImportResult {
+    #[serde(default)]
+    pub created: Vec<Recording>,
+    #[serde(default)]
+    pub skipped: Vec<Value>,
+}
+pub async fn create_recordings(items: Vec<NewRecording>) -> Result<ImportResult, String> {
+    call("POST", "/api/recordings", Some(json!({"items":items}))).await
 }
 pub async fn delete_recording(id: &str) -> Result<(), String> {
     call::<Value>("DELETE", &format!("/api/recordings/{}", encode(id)), None)
@@ -712,9 +1101,7 @@ pub fn subscribe_events(state: AppState) -> Option<EventConnection> {
         connected_timer.borrow_mut().take();
         state.events_connected.set(true);
         leptos::task::spawn_local(async move {
-            if let Err(error) = refresh_recordings(state).await {
-                state.error.set(Some(error));
-            }
+            let _ = refresh_recordings(state).await;
         });
     });
     let failed_timer = retry_timer.clone();
@@ -732,15 +1119,23 @@ pub fn subscribe_events(state: AppState) -> Option<EventConnection> {
     source.set_onopen(Some(on_open.as_ref().unchecked_ref()));
     source.set_onerror(Some(on_error.as_ref().unchecked_ref()));
     let mut messages = Vec::new();
-    for event_name in ["update", "delete", "settings", "mediaJob"] {
+    for event_name in ["update", "delete", "settings", "mediaJob", "resync"] {
         let handler = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(
             move |event: web_sys::MessageEvent| {
                 let Some(text) = event.data().as_string() else {
                     return;
                 };
                 match event_name {
+                    "resync" => {
+                        leptos::task::spawn_local(async move {
+                            let _ = refresh_recordings(state).await;
+                        });
+                    }
                     "update" => {
                         if let Ok(rec) = serde_json::from_str::<Recording>(&text) {
+                            state.recordings_snapshot.update_value(|sync| {
+                                sync.observe(rec.rec_id.clone(), Some(rec.clone()))
+                            });
                             state.recordings.update(|list| {
                                 if let Some(existing) =
                                     list.iter_mut().find(|r| r.rec_id == rec.rec_id)
@@ -750,17 +1145,27 @@ pub fn subscribe_events(state: AppState) -> Option<EventConnection> {
                                     list.push(rec);
                                 }
                             });
+                            state.recount_recordings();
                         }
                     }
                     "delete" => {
                         if let Ok(ids) = serde_json::from_str::<Vec<String>>(&text) {
+                            state.recordings_snapshot.update_value(|sync| {
+                                for id in &ids {
+                                    sync.observe(id.clone(), None);
+                                }
+                            });
                             state
                                 .recordings
                                 .update(|list| list.retain(|r| !ids.contains(&r.rec_id)));
+                            state.recount_recordings();
                         }
                     }
                     "mediaJob" => {
                         if let Ok(job) = serde_json::from_str::<MediaJob>(&text) {
+                            state.jobs_snapshot.update_value(|sync| {
+                                sync.observe(job.id.clone(), Some(job.clone()))
+                            });
                             state.media_jobs.update(|jobs| {
                                 if let Some(existing) =
                                     jobs.iter_mut().find(|item| item.id == job.id)

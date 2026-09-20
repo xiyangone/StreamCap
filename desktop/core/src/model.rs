@@ -120,6 +120,16 @@ pub struct Recording {
     pub check_error: Option<String>,
     #[serde(default, skip_deserializing)]
     pub verification_required: bool,
+    #[serde(default, skip_deserializing)]
+    pub access_state: String,
+    #[serde(default, skip_deserializing)]
+    pub check_state: String,
+    #[serde(default, skip_deserializing)]
+    pub last_check_at: Option<i64>,
+    #[serde(default, skip_deserializing)]
+    pub last_success_at: Option<i64>,
+    #[serde(default, skip_deserializing)]
+    pub next_check_at: Option<i64>,
     /// Internal attempt identity; never sent to the UI or persisted with user tasks.
     #[serde(skip)]
     pub(crate) recording_run: Option<uuid::Uuid>,
@@ -171,6 +181,11 @@ impl Recording {
             recording_error: None,
             check_error: None,
             verification_required: false,
+            access_state: String::new(),
+            check_state: "waiting".into(),
+            last_check_at: None,
+            last_success_at: None,
+            next_check_at: None,
             recording_run: None,
             live_title: None,
             speed: None,
@@ -207,6 +222,59 @@ impl Recording {
     pub fn to_storage(&self) -> serde_json::Value {
         serde_json::to_value(self.to_stored()).expect("recording is JSON serializable")
     }
+}
+
+/// Only collapse known room-address aliases. Signed media URLs and unknown query
+/// parameters keep their identity; short links need a verified redirect first.
+pub fn room_identity(value: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(value.trim()) else {
+        return value.trim().to_string();
+    };
+    if matches!(url.scheme(), "http" | "https")
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port().is_none()
+    {
+        let parts = url
+            .path_segments()
+            .into_iter()
+            .flatten()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>();
+        let room = match (url.host_str().unwrap_or(""), parts.as_slice()) {
+            ("live.douyin.com", [id]) | ("www.douyin.com" | "douyin.com", ["live", id]) => {
+                Some(("douyin", *id))
+            }
+            ("live.kuaishou.com", ["u", id]) => Some(("kuaishou", *id)),
+            ("live.bilibili.com", [id]) if id.bytes().all(|b| b.is_ascii_digit()) => {
+                Some(("bilibili", *id))
+            }
+            _ => None,
+        };
+        if let Some((platform, id)) = room {
+            // Keep unknown parameters byte-for-byte, including their order and encoding.
+            // Only these explicit analytics keys are independent of room access.
+            let query = url
+                .query()
+                .unwrap_or_default()
+                .split('&')
+                .filter(|pair| {
+                    !matches!(
+                        pair.split('=').next().unwrap_or_default(),
+                        "utm_source" | "utm_medium" | "utm_campaign" | "utm_term" | "utm_content"
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("&");
+            return if query.is_empty() {
+                format!("{platform}:{id}")
+            } else {
+                format!("{platform}:{id}?{query}")
+            };
+        }
+    }
+    url.set_fragment(None);
+    url.to_string()
 }
 
 /// recordings.json 的磁盘表示：**必须与 Python `Recording.to_dict()` 完全一致**。
@@ -427,5 +495,44 @@ impl MediaJobState {
             self,
             Self::Waiting | Self::Running | Self::Verifying | Self::Cleaning
         )
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::room_identity;
+
+    #[test]
+    fn known_room_aliases_only_discard_explicit_analytics_keys() {
+        assert_eq!(
+            room_identity("https://live.douyin.com/123?utm_source=share#top"),
+            room_identity("https://www.douyin.com/live/123")
+        );
+        for base in [
+            "https://live.douyin.com/123",
+            "https://live.kuaishou.com/u/abc",
+            "https://live.bilibili.com/123",
+        ] {
+            assert_ne!(
+                room_identity(base),
+                room_identity(&format!("{base}?access=one"))
+            );
+            assert_ne!(
+                room_identity(&format!("{base}?access=one")),
+                room_identity(&format!("{base}?access=two"))
+            );
+            assert_eq!(
+                room_identity(&format!("{base}?access=a%2Bb&mode=1&utm_source=share")),
+                room_identity(&format!("{base}?access=a%2Bb&mode=1"))
+            );
+        }
+        assert_ne!(
+            room_identity("https://media.invalid/stream.ts?token=a"),
+            room_identity("https://media.invalid/stream.ts?token=b")
+        );
+        assert_ne!(
+            room_identity("https://v.douyin.com/a"),
+            room_identity("https://v.douyin.com/b")
+        );
     }
 }

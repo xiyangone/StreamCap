@@ -96,6 +96,11 @@ pub fn build_command(options: &RecordOptions) -> Vec<String> {
         "-loglevel",
         "error",
         "-hide_banner",
+        "-nostats",
+        "-progress",
+        "pipe:1",
+        "-stats_period",
+        "2",
         "-protocol_whitelist",
         protocols,
         "-thread_queue_size",
@@ -483,6 +488,81 @@ pub fn with_segment_suffix(save_path: &str, format: &str, segment: bool) -> Stri
 }
 
 /// 运行中的录制进程句柄。
+const FIRST_MEDIA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const STALLED_MEDIA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
+struct RecordingProgress {
+    started: tokio::time::Instant,
+    advanced: tokio::time::Instant,
+    bytes: u64,
+    media_us: u64,
+    frames: u64,
+    has_media: bool,
+    reported_time: bool,
+    terminal_error: Option<&'static str>,
+}
+impl RecordingProgress {
+    fn new() -> Self {
+        let now = tokio::time::Instant::now();
+        Self {
+            started: now,
+            advanced: now,
+            bytes: 0,
+            media_us: 0,
+            frames: 0,
+            has_media: false,
+            reported_time: false,
+            terminal_error: None,
+        }
+    }
+    fn observe_line(&mut self, line: &str) {
+        let Some((key, value)) = line.split_once('=') else {
+            return;
+        };
+        let Ok(value) = value.trim().parse::<u64>() else {
+            return;
+        };
+        let field = match key.trim() {
+            "out_time_us" => {
+                self.reported_time = true;
+                &mut self.media_us
+            }
+            "frame" => &mut self.frames,
+            _ => return,
+        };
+        if value > *field {
+            *field = value;
+            self.has_media = true;
+            self.advanced = tokio::time::Instant::now();
+        }
+    }
+    fn observe_bytes(&mut self, bytes: u64) {
+        if bytes > self.bytes {
+            self.bytes = bytes;
+            self.has_media = true;
+            self.advanced = tokio::time::Instant::now();
+        }
+    }
+    fn seconds(&self) -> f64 {
+        if self.reported_time {
+            self.media_us as f64 / 1_000_000.0
+        } else if self.has_media {
+            (self.advanced - self.started).as_secs_f64()
+        } else {
+            0.0
+        }
+    }
+    fn stalled(&self) -> Option<&'static str> {
+        if self.has_media && self.advanced.elapsed() >= STALLED_MEDIA_TIMEOUT {
+            Some("录制连续 90 秒无媒体产出，已停止并保留已录文件")
+        } else if !self.has_media && self.started.elapsed() >= FIRST_MEDIA_TIMEOUT {
+            Some("录制启动 120 秒未收到媒体，已停止等待")
+        } else {
+            None
+        }
+    }
+}
+
 pub struct RecorderProcess {
     pub rec_id: String,
     pub output_path: PathBuf,
@@ -494,12 +574,31 @@ pub struct RecorderProcess {
     stop_requested: AtomicBool,
     failure: Arc<Mutex<Option<String>>>,
     stderr_done: tokio_util::sync::CancellationToken,
+    progress_done: tokio_util::sync::CancellationToken,
+    progress: Arc<std::sync::Mutex<RecordingProgress>>,
 }
 
 impl RecorderProcess {
     /// 优雅停止：Windows 下向 stdin 写 `q` 让 ffmpeg 收尾；超时后强杀。
     pub async fn stop(&self, grace_secs: u64) {
         self.stop_requested.store(true, Ordering::SeqCst);
+        self.finish(grace_secs).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            self.progress_done.cancelled(),
+        )
+        .await;
+    }
+    pub fn observe_output_bytes(&self, bytes: u64) {
+        self.progress
+            .lock()
+            .expect("recording progress")
+            .observe_bytes(bytes);
+    }
+    pub fn recorded_seconds(&self) -> f64 {
+        self.progress.lock().expect("recording progress").seconds()
+    }
+    async fn finish(&self, grace_secs: u64) {
         if let Some(direct) = &self.direct {
             direct.stop().await;
             return;
@@ -584,7 +683,7 @@ impl Engine {
                 .expect("media reservation lock")
                 .values()
                 .flatten()
-                .any(|path| path.starts_with(target))
+                .any(|path| output_is_protected(path, target))
     }
     pub async fn is_recording_path(&self, target: &Path) -> bool {
         self.active
@@ -637,6 +736,33 @@ impl Engine {
         if !self.is_current(process).await {
             return ProcessState::Unknown;
         }
+        let stalled = process
+            .progress
+            .lock()
+            .expect("recording progress")
+            .stalled();
+        if let Some(reason) = stalled {
+            let running = if let Some(direct) = &process.direct {
+                direct.result.lock().await.is_none()
+            } else {
+                process
+                    .child
+                    .as_ref()
+                    .expect("ffmpeg process")
+                    .lock()
+                    .await
+                    .try_wait()
+                    .is_ok_and(|status| status.is_none())
+            };
+            if running {
+                process
+                    .progress
+                    .lock()
+                    .expect("recording progress")
+                    .terminal_error = Some(reason);
+                process.finish(5).await;
+            }
+        }
         let exit_code = if let Some(direct) = &process.direct {
             let result = direct.result.lock().await;
             match result.as_ref() {
@@ -664,7 +790,20 @@ impl Engine {
             process.stderr_done.cancelled(),
         )
         .await;
-        let error = if exit_code == Some(0) {
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            process.progress_done.cancelled(),
+        )
+        .await;
+        let health_error = process
+            .progress
+            .lock()
+            .expect("recording progress")
+            .terminal_error
+            .map(str::to_owned);
+        let error = if health_error.is_some() {
+            health_error
+        } else if exit_code == Some(0) {
             None
         } else {
             Some(
@@ -696,8 +835,7 @@ impl Engine {
 
     /// 启动录制。
     ///
-    /// ffmpeg 以 `-loglevel error` 运行，stderr 只会输出错误，因此这里不做进度解析
-    /// （录制速率由调度器按产出文件增量计算），只保留错误行用于诊断。
+    /// Progress has its own stdout pipe; stderr remains a bounded diagnostic channel.
     pub async fn start(
         &self,
         ffmpeg: &Path,
@@ -755,7 +893,7 @@ impl Engine {
         command
             .args(&args)
             .stdin(Stdio::piped())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         #[cfg(windows)]
@@ -765,6 +903,24 @@ impl Engine {
             .map_err(|e| format!("启动 ffmpeg 失败: {e}"))?;
 
         let failure = Arc::new(Mutex::new(None));
+        let progress = Arc::new(std::sync::Mutex::new(RecordingProgress::new()));
+        let progress_done = tokio_util::sync::CancellationToken::new();
+        if let Some(stdout) = child.stdout.take() {
+            let progress = progress.clone();
+            let done = progress_done.clone().drop_guard();
+            self.log_tasks.spawn(async move {
+                let _done = done;
+                let mut lines = BufReader::new(stdout).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    progress
+                        .lock()
+                        .expect("recording progress")
+                        .observe_line(&line);
+                }
+            });
+        } else {
+            progress_done.cancel();
+        }
         let stderr_done = tokio_util::sync::CancellationToken::new();
         if let Some(stderr) = child.stderr.take() {
             let rec_id = rec_id.to_string();
@@ -801,6 +957,8 @@ impl Engine {
             stop_requested: AtomicBool::new(false),
             failure,
             stderr_done,
+            progress_done,
+            progress,
         });
         active.insert(rec_id.to_string(), process.clone());
         Ok(process)
@@ -856,7 +1014,9 @@ impl Engine {
             direct: Some(direct),
             stop_requested: AtomicBool::new(false),
             failure: Arc::new(Mutex::new(None)),
-            stderr_done: done,
+            stderr_done: done.clone(),
+            progress_done: done,
+            progress: Arc::new(std::sync::Mutex::new(RecordingProgress::new())),
         });
         active.insert(rec_id.to_string(), process.clone());
         Ok(process)
@@ -950,6 +1110,66 @@ impl Drop for MediaReservation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn media_progress_uses_startup_and_idle_budgets_without_counting_wait_time() {
+        let mut progress = RecordingProgress::new();
+        tokio::time::advance(std::time::Duration::from_secs(119)).await;
+        progress.observe_line("out_time_us=N/A");
+        progress.observe_line("frame=0");
+        assert_eq!(progress.stalled(), None);
+        assert_eq!(progress.seconds(), 0.0);
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        assert!(progress.stalled().unwrap().contains("120"));
+
+        let mut progress = RecordingProgress::new();
+        progress.observe_line("out_time_us=2000000");
+        tokio::time::advance(std::time::Duration::from_secs(89)).await;
+        progress.observe_line("out_time_us=2000000");
+        assert_eq!(progress.stalled(), None);
+        assert_eq!(progress.seconds(), 2.0);
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        assert!(progress.stalled().unwrap().contains("90"));
+        progress.observe_bytes(1024);
+        assert_eq!(progress.stalled(), None);
+        assert_eq!(progress.seconds(), 2.0);
+        tokio::time::advance(std::time::Duration::from_secs(90)).await;
+        progress.observe_bytes(1024);
+        assert!(
+            progress.stalled().is_some(),
+            "unchanged bytes cannot reset the idle clock"
+        );
+        progress.observe_line("frame=10");
+        assert_eq!(progress.stalled(), None);
+    }
+
+    #[tokio::test]
+    async fn finish_reservations_protect_segments_and_sidecars_without_holding_global_lock() {
+        let engine = Engine::new();
+        let root = tempfile::tempdir().unwrap();
+        let guard = engine.filesystem_guard().await;
+        let reservation = engine.reserve_media(vec![
+            root.path().join("take_%03d.ts"),
+            root.path().join("take_%03d.srt"),
+        ]);
+        drop(guard);
+        let guard = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            engine.filesystem_guard(),
+        )
+        .await
+        .unwrap();
+        assert!(engine.protects_path(&root.path().join("take_001.ts")).await);
+        assert!(
+            engine
+                .protects_path(&root.path().join("take_020.srt"))
+                .await
+        );
+        assert!(engine.protects_path(root.path()).await);
+        assert!(!engine.protects_path(&root.path().join("other.ts")).await);
+        drop(reservation);
+        assert!(!engine.protects_path(root.path()).await);
+        drop(guard);
+    }
     #[test]
     fn failure_summaries_are_bounded_and_never_include_stream_credentials() {
         assert_eq!(

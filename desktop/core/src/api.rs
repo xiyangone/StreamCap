@@ -171,6 +171,7 @@ async fn status(State(state): State<ApiState>) -> Json<Value> {
     Json(json!({
         "ok": true,
         "version": env!("CARGO_PKG_VERSION"),
+        "buildId": env!("STREAMCAP_BUILD_ID"),
         "activeRecordings": active,
         "totalRecordings": total,
         "resolverReady": state.resolver.healthy().await,
@@ -240,20 +241,31 @@ async fn create_recordings(
     }
     drop(config);
 
-    state
+    let candidates = created;
+    let created = state
         .store
-        .insert(created.clone())
+        .insert(candidates.clone())
         .await
         .map_err(ApiError::storage)?;
+    let skipped: Vec<_> = candidates
+        .into_iter()
+        .filter(|candidate| {
+            !created
+                .iter()
+                .any(|record| record.rec_id == candidate.rec_id)
+        })
+        .map(|record| json!({"url":record.url,"reason":"duplicate"}))
+        .collect();
     state.store.snack(format!(
-        "已添加 {} 个录制任务，已开启自动监控",
-        created.len()
+        "已添加 {} 个录制任务，跳过 {} 个重复地址",
+        created.len(),
+        skipped.len()
     ));
     state
         .scheduler
         .request_monitoring(created.iter().map(|record| record.rec_id.clone()));
 
-    Ok(Json(json!({ "created": created })))
+    Ok(Json(json!({ "created": created, "skipped": skipped })))
 }
 
 async fn delete_one(
@@ -296,28 +308,14 @@ async fn toggle_monitor(
     State(state): State<ApiState>,
     AxumPath(rec_id): AxumPath<String>,
 ) -> ApiResult {
-    let Some(rec) = state.store.get(&rec_id).await else {
-        return Err(ApiError::not_found(format!(
-            "recording not found: {rec_id}"
-        )));
-    };
-
-    let now_monitoring = !rec.monitor_status;
-    state
-        .store
-        .update(&rec_id, |r| {
-            r.monitor_status = now_monitoring;
-        })
-        .await;
-
-    if !now_monitoring {
-        state.scheduler.stop_recording(&rec_id).await;
-    }
-
-    state.store.persist().await.map_err(ApiError::storage)?;
-    state.scheduler.request_monitoring([rec_id.clone()]);
-    let updated = state.store.get(&rec_id).await;
-    Ok(Json(serde_json::to_value(updated).unwrap_or(Value::Null)))
+    let updated = state
+        .scheduler
+        .toggle_monitor(&rec_id)
+        .await
+        .map_err(ApiError::storage)?;
+    Ok(Json(
+        serde_json::to_value(updated).map_err(|e| ApiError::internal(e.to_string()))?,
+    ))
 }
 
 async fn check_one(State(state): State<ApiState>, AxumPath(rec_id): AxumPath<String>) -> ApiResult {
@@ -412,19 +410,84 @@ async fn list_recording_files(
     };
     let root = state.config.read().await.recordings_root();
     let directory = std::path::PathBuf::from(&dir);
-    let mut files=state.storage.blocking(move|stop|{
-        crate::storage::check_cancel(&stop)?;
-        if !directory.exists(){return Ok(Vec::<Value>::new())}
-        let root_real=root.canonicalize()?;let dir_real=directory.canonicalize()?;
-        let relative=dir_real.strip_prefix(&root_real).map_err(|_|std::io::Error::new(std::io::ErrorKind::InvalidInput,"此任务目录不在当前录制根目录内"))?.to_string_lossy().replace('\\',"/");
-        for ancestor in directory.ancestors(){
-            if ancestor==root{break}
-            if crate::storage::is_link(&std::fs::symlink_metadata(ancestor)?){return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,"不能通过链接预览录制文件"))}
-            if ancestor.canonicalize()?==root_real{break}
-        }
-        let listing=crate::storage::list(&root,&relative,&stop)?;
-        Ok(listing.items.into_iter().filter(|item|!item.is_dir && is_media_name(&item.name)).map(|item|json!({"name":item.name,"size":item.size,"path":item.path,"modified":item.modified.unwrap_or(0.0)})).collect::<Vec<_>>())
-    }).await.map_err(ApiError::storage)?;
+    let mut files = state
+        .storage
+        .blocking(move |stop| {
+            crate::storage::check_cancel(&stop)?;
+            if !directory.exists() {
+                return Ok(Vec::<Value>::new());
+            }
+            let root_real = root.canonicalize()?;
+            let dir_real = directory.canonicalize()?;
+            let relative = dir_real
+                .strip_prefix(&root_real)
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "此任务目录不在当前录制根目录内",
+                    )
+                })?
+                .to_string_lossy()
+                .replace('\\', "/");
+            for ancestor in directory.ancestors() {
+                if ancestor == root {
+                    break;
+                }
+                if crate::storage::is_link(&std::fs::symlink_metadata(ancestor)?) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "不能通过链接预览录制文件",
+                    ));
+                }
+                if ancestor.canonicalize()? == root_real {
+                    break;
+                }
+            }
+            let checked = crate::storage::checked_target(&root, &relative, true)?;
+            let mut files = Vec::new();
+            // Preview needs immediate files, not recursive sizes of unrelated subdirectories.
+            for entry in std::fs::read_dir(checked)? {
+                crate::storage::check_cancel(&stop)?;
+                let entry = entry?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with(".streamcap-remux-")
+                    || name.starts_with(".streamcap-subtitle-")
+                    || !is_media_name(&name)
+                {
+                    continue;
+                }
+                let metadata = match std::fs::symlink_metadata(entry.path()) {
+                    Ok(metadata) => metadata,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::NotFound
+                            || error.raw_os_error() == Some(303) =>
+                    {
+                        continue
+                    }
+                    Err(error) => return Err(error),
+                };
+                if crate::storage::is_link(&metadata) || !metadata.is_file() {
+                    continue;
+                }
+                let path = if relative.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{relative}/{name}")
+                };
+                let modified = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|time| time.as_secs_f64())
+                    .unwrap_or(0.0);
+                files.push(
+                    json!({"name":name,"size":metadata.len(),"path":path,"modified":modified}),
+                );
+            }
+            Ok(files)
+        })
+        .await
+        .map_err(ApiError::storage)?;
     files.sort_by(|a, b| {
         b["modified"]
             .as_f64()
@@ -587,10 +650,11 @@ async fn update_one(
     Json(payload): Json<UpdatePayload>,
 ) -> ApiResult {
     validate_changes(&payload.changes, &payload.follow_global, EDIT_FIELDS)?;
+    let lifecycle = state.store.lifecycle_guard().await;
     let config = state.config.read().await;
     let updated = state
         .store
-        .edit_many(&[rec_id], |rec| {
+        .edit_many_locked(&lifecycle, &[rec_id], |rec| {
             apply_edit(
                 rec,
                 &payload.changes,
@@ -675,10 +739,11 @@ async fn batch_edit(
     Json(payload): Json<BatchEditPayload>,
 ) -> ApiResult {
     validate_changes(&payload.changes, &payload.follow_global, BATCH_FIELDS)?;
+    let lifecycle = state.store.lifecycle_guard().await;
     let config = state.config.read().await;
     let updated = state
         .store
-        .edit_many(&payload.rec_ids, |rec| {
+        .edit_many_locked(&lifecycle, &payload.rec_ids, |rec| {
             apply_edit(
                 rec,
                 &payload.changes,
@@ -1238,21 +1303,22 @@ async fn events(
 
     let cancel = state.resolver.cancellation();
     let stream = futures::stream::unfold((receiver, cancel), |(mut rx, cancel)| async move {
-        loop {
-            let event =
-                tokio::select! {biased;_=cancel.cancelled()=>return None,event=rx.recv()=>event};
-            match event {
-                Ok(event) => {
-                    let payload =
-                        serde_json::to_string(&event.payload).unwrap_or_else(|_| "null".into());
-                    return Some((
-                        Ok(Event::default().event(event.topic).data(payload)),
-                        (rx, cancel),
-                    ));
-                }
-                Err(broadcast::error::RecvError::Lagged(_)) => {}
-                Err(broadcast::error::RecvError::Closed) => return None,
+        let event =
+            tokio::select! {biased;_=cancel.cancelled()=>return None,event=rx.recv()=>event};
+        match event {
+            Ok(event) => {
+                let payload =
+                    serde_json::to_string(&event.payload).unwrap_or_else(|_| "null".into());
+                Some((
+                    Ok(Event::default().event(event.topic).data(payload)),
+                    (rx, cancel),
+                ))
             }
+            Err(broadcast::error::RecvError::Lagged(_)) => Some((
+                Ok(Event::default().event("resync").data("{}")),
+                (rx, cancel),
+            )),
+            Err(broadcast::error::RecvError::Closed) => None,
         }
     });
 
@@ -1337,6 +1403,8 @@ pub async fn shutdown(state: &ApiState) -> std::io::Result<()> {
             .update(&rec.rec_id, |r| {
                 r.is_recording = false;
                 r.speed = None;
+                r.check_state = "idle".into();
+                r.next_check_at = None;
             })
             .await;
     }

@@ -286,13 +286,13 @@ fn kuaishou_challenge_has_priority_over_empty_author_and_false_live_flag() {
         value["errorType"]["type"] = code;
         assert_eq!(
             kuaishou::parse_room(&value, None).unwrap_err(),
-            kuaishou::VERIFICATION_REQUIRED
+            kuaishou::PAGE_CHECK_REQUIRED
         );
     }
     let state = json!({"liveroom":{"playList":[restricted,{"author":{"name":"Recommendation"},"isLiving":false,"liveStream":{}}]}});
     assert_eq!(
         kuaishou::parse_state(&state, None).unwrap_err(),
-        kuaishou::VERIFICATION_REQUIRED
+        kuaishou::PAGE_CHECK_REQUIRED
     );
     assert!(kuaishou::parse_state(&json!({"liveroom":{"playList":[]},"room":{"author":{"name":"Wrong room"},"isLiving":false}}),None).is_err());
     assert!(
@@ -304,6 +304,233 @@ fn kuaishou_challenge_has_priority_over_empty_author_and_false_live_flag() {
         .is_live
     );
 }
+#[test]
+fn kuaishou_rendered_offline_page_can_override_a_stale_challenge_marker() {
+    let page = json!({"liveroom":{"playList":[{
+        "author":{"id":"target","name":"目标主播"},
+        "isLiving":false,
+        "liveStream":{},
+        "errorType":{"type":400002,"title":"请完成滑块验证"}
+    }]}});
+    let evaluated = kuaishou::evaluate_verification_page(
+        &page,
+        "target",
+        "目标主播 主播尚未开播，可以观看其他直播",
+        false,
+        None,
+    );
+    let kuaishou::VerificationPage::Room(info) = evaluated else {
+        panic!("rendered target room should be accepted as offline");
+    };
+    assert_eq!(info.anchor_name, "目标主播");
+    assert!(!info.is_live);
+}
+
+#[test]
+fn kuaishou_rate_limit_precedes_400002_and_missing_identity_without_faking_offline() {
+    for field in ["title", "content"] {
+        let mut room = json!({"author":{},"isLiving":false,"liveStream":{},"errorType":{"type":400002,"title":"请完成滑块验证"}});
+        room["errorType"][field] = json!("请求过快，请稍后重试");
+        assert_eq!(
+            kuaishou::parse_room(&room, None).unwrap_err(),
+            kuaishou::RATE_LIMITED
+        );
+        assert_eq!(
+            kuaishou::evaluate_verification_page(&json!({"room":room}), "target", "", false, None),
+            kuaishou::VerificationPage::RateLimited
+        );
+    }
+    assert_eq!(
+        kuaishou::evaluate_verification_page(
+            &json!({}),
+            "target",
+            "请求过快，请稍后重试",
+            false,
+            None
+        ),
+        kuaishou::VerificationPage::RateLimited
+    );
+    assert!(!kuaishou::verification_required(
+        kuaishou::PAGE_CHECK_REQUIRED
+    ));
+    assert!(!kuaishou::verification_required(kuaishou::RATE_LIMITED));
+}
+
+#[test]
+fn kuaishou_login_required_and_optional_login_prompts_are_not_captchas() {
+    let unavailable = json!({"room":{"author":{},"isLiving":false,"errorType":{}}});
+    assert_eq!(
+        kuaishou::evaluate_verification_page(&unavailable, "target", "请先登录后观看", false, None),
+        kuaishou::VerificationPage::LoginRequired
+    );
+    let public_room = json!({"room":{"author":{"id":"target","name":"目标主播"},"isLiving":false,"liveStream":{}}});
+    assert!(matches!(
+        kuaishou::evaluate_verification_page(
+            &public_room,
+            "target",
+            "目标主播 主播尚未开播 登录畅享蓝光直播画质 快手APP登录 手机号登录",
+            false,
+            None
+        ),
+        kuaishou::VerificationPage::Room(_)
+    ));
+    assert_eq!(
+        kuaishou::evaluate_verification_page(&unavailable, "target", "", true, None),
+        kuaishou::VerificationPage::Challenge
+    );
+    assert!(matches!(
+        kuaishou::evaluate_verification_page(
+            &unavailable,
+            "target",
+            "快手APP登录 手机号登录",
+            false,
+            None
+        ),
+        kuaishou::VerificationPage::Unknown(_)
+    ));
+}
+
+#[test]
+fn kuaishou_visible_challenge_and_unverified_recommendations_never_clear_the_gate() {
+    let target = json!({
+        "author":{"id":"target","name":"目标主播"},
+        "isLiving":false,
+        "liveStream":{},
+        "errorType":{"type":400002,"title":"请完成滑块验证"}
+    });
+    let challenge = json!({"liveroom":{"playList":[target.clone()]}});
+    assert_eq!(
+        kuaishou::evaluate_verification_page(
+            &challenge,
+            "target",
+            "主播尚未开播 请完成滑块验证",
+            true,
+            None,
+        ),
+        kuaishou::VerificationPage::Challenge
+    );
+    assert!(matches!(
+        kuaishou::evaluate_verification_page(&challenge, "target", "页面加载中", false, None,),
+        kuaishou::VerificationPage::Unknown(error)
+            if kuaishou::page_check_required(&error)
+    ));
+
+    let recommendation_only =
+        json!({"recommendations":[{"author":{"name":"推荐主播"},"isLiving":false}]});
+    assert!(matches!(
+        kuaishou::evaluate_verification_page(
+            &recommendation_only,
+            "target",
+            "推荐主播 主播尚未开播",
+            false,
+            None,
+        ),
+        kuaishou::VerificationPage::Unknown(_)
+    ));
+
+    let missing_anchor = json!({"liveroom":{"playList":[{
+        "author":{},"isLiving":false,"liveStream":{},
+        "errorType":{"type":400002,"title":"请完成滑块验证"}
+    }]}});
+    assert!(matches!(
+        kuaishou::evaluate_verification_page(
+            &missing_anchor,
+            "target",
+            "主播尚未开播",
+            false,
+            None,
+        ),
+        kuaishou::VerificationPage::Unknown(_)
+    ));
+    assert!(matches!(
+        kuaishou::evaluate_verification_page(
+            &challenge,
+            "target",
+            "推荐主播 主播尚未开播",
+            false,
+            None,
+        ),
+        kuaishou::VerificationPage::Unknown(_)
+    ));
+}
+
+#[test]
+fn kuaishou_runtime_state_is_bound_to_the_current_target_not_an_old_playlist_item() {
+    let target =
+        json!({"author":{"id":"target","name":"目标主播"},"isLiving":false,"liveStream":{}});
+    let other = json!({"author":{"id":"other","name":"目标主播"},"isLiving":false,"liveStream":{}});
+    let mut page = json!({"liveroom":{"activeIndex":1,"playList":[target,other]}});
+    assert!(matches!(
+        kuaishou::evaluate_verification_page(&page, "target", "目标主播 主播尚未开播", false, None),
+        kuaishou::VerificationPage::Unknown(_)
+    ));
+    page["liveroom"]["activeIndex"] = json!(0);
+    assert!(matches!(
+        kuaishou::evaluate_verification_page(&page, "target", "目标主播 主播尚未开播", false, None),
+        kuaishou::VerificationPage::Room(_)
+    ));
+    page["liveroom"]["activeIndex"] = json!(-1);
+    assert!(matches!(
+        kuaishou::evaluate_verification_page(&page, "target", "目标主播 主播尚未开播", false, None),
+        kuaishou::VerificationPage::Unknown(_)
+    ));
+    assert!(matches!(
+        kuaishou::evaluate_verification_page(
+            &json!({}),
+            "target",
+            "目标主播 主播尚未开播",
+            false,
+            None
+        ),
+        kuaishou::VerificationPage::Unknown(_)
+    ));
+}
+
+#[test]
+fn kuaishou_placeholder_error_text_is_not_an_interactive_captcha() {
+    let page = json!({"room":{"author":{"id":"target","name":"目标主播"},"isLiving":false,"liveStream":{},"errorType":{"type":400002}}});
+    assert!(matches!(
+        kuaishou::evaluate_verification_page(
+            &page,
+            "target",
+            "请完成滑块验证 浏览其他内容",
+            false,
+            None
+        ),
+        kuaishou::VerificationPage::Unknown(_)
+    ));
+    assert_eq!(
+        kuaishou::evaluate_verification_page(&page, "target", "请完成滑块验证", true, None),
+        kuaishou::VerificationPage::Challenge
+    );
+}
+
+#[test]
+fn kuaishou_live_runtime_state_keeps_stream_urls_and_cannot_be_overridden_by_offline_text() {
+    let page = json!({"room":{"author":{"id":"target","name":"目标主播"},"isLiving":true,"liveStream":{"caption":"实时直播","playUrls":[{"url":"https://media.example/live.flv","bitrate":3000}]}}});
+    let kuaishou::VerificationPage::Room(info) =
+        kuaishou::evaluate_verification_page(&page, "target", "推荐主播 主播尚未开播", false, None)
+    else {
+        panic!("the verified live room must remain live")
+    };
+    assert!(info.is_live);
+    assert_eq!(info.record_url, "https://media.example/live.flv");
+}
+
+#[test]
+fn kuaishou_cookie_scope_order_is_shared_by_the_browser_and_http_client() {
+    assert_eq!(
+        kuaishou::canonical_cookie_header(
+            "did=specific; userId=fixture; did=parent; kuaishou.live.web_st=a=b"
+        )
+        .unwrap(),
+        "did=specific; userId=fixture; kuaishou.live.web_st=a=b"
+    );
+    assert!(kuaishou::canonical_cookie_header("did=fixture\r\nAuthorization: bad").is_err());
+    assert!(kuaishou::canonical_cookie_header("invalid name=value").is_err());
+    assert_eq!(kuaishou::canonical_cookie_header("").unwrap(), "");
+}
+
 #[test]
 fn kuaishou_login_and_room_share_the_same_state_decoder() {
     let state = json!({"currentUser":{"userId":"42","name":"测试账号"},"liveroom":{"playList":[{"author":{"name":"测试主播"},"isLiving":false,"liveStream":{}}]}});
@@ -324,6 +551,28 @@ fn kuaishou_login_and_room_share_the_same_state_decoder() {
             streamcap_core::platforms::kuaishou_login::verify_login_page(&page, "42").unwrap(),
             Some("测试账号".into())
         );
+    }
+}
+
+#[test]
+fn kuaishou_server_state_allows_undefined_values_without_executing_javascript() {
+    let state = r#"{"liveroom":{"playList":[{"author":{"id":"target","name":"undefined 主播"},"liveStream":{},"isLiving":false,"authToken":undefined,"optional":[undefined,"undefined",{"value":undefined}]}]}}"#;
+    let page = format!(
+        "<script>window.__INITIAL_STATE__={state};document.currentScript.remove();</script>"
+    );
+    let info = kuaishou::parse_page(&page, None).unwrap();
+    assert_eq!(info.anchor_name, "undefined 主播");
+    assert!(!info.is_live);
+    for expression in [
+        "undefinedValue",
+        "(globalThis.sideEffect=true)",
+        "(()=>false)()",
+    ] {
+        let page = page.replace(
+            "\"authToken\":undefined",
+            &format!("\"authToken\":{expression}"),
+        );
+        assert!(kuaishou::parse_page(&page, None).is_err());
     }
 }
 #[tokio::test]

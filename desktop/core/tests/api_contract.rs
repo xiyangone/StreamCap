@@ -36,6 +36,71 @@ async fn start_backend() -> (String, tempfile::TempDir) {
     (format!("http://{addr}"), dir)
 }
 
+#[tokio::test]
+async fn missing_recording_roots_never_rewrite_settings_or_historical_paths_at_bootstrap() {
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = Workspace {
+        resource_dir: directory.path().join("StreamCap_new"),
+        user_data_dir: directory.path().join("profile"),
+    };
+    workspace.ensure_ready().unwrap();
+    let missing = directory.path().join("StreamCap_old/downloads");
+    let settings =
+        serde_json::to_vec_pretty(&json!({"live_save_path":missing,"loop_time_seconds":"4500"}))
+            .unwrap();
+    std::fs::write(workspace.user_settings_path(), &settings).unwrap();
+    let mut recording = streamcap_core::Recording::new(
+        "history".into(),
+        "http://127.0.0.1:1/live.ts".into(),
+        "History".into(),
+    );
+    recording.recording_dir = Some(missing.join("room").to_string_lossy().into());
+    let recordings = serde_json::to_vec_pretty(&json!([recording.to_storage()])).unwrap();
+    std::fs::write(workspace.recordings_path(), &recordings).unwrap();
+    let state = bootstrap(workspace.clone()).await.unwrap();
+    assert!(!missing.exists());
+    assert_eq!(
+        std::fs::read(workspace.user_settings_path()).unwrap(),
+        settings
+    );
+    assert_eq!(
+        std::fs::read(workspace.recordings_path()).unwrap(),
+        recordings
+    );
+    assert_eq!(
+        state.store.get("history").await.unwrap().recording_dir,
+        recording.recording_dir
+    );
+    streamcap_core::api::shutdown(&state).await.unwrap();
+}
+
+#[tokio::test]
+async fn import_counts_alias_duplicates_but_preserves_unknown_access_parameters() {
+    let (base, directory) = start_backend().await;
+    let client = reqwest::Client::new();
+    let response: Value = client.post(format!("{base}/api/recordings"))
+        .json(&json!({"items":[
+            {"url":"https://live.douyin.com/123?access=one", "streamerName":"first"},
+            {"url":"https://www.douyin.com/live/123?access=one&utm_source=share", "streamerName":"do not overwrite"},
+            {"url":"https://live.douyin.com/123?access=two"},
+            {"url":"https://live.douyin.com/123?access=one"}
+        ]})).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    assert_eq!(response["created"].as_array().unwrap().len(), 2);
+    assert_eq!(response["skipped"].as_array().unwrap().len(), 2);
+    assert_eq!(response["created"][0]["streamerName"], "first");
+    let path = directory.path().join("config/recordings.json");
+    let unchanged = std::fs::read(&path).unwrap();
+    let second = response["created"][1]["recId"].as_str().unwrap();
+    let edit = client
+        .put(format!("{base}/api/recordings/{second}"))
+        .json(&json!({"changes":{"url":"https://live.douyin.com/123?access=one"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(edit.status(), 409);
+    assert_eq!(std::fs::read(path).unwrap(), unchanged);
+}
+
 fn seed_defaults(workspace: &Workspace) {
     workspace.ensure_ready().unwrap();
     std::fs::write(
@@ -63,6 +128,7 @@ async fn status_matches_frontend_contract() {
     // 前端 api/gateway.rs 期望的字段名
     assert_eq!(status["ok"], json!(true));
     assert!(status["version"].is_string());
+    assert_eq!(status["buildId"], env!("STREAMCAP_BUILD_ID"));
     assert!(status["activeRecordings"].is_number());
     assert!(status["totalRecordings"].is_number());
     assert!(status["resolverReady"].is_boolean());
@@ -585,7 +651,7 @@ async fn duplicate_creation_and_invalid_edit_leave_existing_tasks_untouched() {
     let (base, guard) = start_backend().await;
     let rec = create_named(&base, "duplicate").await;
     let path = guard.path().join("config/recordings.json");
-    let original = std::fs::read(&path).unwrap();
+    let original: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     let client = reqwest::Client::new();
     let duplicate = client
         .post(format!("{base}/api/recordings"))
@@ -593,7 +659,17 @@ async fn duplicate_creation_and_invalid_edit_leave_existing_tasks_untouched() {
         .send()
         .await
         .unwrap();
-    assert_eq!(duplicate.status(), 409);
+    assert_eq!(duplicate.status(), 200);
+    let duplicate_body: Value = duplicate.json().await.unwrap();
+    assert_eq!(duplicate_body["created"].as_array().unwrap().len(), 1);
+    assert_eq!(duplicate_body["skipped"].as_array().unwrap().len(), 1);
+    assert_eq!(duplicate_body["skipped"][0]["reason"], "duplicate");
+    let after_import = std::fs::read(&path).unwrap();
+    let imported: Value = serde_json::from_slice(&after_import).unwrap();
+    assert_eq!(
+        imported[0], original[0],
+        "skipping duplicates must preserve every stored field"
+    );
     for change in [
         json!({"quality":"BAD"}),
         json!({"videoBitrate": -1}),
@@ -611,7 +687,23 @@ async fn duplicate_creation_and_invalid_edit_leave_existing_tasks_untouched() {
             .unwrap();
         assert_eq!(response.status(), 400);
     }
-    assert_eq!(std::fs::read(path).unwrap(), original);
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        after_import,
+        "invalid edits must not change any stored bytes"
+    );
+    let stored: Value = serde_json::from_slice(&after_import).unwrap();
+    assert_eq!(stored.as_array().unwrap().len(), 2);
+    assert!(stored
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| { item["rec_id"] == rec["recId"] && item["url"] == rec["url"] }));
+    assert!(stored
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["url"] == "https://live.douyin.com/new"));
 }
 
 #[tokio::test]
@@ -823,13 +915,19 @@ async fn creating_and_resuming_a_monitor_schedules_checks_without_start_requests
         .unwrap()
         .status()
         .is_success());
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        while !state.store.get(id).await.unwrap().is_live {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
+    // A resumed room joins the 20-40 second automatic queue instead of causing a burst.
+    // Advance only the test clock, never the real platform's configured interval.
+    tokio::time::pause();
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert!(!state.store.get(id).await.unwrap().is_live);
+    tokio::time::advance(std::time::Duration::from_secs(40)).await;
+    for _ in 0..30 {
+        tokio::task::yield_now().await;
+    }
+    assert!(state.store.get(id).await.unwrap().is_live);
+    tokio::time::resume();
     assert_eq!(
         state.config.read().await.get_i64("loop_time_seconds", 0),
         4500

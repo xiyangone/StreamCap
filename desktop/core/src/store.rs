@@ -17,6 +17,7 @@ pub struct GatewayEvent {
 #[derive(Clone)]
 pub struct Store {
     inner: Arc<RwLock<Vec<Recording>>>,
+    lifecycle: Arc<tokio::sync::Mutex<()>>,
     events: broadcast::Sender<GatewayEvent>,
     workspace: Workspace,
 }
@@ -26,6 +27,7 @@ impl Store {
         let (events, _) = broadcast::channel(256);
         Self {
             inner: Arc::new(RwLock::new(Vec::new())),
+            lifecycle: Arc::new(tokio::sync::Mutex::new(())),
             events,
             workspace,
         }
@@ -33,6 +35,15 @@ impl Store {
 
     pub(crate) fn data_dir(&self) -> &std::path::Path {
         &self.workspace.user_data_dir
+    }
+
+    // Shared with the scheduler; lock order is lifecycle -> config -> task data.
+    pub(crate) fn lifecycle(&self) -> Arc<tokio::sync::Mutex<()>> {
+        self.lifecycle.clone()
+    }
+
+    pub(crate) async fn lifecycle_guard(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.lifecycle.clone().lock_owned().await
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<GatewayEvent> {
@@ -160,6 +171,10 @@ impl Store {
         }
         updated.check_error = None;
         updated.verification_required = false;
+        updated.access_state.clear();
+        updated.check_state = "idle".into();
+        updated.last_check_at = Some(chrono::Utc::now().timestamp());
+        updated.last_success_at = updated.last_check_at;
         updated.is_live = info.is_live;
         updated.live_title = (info.is_live && !info.title.is_empty()).then(|| info.title.clone());
         if !info.is_live {
@@ -176,25 +191,31 @@ impl Store {
         Ok(Some(updated))
     }
 
-    pub async fn insert(&self, recordings: Vec<Recording>) -> io::Result<()> {
+    pub async fn insert(&self, recordings: Vec<Recording>) -> io::Result<Vec<Recording>> {
         let mut list = self.inner.write().await;
         let mut next = list.clone();
-        for rec in &recordings {
-            if next.iter().any(|old| old.url == rec.url) {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "直播间地址已存在，未添加任何任务",
-                ));
+        let mut created = Vec::new();
+        for rec in recordings {
+            let identity = crate::model::room_identity(&rec.url);
+            if next
+                .iter()
+                .any(|old| crate::model::room_identity(&old.url) == identity)
+            {
+                continue;
             }
             next.push(rec.clone());
+            created.push(rec);
+        }
+        if created.is_empty() {
+            return Ok(created);
         }
         self.persist_snapshot(&next)?;
         *list = next;
         drop(list);
-        for rec in recordings {
+        for rec in &created {
             self.emit("update", serde_json::to_value(rec)?);
         }
-        Ok(())
+        Ok(created)
     }
 
     #[cfg(test)]
@@ -206,6 +227,19 @@ impl Store {
 
     /// 在同一写锁内校验全部目标、写盘再发布，批量编辑不能部分落盘。
     pub async fn edit_many<F>(&self, ids: &[String], mutate: F) -> io::Result<Vec<Recording>>
+    where
+        F: Fn(&mut Recording),
+    {
+        let lifecycle = self.lifecycle_guard().await;
+        self.edit_many_locked(&lifecycle, ids, mutate).await
+    }
+
+    pub(crate) async fn edit_many_locked<F>(
+        &self,
+        _lifecycle: &tokio::sync::OwnedMutexGuard<()>,
+        ids: &[String],
+        mutate: F,
+    ) -> io::Result<Vec<Recording>>
     where
         F: Fn(&mut Recording),
     {
@@ -244,6 +278,24 @@ impl Store {
             }
             edited.push(rec.clone());
         }
+        for rec in &edited {
+            let url_changed = list
+                .iter()
+                .find(|old| old.rec_id == rec.rec_id)
+                .is_some_and(|old| old.url != rec.url);
+            if url_changed
+                && next.iter().any(|other| {
+                    other.rec_id != rec.rec_id
+                        && crate::model::room_identity(&other.url)
+                            == crate::model::room_identity(&rec.url)
+                })
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "该直播间已存在，未修改任务",
+                ));
+            }
+        }
         self.persist_snapshot(&next)?;
         *list = next;
         drop(list);
@@ -251,6 +303,22 @@ impl Store {
             self.emit("update", serde_json::to_value(rec)?);
         }
         Ok(edited)
+    }
+
+    /// Caller holds the lifecycle lock through the subsequent scheduler side effects.
+    pub(crate) async fn toggle_monitor_locked(&self, rec_id: &str) -> io::Result<Recording> {
+        let mut list = self.inner.write().await;
+        let index = list
+            .iter()
+            .position(|r| r.rec_id == rec_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "任务不存在"))?;
+        let mut next = list.clone();
+        next[index].monitor_status = !next[index].monitor_status;
+        let updated = next[index].clone();
+        self.persist_snapshot(&next)?;
+        *list = next;
+        self.emit("update", serde_json::to_value(&updated)?);
+        Ok(updated)
     }
 
     /// Update runtime state and broadcast only when the task still exists.
@@ -275,7 +343,12 @@ impl Store {
             .await
     }
 
-    async fn update_when<P, F>(&self, rec_id: &str, predicate: P, mutate: F) -> Option<Recording>
+    pub(crate) async fn update_when<P, F>(
+        &self,
+        rec_id: &str,
+        predicate: P,
+        mutate: F,
+    ) -> Option<Recording>
     where
         P: FnOnce(&Recording) -> bool,
         F: FnOnce(&mut Recording),
@@ -297,6 +370,7 @@ impl Store {
     }
 
     pub async fn remove(&self, rec_ids: &[String]) -> io::Result<usize> {
+        let _lifecycle = self.lifecycle_guard().await;
         let mut list = self.inner.write().await;
         if list
             .iter()

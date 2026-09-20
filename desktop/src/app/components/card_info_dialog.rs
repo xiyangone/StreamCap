@@ -35,6 +35,9 @@ pub fn CardInfoDialog(target: RwSignal<Option<Recording>>) -> impl IntoView {
                 <div><dt>{t("分段录制")}</dt><dd>{move || if record().segment_record.unwrap_or(false) { crate::tr_format!("每 {} 秒", record().segment_time.unwrap_or_else(|| "—".into())) } else { t("关闭").into() }}</dd></div>
                 <div><dt>{t("码率")}</dt><dd>{move || record().video_bitrate.map(|v| format!("{v} kbps")).unwrap_or_else(|| t("复制源流").into())}</dd></div>
                 <div><dt>{t("监控状态")}</dt><dd>{move || if record().monitor_status { t("已开启") } else { t("已暂停") }}</dd></div>
+                <div><dt>{t("最近检查")}</dt><dd>{move || crate::app::labels::modified_time(record().last_check_at.map(|value| value as f64))}</dd></div>
+                <div><dt>{t("最近成功检查")}</dt><dd>{move || crate::app::labels::modified_time(record().last_success_at.map(|value| value as f64))}</dd></div>
+                <div><dt>{t("下次计划检测")}</dt><dd>{move || crate::app::labels::modified_time(record().next_check_at.map(|value| value as f64))}</dd></div>
                 <div><dt>{t("本次录制时长")}</dt><dd>{move||crate::app::labels::duration(record().recorded_seconds)}</dd></div><div><dt>{t("录制速率")}</dt><dd>{move || record().speed.unwrap_or_else(|| "—".into())}</dd></div>
                 <div><dt>{t("保存目录")}</dt><dd class="break-anywhere">{move || record().recording_dir.unwrap_or_else(|| t("尚未生成录制文件").into())}</dd></div>
             </dl>

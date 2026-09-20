@@ -287,14 +287,14 @@ async fn desktop_kuaishou_verification(
             )
             .await?;
         }
-        "smoke-open" => {
+        "smoke-open" | "smoke-open-background" => {
             if !window.state::<lifecycle::Lifecycle>().is_smoke() {
                 return Err("仅隔离验收可调用".into());
             }
             kuaishou_verification::open(
                 app,
                 rec_id.as_deref().ok_or("请选择验证任务")?,
-                true,
+                action == "smoke-open",
                 Some(fixture_url.as_deref().ok_or("缺少隔离夹具地址")?),
             )
             .await?;

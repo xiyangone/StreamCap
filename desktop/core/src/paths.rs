@@ -67,7 +67,15 @@ impl Workspace {
 
     /// 默认录制输出目录，与 Python 的 default_recordings_dir 一致。
     pub fn default_recordings_dir(&self) -> PathBuf {
-        self.user_data_dir.join("downloads")
+        if self.is_installed_profile() {
+            self.resource_dir.join("downloads")
+        } else {
+            self.user_data_dir.join("downloads")
+        }
+    }
+
+    pub(crate) fn is_installed_profile(&self) -> bool {
+        dirs::config_dir().map(|dir| dir.join(APP_NAME)).as_ref() == Some(&self.user_data_dir)
     }
 
     /// 确保用户数据目录存在，并补齐缺失的默认配置（不覆盖用户已有文件）。
@@ -144,6 +152,25 @@ mod tests {
         assert_eq!(
             ws.default_recordings_dir(),
             PathBuf::from("Z:/demo/streamcap/downloads")
+        );
+    }
+
+    #[test]
+    fn installed_workspace_keeps_default_recordings_beside_the_executable() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Workspace::for_installed(dir.path()).unwrap();
+        assert_eq!(ws.default_recordings_dir(), dir.path().join("downloads"));
+    }
+
+    #[test]
+    fn explicit_profiles_keep_default_recordings_inside_the_profile() {
+        let ws = Workspace {
+            resource_dir: PathBuf::from("E:/StreamCap"),
+            user_data_dir: PathBuf::from("E:/isolated-profile"),
+        };
+        assert_eq!(
+            ws.default_recordings_dir(),
+            PathBuf::from("E:/isolated-profile/downloads")
         );
     }
 

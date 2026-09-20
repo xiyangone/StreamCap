@@ -48,18 +48,17 @@ impl CheckOutcome {
     }
 }
 
+type LiveSourceCache =
+    std::collections::HashMap<String, (String, std::time::Instant, crate::resolver::StreamInfo)>;
+
 pub struct Scheduler {
     pacer: crate::pacing::Pacer,
+    automatic_pacer: crate::pacing::AutomaticPacer,
     checks: Arc<
         std::sync::Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>,
     >,
     schedule_edges: std::sync::Mutex<std::collections::HashMap<String, bool>>,
-    live_sources: tokio::sync::RwLock<
-        std::collections::HashMap<
-            String,
-            (String, std::time::Instant, crate::resolver::StreamInfo),
-        >,
-    >,
+    live_sources: Arc<tokio::sync::RwLock<LiveSourceCache>>,
     store: Store,
     engine: Engine,
     config: Arc<RwLock<ConfigStore>>,
@@ -99,12 +98,42 @@ struct FinishPlan {
     subtitles: Option<PathBuf>,
 }
 impl FinishPlan {
+    // Caller holds the filesystem guard: transfer protection before releasing the recorder.
+    fn spawn(
+        self,
+        process: Arc<RecorderProcess>,
+        engine: Engine,
+        postprocess: crate::postprocess::Postprocessor,
+        automation: crate::automation::Automation,
+        store: Store,
+        background: &tokio_util::task::TaskTracker,
+    ) {
+        let mut paths = vec![process.output_path.clone()];
+        if self.subtitles.is_some() {
+            paths.push(process.output_path.with_extension("srt"));
+        }
+        let reservation = engine.reserve_media(paths);
+        background.spawn(async move {
+            self.dispatch(
+                &process,
+                &postprocess,
+                &automation,
+                &store,
+                &engine,
+                reservation,
+            )
+            .await;
+        });
+    }
+
     async fn dispatch(
         mut self,
         process: &Arc<RecorderProcess>,
         postprocess: &crate::postprocess::Postprocessor,
         automation: &crate::automation::Automation,
         store: &Store,
+        engine: &Engine,
+        reservation: crate::engine::MediaReservation,
     ) {
         if let Some(ffprobe) = &self.subtitles {
             if let Err(error) = crate::subtitles::generate(
@@ -119,6 +148,9 @@ impl FinishPlan {
                 store.snack(format!("时间字幕未生成：{error}；本次源文件保留"));
             }
         }
+        // Subtitles may probe many files. Only the short reservation/job handoff is locked.
+        let filesystem = engine.filesystem_guard().await;
+        drop(reservation);
         if self.convert {
             if let Err(error) = postprocess
                 .enqueue_recording_locked(
@@ -132,6 +164,7 @@ impl FinishPlan {
                 store.snack(format!("自动转 MP4 未开始：{error}；原 TS 保留"));
             }
         }
+        drop(filesystem);
         if let Some(script) = self.script {
             let room = store
                 .get(&process.rec_id)
@@ -159,6 +192,7 @@ impl Scheduler {
         recording_enabled: Arc<AtomicBool>,
     ) -> Self {
         let stopping = resolver.cancellation();
+        let starting = store.lifecycle();
         let postprocess = crate::postprocess::Postprocessor::new(
             engine.clone(),
             store.clone(),
@@ -171,9 +205,10 @@ impl Scheduler {
             notifications,
             automation,
             pacer: crate::pacing::Pacer::default(),
+            automatic_pacer: crate::pacing::AutomaticPacer::default(),
             checks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             schedule_edges: std::sync::Mutex::new(std::collections::HashMap::new()),
-            live_sources: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            live_sources: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             store,
             engine,
             config,
@@ -188,7 +223,7 @@ impl Scheduler {
             postprocess,
             conversion_plans: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             background: tokio_util::task::TaskTracker::new(),
-            starting: Arc::new(tokio::sync::Mutex::new(())),
+            starting,
         }
     }
 
@@ -220,7 +255,6 @@ impl Scheduler {
     }
 
     pub async fn run(self: Arc<Self>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
-        use futures::StreamExt;
         use tokio::time::Instant;
         let mut changed = self.interval_changed.subscribe();
         let mut interval = self.monitoring_interval().await;
@@ -232,6 +266,19 @@ impl Scheduler {
             .filter(|record| record.monitor_status)
             .map(|record| (record.rec_id, Instant::now()))
             .collect();
+        for id in deadlines.keys() {
+            self.store
+                .update(id, |record| {
+                    record.check_state = if record.is_recording {
+                        "idle"
+                    } else {
+                        "queued"
+                    }
+                    .into();
+                    record.next_check_at = Some(chrono::Utc::now().timestamp());
+                })
+                .await;
+        }
         loop {
             let deadline = deadlines
                 .values()
@@ -243,7 +290,10 @@ impl Scheduler {
                 _ = shutdown.changed() => return,
                 _ = changed.changed() => {
                     interval = self.monitoring_interval().await;
-                    for next in deadlines.values_mut() { *next = Instant::now() + interval; }
+                    for (id, next) in &mut deadlines {
+                        *next = Instant::now() + interval;
+                        self.store.update(id, |r| { r.check_state = "idle".into(); r.next_check_at = Some(chrono::Utc::now().timestamp() + interval.as_secs() as i64); }).await;
+                    }
                     continue;
                 },
                 _ = self.monitor_changed.notified() => {},
@@ -255,11 +305,23 @@ impl Scheduler {
             deadlines.retain(|id, _| records.iter().any(|r| &r.rec_id == id && r.monitor_status));
             for record in &records {
                 if record.monitor_status && requested.contains(&record.rec_id) {
-                    deadlines.insert(record.rec_id.clone(), Instant::now());
+                    let now = Instant::now();
+                    deadlines
+                        .entry(record.rec_id.clone())
+                        .and_modify(|due| *due = (*due).min(now))
+                        .or_insert(now);
+                    self.store
+                        .update(&record.rec_id, |r| {
+                            if !r.is_recording && r.check_state != "checking" {
+                                r.check_state = "queued".into();
+                            }
+                            r.next_check_at = Some(chrono::Utc::now().timestamp());
+                        })
+                        .await;
                 }
             }
             let now = Instant::now();
-            let due: Vec<_> = records
+            let due = records
                 .into_iter()
                 .filter(|record| {
                     record.monitor_status
@@ -267,34 +329,63 @@ impl Scheduler {
                             .get(&record.rec_id)
                             .is_some_and(|next| *next <= now)
                 })
-                .collect();
-            for record in &due {
+                .min_by_key(|record| deadlines[&record.rec_id]);
+            let Some(record) = due else { continue };
+            if !self.recording_enabled.load(Ordering::SeqCst) || record.is_recording {
                 deadlines.insert(record.rec_id.clone(), now + interval);
-            }
-            if !self.recording_enabled.load(Ordering::SeqCst) {
+                self.store
+                    .update(&record.rec_id, |r| {
+                        r.next_check_at =
+                            Some(chrono::Utc::now().timestamp() + interval.as_secs() as i64);
+                        if r.is_recording {
+                            r.check_state = "idle".into();
+                        }
+                    })
+                    .await;
                 continue;
             }
-            let checks = futures::stream::iter(due)
-                .map(|record| {
-                    let scheduler = self.clone();
-                    async move {
-                        if let Err(error) = scheduler.check(record.rec_id.clone()).await {
-                            log::debug!("检测未完成: {error}");
-                        }
-                        (record.rec_id, Instant::now() + interval)
+            self.store
+                .update(&record.rec_id, |r| {
+                    if r.check_state != "checking" {
+                        r.check_state = "queued".into();
                     }
                 })
-                .buffer_unordered(16)
-                .collect::<Vec<_>>();
-            let completed = tokio::select! { biased;
+                .await;
+            let check = async {
+                let _permit = self.automatic_pacer.acquire(&self.stopping).await?;
+                log::info!(
+                    "自动探测开始 task={} platform={} interval={}s",
+                    record.rec_id,
+                    record.platform_key.as_deref().unwrap_or("custom"),
+                    interval.as_secs()
+                );
+                self.check(record.rec_id.clone()).await
+            };
+            let result = tokio::select! { biased;
                 _ = self.stopping.cancelled() => return,
                 _ = shutdown.changed() => return,
-                result = checks => result,
+                result = check => result,
             };
-            // A new task's first check never accelerates another room's existing deadline.
-            for (id, next) in completed {
-                deadlines.insert(id, next);
+            if let Err(error) = result {
+                log::debug!("检测未完成: {error}");
             }
+            // The next ordinary poll is measured per room, after its own completion.
+            self.store
+                .update(&record.rec_id, |r| {
+                    if !self
+                        .checks
+                        .lock()
+                        .expect("active checks")
+                        .contains_key(&record.rec_id)
+                    {
+                        r.check_state = "idle".into();
+                    }
+                    r.next_check_at = r
+                        .monitor_status
+                        .then_some(chrono::Utc::now().timestamp() + interval.as_secs() as i64);
+                })
+                .await;
+            deadlines.insert(record.rec_id, Instant::now() + interval);
         }
     }
 
@@ -316,11 +407,35 @@ impl Scheduler {
                 return Ok(CheckOutcome::OutsideSchedule);
             }
         }
-        let info = match self.resolve_for(&rec_id).await {
-            Ok(info) => info,
+        let (expected, info) = match self.resolve_for(&rec_id).await {
+            Ok(resolved) => resolved,
             Err(error) => return Ok(CheckOutcome::Failed(error)),
         };
-        self.accept_resolved(rec_id, &info, false).await
+        self.accept_resolved(&expected, &info, false).await
+    }
+
+    /// Accept data from the same official room after an explicit human verification action.
+    pub async fn report_kuaishou_access(&self, expected: &crate::model::Recording, error: &str) {
+        self.store
+            .update_when(
+                &expected.rec_id,
+                |r| {
+                    !self.stopping.is_cancelled()
+                        && r.platform_key.as_deref() == Some("kuaishou")
+                        && r.url == expected.url
+                        && r.quality == expected.quality
+                        && r.recording_run == expected.recording_run
+                },
+                |r| {
+                    r.check_error = Some(error.into());
+                    r.verification_required =
+                        crate::platforms::kuaishou::verification_required(error);
+                    r.access_state = crate::platforms::kuaishou::access_state(error).into();
+                    r.check_state = "idle".into();
+                    r.last_check_at = Some(chrono::Utc::now().timestamp());
+                },
+            )
+            .await;
     }
 
     /// Accept data from the same official room after an explicit human verification action.
@@ -331,6 +446,7 @@ impl Scheduler {
         info: &crate::resolver::StreamInfo,
     ) -> Result<CheckOutcome, String> {
         let _operation = self.begin_check(&expected.rec_id)?;
+        let lifecycle = self.starting.lock().await;
         let current = self
             .store
             .get(&expected.rec_id)
@@ -353,16 +469,25 @@ impl Scheduler {
                 CheckOutcome::MonitoringPaused
             });
         }
-        self.accept_resolved(current.rec_id, info, false).await
+        drop(lifecycle);
+        self.accept_resolved(&current, info, false).await
     }
 
     async fn accept_resolved(
         &self,
-        rec_id: String,
+        expected: &crate::model::Recording,
         info: &crate::resolver::StreamInfo,
         manual: bool,
     ) -> Result<CheckOutcome, String> {
         let _starting = self.starting.lock().await;
+        let rec_id = expected.rec_id.clone();
+        if self.store.get(&rec_id).await.is_none_or(|current| {
+            current.url != expected.url
+                || current.quality != expected.quality
+                || current.recording_run != expected.recording_run
+        }) {
+            return Err("任务已更新，旧检测结果已丢弃".into());
+        }
         if self.stopping.is_cancelled() {
             return Err("应用正在退出".into());
         }
@@ -717,7 +842,8 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Process exit ends recording, not the last verified platform live status.
+    /// Publish recording completion immediately, then recheck only this room's live status.
+    /// EOF itself is not proof that a platform room is offline.
     fn spawn_exit_watcher(&self, process: Arc<RecorderProcess>) {
         let store = self.store.clone();
         let engine = self.engine.clone();
@@ -726,6 +852,9 @@ impl Scheduler {
         let conversion_plans = self.conversion_plans.clone();
         let automation = self.automation.clone();
         let stopping = self.stopping.clone();
+        let room_check = self.room_check();
+        let live_sources = self.live_sources.clone();
+        let background = self.background.clone();
         self.background.spawn(async move {
             loop {
                 tokio::select! { biased;
@@ -740,23 +869,45 @@ impl Scheduler {
                 match engine.poll_state(&process).await {
                     crate::engine::ProcessState::Running => continue,
                     crate::engine::ProcessState::Exited { code, error } => {
-                        if let Some(plan) = conversion_plans.lock().await.remove(&process.run_id) {
-                            plan.dispatch(&process, &postprocess, &automation, &store)
-                                .await;
-                        }
+                        let refresh_needed = code == Some(0) && error.is_none();
+                        let plan = conversion_plans.lock().await.remove(&process.run_id);
                         log::info!("录制 {} 已结束（ffmpeg 退出码 {code:?}）", process.rec_id);
                         let updated = store
                             .update_for_run(&process.rec_id, process.run_id, |r| {
                                 r.is_recording = false;
-                                r.recorded_seconds = process.started_at.elapsed().as_secs_f64();
+                                r.recorded_seconds = process.recorded_seconds();
                                 r.last_duration = Some(r.recorded_seconds);
-                                r.recording_run = None;
+                                // Retain the attempt identity until the read-only check is applied.
+                                // Stop/edit/restart will invalidate it before an old reply can commit.
+                                if !refresh_needed {
+                                    r.recording_run = None;
+                                }
                                 r.speed = None;
                                 r.recording_error = error.clone();
                             })
                             .await;
-                        if let (Some(record), Some(error)) = (updated, error) {
+                        if let Some(plan) = plan {
+                            plan.spawn(
+                                process.clone(),
+                                engine.clone(),
+                                postprocess.clone(),
+                                automation.clone(),
+                                store.clone(),
+                                &background,
+                            );
+                        }
+                        if let (Some(record), Some(error)) = (&updated, error) {
                             store.snack(format!("{}：录制失败，{error}", record.streamer_name));
+                        }
+                        if updated.is_some() {
+                            live_sources.write().await.remove(&process.rec_id);
+                            drop(_filesystem);
+                            drop(_starting);
+                            if refresh_needed {
+                                room_check
+                                    .refresh_finished(&process.rec_id, process.run_id)
+                                    .await;
+                            }
                         }
                         return;
                     }
@@ -781,8 +932,9 @@ impl Scheduler {
                 let current=match storage.blocking(move|cancel|{crate::storage::check_cancel(&cancel)?;crate::media_safety::output_bytes(&pattern)}).await{Ok(n)=>n,Err(e)=>{log::warn!("录制大小统计失败: {e}");continue;}};
                 let seconds=sampled_at.elapsed().as_secs_f64().max(0.001);sampled_at=tokio::time::Instant::now();
                 let speed=format!("{:.0} KB/s",current.saturating_sub(previous) as f64/seconds/1024.0);previous=current;
-                let elapsed=process.started_at.elapsed().as_secs_f64();
-                store.update_for_run(&process.rec_id,process.run_id,move|r|{r.speed=Some(speed);r.recorded_seconds=elapsed;}).await;
+                process.observe_output_bytes(current);
+                let elapsed=process.recorded_seconds();
+                store.update_when(&process.rec_id, |r| r.is_recording && r.recording_run == Some(process.run_id), move|r|{r.speed=Some(speed);r.recorded_seconds=elapsed;}).await;
             }
         });
     }
@@ -791,103 +943,28 @@ impl Scheduler {
     /// 未开播时返回错误——对应 Python `recording_button_on_click` 的「该直播间未开播」提示。
     pub async fn force_start(&self, rec_id: String) -> Result<CheckOutcome, String> {
         let _operation = self.begin_check(&rec_id)?;
-        let info = self.resolve_for(&rec_id).await?;
-        self.accept_resolved(rec_id, &info, true).await
+        let (expected, info) = self.resolve_for(&rec_id).await?;
+        self.accept_resolved(&expected, &info, true).await
     }
 
-    /// 解析直播流（check 与 force_start 共用）。
-    async fn resolve_for(&self, rec_id: &str) -> Result<crate::resolver::StreamInfo, String> {
-        let Some(rec) = self.store.get(rec_id).await else {
-            return Err(format!("任务不存在: {rec_id}"));
-        };
-
-        let (proxy, quality, maximum, spacing) = {
-            let config = self.config.read().await;
-            let proxy = recording_proxy(&config, rec.platform_key.as_deref())?;
-            let quality = rec
-                .quality
-                .clone()
-                .unwrap_or_else(|| config.get_str("record_quality", "OD"));
-            (
-                proxy,
-                quality,
-                config
-                    .get_i64("platform_max_concurrent_requests", 3)
-                    .clamp(1, 16) as usize,
-                config.get_i64("platform_request_interval", 3).clamp(0, 300) as u64,
-            )
-        };
-        let key = rec.platform_key.as_deref().unwrap_or("custom");
-        let stop = self
-            .checks
-            .lock()
-            .expect("active checks")
-            .get(rec_id)
-            .cloned()
-            .unwrap_or_else(|| self.stopping.clone());
-        let _permit = self
-            .pacer
-            .acquire(key, maximum, Duration::from_secs(spacing), &stop)
-            .await?;
-        let cookie = self
-            .config
-            .read()
-            .await
-            .cookies_for_resolver()
-            .map_err(|_| "Cookie 配置无法读取，未发送匿名请求")?
-            .get(key)
-            .cloned();
-        let work = self.resolver.resolve(ResolveRequest {
-            account: self
-                .config
-                .read()
-                .await
-                .account(key)
-                .map_err(|_| "账号配置无法读取，未发送匿名请求")?,
-            url: rec.url.clone(),
-            quality: Some(quality),
-            proxy,
-            cookie,
-            platform: rec.platform_key.clone(),
-        });
-        let result = tokio::select! { biased; _=stop.cancelled()=>Err("检测已取消".into()), result=work=>result };
-        if self
-            .store
-            .get(rec_id)
-            .await
-            .is_none_or(|current| current.url != rec.url || current.quality != rec.quality)
-        {
-            return Err("任务已更新，旧检测结果已丢弃".into());
+    /// All checks, including post-recording refreshes, share one resolver and pacer.
+    fn room_check(&self) -> RoomCheck {
+        RoomCheck {
+            store: self.store.clone(),
+            config: self.config.clone(),
+            resolver: self.resolver.clone(),
+            pacer: self.pacer.clone(),
+            automatic_pacer: self.automatic_pacer.clone(),
+            checks: self.checks.clone(),
+            stopping: self.stopping.clone(),
+            notifications: self.notifications.clone(),
         }
-        self.pacer.result(key, &result);
-        if let Err(error) = &result {
-            let verification =
-                key == "kuaishou" && crate::platforms::kuaishou::verification_required(error);
-            let changed = rec.check_error.as_ref() != Some(error)
-                || rec.verification_required != verification;
-            self.store
-                .update(rec_id, |record| {
-                    record.check_error = Some(error.clone());
-                    record.verification_required = verification;
-                })
-                .await;
-            if changed {
-                // Never write cookie values, request URLs or platform response bodies to the log.
-                log::warn!(
-                    "平台检测未完成 task={} platform={} verification={}",
-                    rec_id,
-                    key,
-                    verification
-                );
-            }
-            if verification {
-                self.store.emit(
-                    "kuaishouVerificationRequired",
-                    serde_json::json!({"recId":rec_id}),
-                );
-            }
-        }
-        result
+    }
+    async fn resolve_for(
+        &self,
+        rec_id: &str,
+    ) -> Result<(crate::model::Recording, crate::resolver::StreamInfo), String> {
+        self.room_check().resolve_for(rec_id).await
     }
     pub async fn enforce_windows(self: &Arc<Self>) {
         self.automation.tick().await;
@@ -916,19 +993,21 @@ impl Scheduler {
                     .insert(record.rec_id.clone(), active)
                     .unwrap_or(false);
                 if active && !previous && !record.is_recording {
-                    let _starting = self.starting.lock().await;
-                    if self.stopping.is_cancelled() {
-                        return;
-                    }
-                    let scheduler = self.clone();
-                    self.background.spawn(async move {
-                        if let Err(error) = scheduler.check(record.rec_id).await {
-                            log::debug!("定时检测未执行: {error}");
-                        }
-                    });
+                    self.request_monitoring([record.rec_id]);
                 }
             }
         }
+    }
+
+    /// Persist the transition before publishing it or touching an active recorder.
+    pub async fn toggle_monitor(&self, rec_id: &str) -> std::io::Result<crate::model::Recording> {
+        let _starting = self.starting.lock().await;
+        let record = self.store.toggle_monitor_locked(rec_id).await?;
+        if !record.monitor_status {
+            self.stop_recording_locked(rec_id).await;
+        }
+        self.request_monitoring([rec_id.to_owned()]);
+        Ok(self.store.get(rec_id).await.unwrap_or(record))
     }
 
     /// 停止录制并更新状态。
@@ -944,15 +1023,7 @@ impl Scheduler {
         let _filesystem = self.engine.filesystem_guard().await;
         let process = self.engine.process(rec_id).await;
         let stopped = self.engine.stop(rec_id, 15).await;
-        let elapsed = process
-            .as_ref()
-            .map(|p| p.started_at.elapsed().as_secs_f64());
-        if let Some(process) = process {
-            if let Some(plan) = self.conversion_plans.lock().await.remove(&process.run_id) {
-                plan.dispatch(&process, &self.postprocess, &self.automation, &self.store)
-                    .await;
-            }
-        }
+        let elapsed = process.as_ref().map(|p| p.recorded_seconds());
         self.store
             .update(rec_id, |r| {
                 r.is_recording = false;
@@ -963,8 +1034,25 @@ impl Scheduler {
                 r.recording_run = None;
                 r.recording_error = None;
                 r.speed = None;
+                r.check_state = "idle".into();
+                if !r.monitor_status {
+                    r.next_check_at = None;
+                }
             })
             .await;
+        if let Some(process) = process {
+            let plan = self.conversion_plans.lock().await.remove(&process.run_id);
+            if let Some(plan) = plan {
+                plan.spawn(
+                    process,
+                    self.engine.clone(),
+                    self.postprocess.clone(),
+                    self.automation.clone(),
+                    self.store.clone(),
+                    &self.background,
+                );
+            }
+        }
         stopped
     }
 
@@ -988,18 +1076,7 @@ impl Scheduler {
     }
 
     fn begin_check(&self, rec_id: &str) -> Result<CheckLease, String> {
-        if self.stopping.is_cancelled() {
-            return Err("应用正在退出".into());
-        }
-        let mut checks = self.checks.lock().expect("active checks");
-        if checks.contains_key(rec_id) {
-            return Err("此任务正在检测，请勿重复请求".into());
-        }
-        checks.insert(rec_id.to_owned(), self.stopping.child_token());
-        Ok(CheckLease {
-            id: rec_id.to_owned(),
-            checks: self.checks.clone(),
-        })
+        self.room_check().begin_check(rec_id)
     }
     /// Preview reuses a fresh verified source and never performs a background room request.
     pub async fn preview_input(&self, rec_id: &str) -> Result<crate::preview::LiveInput, String> {
@@ -1056,6 +1133,299 @@ impl Scheduler {
 }
 
 /// 海外平台使用更大的缓冲配置（与 Python is_overseas 取向一致）。
+
+#[derive(Clone)]
+struct RoomCheck {
+    store: Store,
+    config: Arc<RwLock<ConfigStore>>,
+    resolver: Resolver,
+    pacer: crate::pacing::Pacer,
+    automatic_pacer: crate::pacing::AutomaticPacer,
+    checks: Arc<
+        std::sync::Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>,
+    >,
+    stopping: tokio_util::sync::CancellationToken,
+    notifications: crate::notifications::Notifications,
+}
+impl RoomCheck {
+    async fn check_phase(&self, expected: &crate::model::Recording, phase: &str) {
+        self.store
+            .update_when(
+                &expected.rec_id,
+                |record| {
+                    record.url == expected.url
+                        && record.quality == expected.quality
+                        && record.recording_run == expected.recording_run
+                        && record.check_state != phase
+                },
+                |record| {
+                    record.check_state = phase.into();
+                    if phase == "checking" {
+                        record.last_check_at = Some(chrono::Utc::now().timestamp());
+                    }
+                },
+            )
+            .await;
+    }
+
+    fn begin_check(&self, rec_id: &str) -> Result<CheckLease, String> {
+        if self.stopping.is_cancelled() {
+            return Err("应用正在退出".into());
+        }
+        let mut checks = self.checks.lock().expect("active checks");
+        if checks.contains_key(rec_id) {
+            return Err("此任务正在检测，请勿重复请求".into());
+        }
+        checks.insert(rec_id.to_owned(), self.stopping.child_token());
+        Ok(CheckLease {
+            id: rec_id.to_owned(),
+            checks: self.checks.clone(),
+        })
+    }
+    /// 解析直播流（check 与 force_start 共用）。
+    async fn resolve_for(
+        &self,
+        rec_id: &str,
+    ) -> Result<(crate::model::Recording, crate::resolver::StreamInfo), String> {
+        let Some(rec) = self.store.get(rec_id).await else {
+            return Err(format!("任务不存在: {rec_id}"));
+        };
+
+        let key = rec.platform_key.as_deref().unwrap_or("custom");
+        let stop = self
+            .checks
+            .lock()
+            .expect("active checks")
+            .get(rec_id)
+            .cloned()
+            .unwrap_or_else(|| self.stopping.clone());
+        self.check_phase(&rec, "queued").await;
+        let work = async {
+            let (proxy, quality, maximum, spacing) = {
+                let config = self.config.read().await;
+                let proxy = recording_proxy(&config, rec.platform_key.as_deref())?;
+                let quality = rec
+                    .quality
+                    .clone()
+                    .unwrap_or_else(|| config.get_str("record_quality", "OD"));
+                (
+                    proxy,
+                    quality,
+                    config
+                        .get_i64("platform_max_concurrent_requests", 3)
+                        .clamp(1, 16) as usize,
+                    config.get_i64("platform_request_interval", 3).clamp(0, 300) as u64,
+                )
+            };
+            let _permit = self
+                .pacer
+                .acquire(key, maximum, Duration::from_secs(spacing), &stop)
+                .await?;
+            self.check_phase(&rec, "checking").await;
+            let cookie = self
+                .config
+                .read()
+                .await
+                .cookies_for_resolver()
+                .map_err(|_| "Cookie 配置无法读取，未发送匿名请求")?
+                .get(key)
+                .cloned();
+            self.resolver
+                .resolve(ResolveRequest {
+                    account: self
+                        .config
+                        .read()
+                        .await
+                        .account(key)
+                        .map_err(|_| "账号配置无法读取，未发送匿名请求")?,
+                    url: rec.url.clone(),
+                    quality: Some(quality),
+                    proxy,
+                    cookie,
+                    platform: rec.platform_key.clone(),
+                })
+                .await
+        };
+        let result = tokio::select! {
+            biased;
+            _=stop.cancelled()=>Err("检测已取消".into()),
+            result=tokio::time::timeout(Duration::from_secs(60),work)=>result.unwrap_or_else(|_| Err("检测排队或解析超过 60 秒，请稍后重试".into())),
+        };
+        self.check_phase(&rec, "idle").await;
+        if stop.is_cancelled() {
+            return Err("检测已取消".into());
+        }
+        if self.store.get(rec_id).await.is_none_or(|current| {
+            current.url != rec.url
+                || current.quality != rec.quality
+                || current.recording_run != rec.recording_run
+        }) {
+            return Err("任务已更新，旧检测结果已丢弃".into());
+        }
+        self.pacer.result(key, &result);
+        if let Err(error) = &result {
+            let verification =
+                key == "kuaishou" && crate::platforms::kuaishou::verification_required(error);
+            let page_check =
+                key == "kuaishou" && crate::platforms::kuaishou::page_check_required(error);
+            let changed = rec.check_error.as_ref() != Some(error)
+                || rec.verification_required != verification;
+            let updated = self
+                .store
+                .update_when(
+                    rec_id,
+                    |record| {
+                        !stop.is_cancelled()
+                            && record.url == rec.url
+                            && record.quality == rec.quality
+                            && record.recording_run == rec.recording_run
+                    },
+                    |record| {
+                        record.check_error = Some(error.clone());
+                        record.verification_required = verification;
+                        record.access_state = if key == "kuaishou" {
+                            crate::platforms::kuaishou::access_state(error).into()
+                        } else {
+                            String::new()
+                        };
+                        record.check_state = "idle".into();
+                        record.last_check_at = Some(chrono::Utc::now().timestamp());
+                    },
+                )
+                .await;
+            if updated.is_none() {
+                return Err("任务已更新，旧检测结果已丢弃".into());
+            }
+            if changed {
+                // Never write cookie values, request URLs or platform response bodies to the log.
+                log::warn!(
+                    "平台检测未完成 task={} platform={} verification={}",
+                    rec_id,
+                    key,
+                    verification
+                );
+            }
+            if page_check {
+                self.store.emit(
+                    "kuaishouVerificationRequired",
+                    serde_json::json!({"recId":rec_id}),
+                );
+            }
+        }
+        result.map(|info| (rec, info))
+    }
+
+    async fn refresh_finished(&self, rec_id: &str, run_id: uuid::Uuid) {
+        let Ok(_permit) = self.automatic_pacer.acquire(&self.stopping).await else {
+            return;
+        };
+        let _operation = loop {
+            if self.stopping.is_cancelled()
+                || self.store.get(rec_id).await.is_none_or(|record| {
+                    record.recording_run != Some(run_id) || record.is_recording
+                })
+            {
+                return;
+            }
+            if let Ok(operation) = self.begin_check(rec_id) {
+                break operation;
+            }
+            tokio::select! {
+                biased;
+                _ = self.stopping.cancelled() => return,
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+            }
+        };
+        let Some(expected) = self.store.get(rec_id).await else {
+            return;
+        };
+        if expected.recording_run != Some(run_id) || expected.is_recording {
+            return;
+        }
+        let result = self.resolve_for(rec_id).await.map(|(_, info)| info);
+        let cancelled = self.stopping.is_cancelled()
+            || self
+                .checks
+                .lock()
+                .expect("active checks")
+                .get(rec_id)
+                .is_none_or(|token| token.is_cancelled());
+        if cancelled {
+            return;
+        }
+        self.apply_finished(&expected, &result).await;
+    }
+
+    async fn apply_finished(
+        &self,
+        expected: &crate::model::Recording,
+        result: &Result<crate::resolver::StreamInfo, String>,
+    ) {
+        let updated = self
+            .store
+            .update_when(
+                &expected.rec_id,
+                |record| {
+                    !self.stopping.is_cancelled()
+                        && expected.recording_run.is_some()
+                        && record.recording_run == expected.recording_run
+                        && record.url == expected.url
+                        && record.quality == expected.quality
+                        && !record.is_recording
+                },
+                |record| {
+                    record.recording_run = None;
+                    record.check_state = "idle".into();
+                    record.last_check_at = Some(chrono::Utc::now().timestamp());
+                    match result {
+                        Ok(info) => {
+                            record.last_success_at = record.last_check_at;
+                            record.is_live = info.is_live;
+                            record.live_title = (info.is_live && !info.title.is_empty())
+                                .then(|| info.title.clone());
+                            record.check_error = None;
+                            record.verification_required = false;
+                            record.access_state.clear();
+                            if !info.is_live {
+                                record.recording_error = None;
+                            }
+                        }
+                        Err(error) => {
+                            record.check_error = Some(error.clone());
+                            record.verification_required = record.platform_key.as_deref()
+                                == Some("kuaishou")
+                                && crate::platforms::kuaishou::verification_required(error);
+                            record.access_state =
+                                if record.platform_key.as_deref() == Some("kuaishou") {
+                                    crate::platforms::kuaishou::access_state(error).into()
+                                } else {
+                                    String::new()
+                                };
+                        }
+                    }
+                },
+            )
+            .await;
+        if let Some(record) = updated {
+            if result.is_ok() && record.is_live != expected.is_live {
+                let mut notification = record.clone();
+                if !record.is_live {
+                    notification.live_title = expected.live_title.clone();
+                }
+                self.notifications
+                    .changed(&notification, record.is_live)
+                    .await;
+            }
+            log::info!(
+                "录制结束后的状态复核 task={} readable={} live={}",
+                record.rec_id,
+                result.is_ok(),
+                record.is_live
+            );
+        }
+    }
+}
+
 fn is_overseas_platform(platform_key: Option<&str>) -> bool {
     const OVERSEAS: &[&str] = &[
         "tiktok", "soop", "pandatv", "winktv", "flextv", "popkontv", "twitch", "liveme",
@@ -1145,6 +1515,169 @@ mod tests {
     use crate::model::Recording;
     use crate::paths::Workspace;
 
+    async fn finished_recording_fixture() -> (tempfile::TempDir, crate::api::ApiState, Recording) {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::api::bootstrap(Workspace::from_repo_root(dir.path()))
+            .await
+            .unwrap();
+        state
+            .config
+            .write()
+            .await
+            .update_user_config(
+                serde_json::json!({"loop_time_seconds":"4500","platform_request_interval":"0"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )
+            .unwrap();
+        let mut record = Recording::new(
+            "finished".into(),
+            "http://127.0.0.1:1/fixture.ts".into(),
+            "Fixture".into(),
+        );
+        record.platform_key = Some("custom".into());
+        record.monitor_status = true;
+        record.is_live = true;
+        record.is_recording = false;
+        record.live_title = Some("Previous live title".into());
+        record.recorded_seconds = 42.0;
+        record.last_duration = Some(42.0);
+        record.recording_run = Some(uuid::Uuid::new_v4());
+        record.recording_error = Some("Previous transport error".into());
+        state.store.insert(vec![record.clone()]).await.unwrap();
+        (dir, state, record)
+    }
+
+    #[tokio::test]
+    async fn finished_recording_refresh_uses_confirmed_state_and_keeps_monitoring_intent() {
+        for (monitored, outcome) in [
+            (
+                true,
+                Ok(crate::resolver::StreamInfo {
+                    is_live: false,
+                    ..Default::default()
+                }),
+            ),
+            (
+                false,
+                Ok(crate::resolver::StreamInfo {
+                    is_live: false,
+                    ..Default::default()
+                }),
+            ),
+            (
+                true,
+                Ok(crate::resolver::StreamInfo {
+                    is_live: true,
+                    title: "Still live".into(),
+                    ..Default::default()
+                }),
+            ),
+            (true, Err("平台请求超时".to_string())),
+        ] {
+            let (_dir, state, mut expected) = finished_recording_fixture().await;
+            expected.monitor_status = monitored;
+            state
+                .store
+                .update("finished", |record| record.monitor_status = monitored)
+                .await;
+            state
+                .scheduler
+                .room_check()
+                .apply_finished(&expected, &outcome)
+                .await;
+            let current = state.store.get("finished").await.unwrap();
+            assert_eq!(current.monitor_status, monitored);
+            assert_eq!(current.check_state, "idle");
+            assert!(current.last_check_at.is_some());
+            assert_eq!(current.last_success_at.is_some(), outcome.is_ok());
+            assert!(!current.is_recording);
+            assert_eq!(current.last_duration, Some(42.0));
+            assert_eq!(current.recorded_seconds, 42.0);
+            assert!(current.recording_run.is_none());
+            match outcome {
+                Ok(info) => {
+                    assert_eq!(current.is_live, info.is_live);
+                    assert_eq!(current.live_title, info.is_live.then_some(info.title));
+                    assert!(current.check_error.is_none());
+                    if !info.is_live {
+                        assert!(current.recording_error.is_none());
+                    }
+                }
+                Err(error) => {
+                    assert!(
+                        current.is_live,
+                        "an unreadable room is not evidence of offline"
+                    );
+                    assert_eq!(current.check_error, Some(error));
+                    assert!(current.recording_error.is_some());
+                }
+            }
+            assert!(
+                state.engine.active_ids().await.is_empty(),
+                "status refresh never restarts recording"
+            );
+            assert_eq!(
+                state.config.read().await.get_i64("loop_time_seconds", 0),
+                4500
+            );
+            crate::api::shutdown(&state).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn finished_recording_refresh_cannot_overwrite_replacement_edits_or_cancellation() {
+        for mutation in ["replacement", "url", "quality", "stopped", "cancelled"] {
+            let (_dir, state, expected) = finished_recording_fixture().await;
+            state
+                .store
+                .update("finished", |record| match mutation {
+                    "replacement" => {
+                        record.recording_run = Some(uuid::Uuid::new_v4());
+                        record.is_recording = true;
+                    }
+                    "url" => record.url = "http://127.0.0.1:1/replacement.ts".into(),
+                    "quality" => record.quality = Some("HD".into()),
+                    "stopped" => record.recording_run = None,
+                    _ => {}
+                })
+                .await;
+            if mutation == "cancelled" {
+                state.scheduler.stopping.cancel();
+            }
+            let before = state.store.get("finished").await.unwrap();
+            let mut events = state.store.subscribe();
+            state
+                .scheduler
+                .room_check()
+                .apply_finished(&expected, &Ok(crate::resolver::StreamInfo::default()))
+                .await;
+            assert_eq!(state.store.get("finished").await.unwrap(), before);
+            assert!(events.try_recv().is_err());
+            crate::api::shutdown(&state).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn finished_recording_refresh_reuses_the_resolver_without_waiting_for_the_interval() {
+        let (_dir, state, expected) = finished_recording_fixture().await;
+        state
+            .scheduler
+            .room_check()
+            .refresh_finished("finished", expected.recording_run.unwrap())
+            .await;
+        let current = state.store.get("finished").await.unwrap();
+        assert!(
+            current.is_live,
+            "a readable direct source stays live without starting a recorder"
+        );
+        assert!(!current.is_recording && current.recording_run.is_none());
+        assert!(current.live_title.is_none() && current.check_error.is_none());
+        assert!(state.engine.active_ids().await.is_empty());
+        crate::api::shutdown(&state).await.unwrap();
+    }
+
     #[tokio::test]
     async fn confirmed_offline_updates_name_and_clears_only_recording_state() {
         for manual in [false, true] {
@@ -1171,7 +1704,7 @@ mod tests {
             );
             let result = scheduler
                 .accept_resolved(
-                    "offline".into(),
+                    &store.get("offline").await.unwrap(),
                     &crate::resolver::StreamInfo {
                         anchor_name: "已下播主播".into(),
                         is_live: false,
@@ -1192,6 +1725,49 @@ mod tests {
             resolver.shutdown().await;
             scheduler.finish_background().await;
         }
+    }
+
+    #[tokio::test]
+    async fn delayed_resolved_source_cannot_apply_after_an_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::from_repo_root(dir.path());
+        workspace.ensure_ready().unwrap();
+        let store = Store::new(workspace.clone());
+        let expected = Recording::new(
+            "edited".into(),
+            "https://media.invalid/old.flv".into(),
+            "Original".into(),
+        );
+        store.insert(vec![expected.clone()]).await.unwrap();
+        let resolver = Resolver::new();
+        let scheduler = Scheduler::new(
+            store.clone(),
+            Engine::new(),
+            Arc::new(RwLock::new(ConfigStore::load(workspace).unwrap())),
+            resolver.clone(),
+            None,
+            Arc::new(AtomicBool::new(true)),
+        );
+        let lifecycle = store.lifecycle_guard().await;
+        let info = crate::resolver::StreamInfo {
+            anchor_name: "Stale source".into(),
+            is_live: false,
+            ..Default::default()
+        };
+        let mut pending = Box::pin(scheduler.accept_resolved(&expected, &info, false));
+        assert!(futures::poll!(pending.as_mut()).is_pending());
+        store
+            .edit_many_locked(&lifecycle, &["edited".into()], |record| {
+                record.url = "https://media.invalid/new.flv".into()
+            })
+            .await
+            .unwrap();
+        let current = store.get("edited").await.unwrap();
+        drop(lifecycle);
+        assert!(pending.await.unwrap_err().contains("旧检测结果已丢弃"));
+        assert_eq!(store.get("edited").await.unwrap(), current);
+        resolver.shutdown().await;
+        scheduler.finish_background().await;
     }
 
     #[test]

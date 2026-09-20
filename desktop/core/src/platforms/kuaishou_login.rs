@@ -449,6 +449,65 @@ fn js_string(text: &str) -> Option<String> {
     }
     None
 }
+/// The site's state serializer includes the JS value `undefined` in objects.
+/// Decode only JSON plus that value; never execute page code or alter string contents.
+fn state_json(text: &str) -> Option<Value> {
+    if let Some(value) = first_json_value(text) {
+        return Some(value);
+    }
+    let text = text.trim_start();
+    if text.len() > super::http::MAX_RESPONSE || !text.starts_with(['{', '[']) {
+        return None;
+    }
+    let mut output = String::with_capacity(text.len());
+    let (mut index, mut depth, mut quoted, mut escaped) = (0, 0_i32, false, false);
+    let mut previous = None;
+    while index < text.len() {
+        let ch = text[index..].chars().next()?;
+        if quoted {
+            output.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                quoted = false;
+                previous = Some('"');
+            }
+            index += ch.len_utf8();
+            continue;
+        }
+        if matches!(previous, Some(':' | '[' | ','))
+            && text[index..].starts_with("undefined")
+            && text[index + 9..]
+                .chars()
+                .next()
+                .is_some_and(|next| next.is_whitespace() || matches!(next, ',' | ']' | '}'))
+        {
+            output.push_str("null");
+            previous = Some('v');
+            index += 9;
+            continue;
+        }
+        output.push(ch);
+        match ch {
+            '"' => quoted = true,
+            '{' | '[' => depth += 1,
+            '}' | ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return first_json_value(&output);
+                }
+            }
+            _ => {}
+        }
+        if !ch.is_whitespace() {
+            previous = Some(ch);
+        }
+        index += ch.len_utf8();
+    }
+    None
+}
 fn assigned_json(text: &str) -> Option<Value> {
     let text = text.trim_start();
     let parse_tail = text
@@ -459,7 +518,7 @@ fn assigned_json(text: &str) -> Option<Value> {
         let encoded = js_string(tail)?;
         return first_json_value(&encoded);
     }
-    first_json_value(text)
+    state_json(text)
 }
 fn first_text_value(text: &str) -> Option<Value> {
     first_json_value(text).or_else(|| js_string(text).map(Value::String))
