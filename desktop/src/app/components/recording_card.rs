@@ -25,7 +25,7 @@ pub fn RecordingCard(
 ) -> impl IntoView {
     let state = gateway::app_state();
     let initial = StoredValue::new(recording);
-    let record = Signal::derive(move || {
+    let record = Memo::new(move |_| {
         state
             .recordings
             .with(|list| {
@@ -113,8 +113,8 @@ pub fn RecordingCard(
             </div>
             <div class="card-main">
                 <button class="card-name" title=t("查看录制信息") on:click=move |_| on_info.run(record.get_untracked())>{move || record.get().name()}</button>
-                <p class="card-subtitle" title=move || record.get().live_title.unwrap_or_default()>{move || record.get().live_title.filter(|s| !s.is_empty()).unwrap_or_else(|| if record.get().is_live { t("直播中").into() } else { t("等待开播").into() })}</p>
-                <Show when=move || record.get().check_error.is_some()>
+                <p class="card-subtitle" title=move || record.get().live_title.unwrap_or_default()>{move || crate::app::labels::recording_subtitle(&record.get())}</p>
+                <Show when=move || record.get().check_error.is_some() && record.get().check_state != "rechecking">
                     <div class="card-check-error" role="status" title=move || record.get().check_error.unwrap_or_default()>
                         <span><Icon name="alert" size=14 />{move || if record.get().verification_required { t("请在快手窗口完成验证").to_string() } else { crate::tr_format!("检测失败：{}",record.get().check_error.unwrap_or_default()) }}</span>
                         <Show when=move || record.get().verification_required || matches!(record.get().access_state.as_str(), "pageCheck" | "unavailable" | "loginPrompt")>

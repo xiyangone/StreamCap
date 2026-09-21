@@ -1,6 +1,6 @@
 use crate::app::i18n::t;
 use crate::{
-    api::gateway::{self, Recording},
+    api::gateway::{self, Recording, TaskPhase},
     app::{
         components::{
             AddRecordingDialog, CardInfoDialog, EditRecordingDialog, EmptyState, Icon,
@@ -27,14 +27,25 @@ pub fn HomeView() -> impl IntoView {
         state.recordings.with(|items| {
             items
                 .iter()
-                .filter(|r| r.monitor_status && !r.is_recording)
+                .filter(|r| r.task_phase() == TaskPhase::Waiting)
+                .count()
+        })
+    };
+    let live_idle = move || {
+        state.recordings.with(|items| {
+            items
+                .iter()
+                .filter(|r| r.task_phase() == TaskPhase::LiveIdle)
                 .count()
         })
     };
     let attention = move || {
-        state
-            .recordings
-            .with(|items| items.iter().filter(|r| r.needs_attention()).count())
+        state.recordings.with(|items| {
+            items
+                .iter()
+                .filter(|r| r.task_phase() == TaskPhase::Attention)
+                .count()
+        })
     };
     let recent = move || {
         let mut items = state.recordings.get();
@@ -66,14 +77,14 @@ pub fn HomeView() -> impl IntoView {
             <div class="stats-strip glass">
                 <div class="stat-item"><span class="stat-icon blue"><Icon name="video" /></span><div><span class="stat-label">{t("全部直播间")}</span><strong>{move || state.recordings.get().len()}</strong></div></div>
                 <div class="stat-item"><span class="stat-icon green"><Icon name="signal" /></span><div><span class="stat-label">{t("正在录制")}</span><strong>{active}<small>{t("路")}</small></strong></div></div>
-                <div class="stat-item"><span class="stat-icon cyan"><Icon name="eye" /></span><div><span class="stat-label">{t("监控中")}</span><strong>{waiting}</strong></div></div>
+                <div class="stat-item"><span class="stat-icon cyan"><Icon name="eye" /></span><div><span class="stat-label">{t("等待开播")}</span><strong>{waiting}</strong></div></div>
                 <div class="stat-item"><span class="stat-icon attention"><Icon name="alert" /></span><div><span class="stat-label">{t("需关注")}</span><strong>{attention}</strong></div></div>
             </div>
             <div class="overview-grid workbench-overview">
                 <section class="capture-panel glass">
                     <div class="capture-copy"><span class="live-label"><i class="status-dot" />{t("自动录制")}</span>
-                        <h2>{move || if active() > 0 { crate::tr_format!("{} 路直播，正在记录", active()) } else if waiting() > 0 { t("正在等待直播开播").into() } else { t("添加直播间，开始自动录制").into() }}</h2>
-                        <p>{move || if attention() > 0 { t("有需要处理的任务，请查看下方提示。") } else if waiting() > 0 || active() > 0 { t("监控已开启，无需逐个点击录制。") } else { t("新增直播间会自动开启监控。") }}</p>
+                        <h2>{move || if active() > 0 { crate::tr_format!("{} 路直播，正在记录", active()) } else if live_idle() > 0 { t("直播已开播，当前未录制").into() } else if attention() > 0 { t("有任务需要确认状态").into() } else if waiting() > 0 { t("正在等待直播开播").into() } else { t("添加直播间，开始自动录制").into() }}</h2>
+                        <p>{move || if attention() > 0 { t("有需要处理的任务，请查看下方提示。") } else if live_idle() > 0 { t("请查看任务的录制与通知设置。") } else if waiting() > 0 || active() > 0 { t("监控已开启，无需逐个点击录制。") } else { t("新增直播间会自动开启监控。") }}</p>
                         <div class="workbench-actions"><a class="button secondary small" href="/recordings">{t("管理直播间")}<Icon name="arrow" size=15 /></a><a class="text-link" href="/storage">{t("打开媒体库")}<Icon name="folder" size=15 /></a></div>
                         <div class="workbench-service" role="status"><span class:healthy=move || state.status.get().ok><i class="status-dot" />{move || if state.status.get().ok { t("本地服务已连接") } else {t("本地服务未连接")}}</span><span class:unhealthy=move || !state.status.get().resolver_ready>{move || if state.status.get().resolver_ready {t("解析已就绪")} else {t("解析暂不可用")}}</span></div>
                     </div>

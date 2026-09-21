@@ -85,7 +85,7 @@ export async function streamPreviewFixture(res, prepareBytes, state, preview) {
   state.activePreviews++;
   state.maxActivePreviews = Math.max(state.maxActivePreviews, state.activePreviews);
   state.previewStarts.push(preview);
-  res.writeHead(200, { 'Content-Type': 'video/mp2t' });
+  res.writeHead(200, { 'Content-Type': 'video/mp2t', 'X-StreamCap-Offset': String(preview.start ?? 0), 'X-StreamCap-Preview-Mode': 'transcode' });
   for (let offset = 0; offset < bytes.length && !closed; offset += 4096) {
     res.write(bytes.subarray(offset, offset + 4096));
     await delay(60);

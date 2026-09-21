@@ -2,6 +2,7 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { createReadStream } from 'node:fs';
+import { Readable } from 'node:stream';
 import { mkdir, mkdtemp, readFile, stat, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -20,6 +21,8 @@ const run = promisify(execFile);
 const mp4 = join(output, 'sample.mp4'), ts = join(output, 'sample.ts');
 await run(ffmpeg, ['-v','error','-nostdin','-f','lavfi','-i','testsrc2=size=320x180:rate=15','-t','18','-an','-c:v','libx264','-preset','ultrafast','-g','15','-pix_fmt','yuv420p','-movflags','+faststart',mp4], { windowsHide: true });
 await run(ffmpeg, ['-v','error','-nostdin','-i',mp4,'-c','copy','-f','mpegts',ts], { windowsHide: true });
+const nativeBackend = process.env.STREAMCAP_TEST_BACKEND;
+if (nativeBackend) { const url=new URL(nativeBackend); assert.equal(url.hostname,'127.0.0.1'); assert.notEqual(url.port,'6059'); }
 const result = { passed: false, cases: [], output, segments: 0, maxActiveSegments: 0, errors: [] };
 let active = 0, growing = false;
 const children = new Set();
@@ -33,6 +36,17 @@ const server = createServer(async (req, res) => {
     }
     const assets = { '/styles.css': ['styles.css','text/css'], '/media-player.js': ['assets/media-player.js','application/javascript'], '/mpegts.js': ['node_modules/mpegts.js/dist/mpegts.js','application/javascript'] };
     if (assets[url.pathname]) { const [file, mime] = assets[url.pathname]; res.setHeader('Content-Type',mime); res.end(await readFile(join(desktop,file))); return; }
+    if (nativeBackend && ['/api/media/info','/api/media/transcode'].includes(url.pathname) && url.searchParams.get('path')==='native-copy.ts') {
+      const abort=new AbortController();res.once('close',()=>abort.abort());
+      try {
+        const response=await fetch(nativeBackend+url.pathname+url.search,{signal:abort.signal});
+        if(res.destroyed){await response.body.cancel();return;}
+        const headers={'Content-Type':response.headers.get('content-type')};
+        for(const key of ['x-streamcap-offset','x-streamcap-preview-mode']){const value=response.headers.get(key);if(value!=null)headers[key]=value;}
+        res.writeHead(response.status,headers);const stream=Readable.fromWeb(response.body);stream.on('error',()=>res.destroy());stream.pipe(res);
+      } catch(error) { if(!abort.signal.aborted)throw error; }
+      return;
+    }
     if (url.pathname === '/api/media/info') { json(res, { format: url.searchParams.get('path').split('.').at(-1), durationSeconds:18, isRecording:growing, seekable:true, size:(await stat(ts)).size }); return; }
     if (url.pathname === '/api/media/transcode') {
       const start = Number(url.searchParams.get('start') || 0); assert.ok(Number.isFinite(start) && start >= 0 && start < 18);
@@ -101,6 +115,28 @@ try {
     assert.ok(result.segments-before<=4,'rapid scrubs must keep only a bounded number of segment restarts');
     await page.getByRole('button',{name:'回到最新',exact:true}).click();await at(15);
     await page.evaluate(()=>window.endPreview());growing=false;
+  });
+  if(nativeBackend) await step('Rust stream-copy preserves resolution, timestamps and real decoded frame on forward/backward seeks',async()=>{
+    await page.evaluate(()=>window.beginPreview('native-copy.ts'));
+    await page.waitForFunction(()=>{const v=document.querySelector('video');return v.readyState>=2&&!v.seeking&&v.currentTime>.1;});
+    await page.getByRole('button',{name:'暂停',exact:true}).click();
+    assert.equal(await page.locator('video').getAttribute('data-preview-mode'),'copy');
+    assert.deepEqual(await page.locator('video').evaluate(v=>[v.videoWidth,v.videoHeight]),[640,360]);
+    const frame=()=>page.locator('video').evaluate(v=>{const c=document.createElement('canvas');c.width=c.height=1;const x=c.getContext('2d');x.drawImage(v,0,0,1,1);return [...x.getImageData(0,0,1,1).data].slice(0,3);});
+    for(const [target,channel] of [[156.6,2],[3.6,0],[146.4,2],[1.2,0]]) {
+      const slider=page.getByRole('slider',{name:'播放进度',exact:true}),box=await slider.boundingBox(),duration=Number(await page.locator('video').getAttribute('data-timeline-duration'));
+      const loads=Number(await page.locator('video').getAttribute('data-segment-loads'));
+      const started=performance.now();await page.mouse.click(box.x+6+(box.width-12)*target/duration,box.y+box.height/2);await at(target);
+      await page.waitForFunction(()=>!document.querySelector('.media-preview').classList.contains('is-seeking'));
+      const milliseconds=Math.round(performance.now()-started),pixel=await frame();
+      if(!(pixel[channel]>190&&pixel[channel===0?2:0]<50)) console.log('SEEK_DIAGNOSTIC '+JSON.stringify(await page.locator('video').evaluate(v=>({data:{...v.dataset},time:v.currentTime,ready:v.readyState,src:v.currentSrc,buffered:Array.from({length:v.buffered.length},(_,i)=>[v.buffered.start(i),v.buffered.end(i)]),message:document.querySelector('.media-preview').dataset.message}))));
+      assert.ok(pixel[channel]>190&&pixel[channel===0?2:0]<50,`wrong decoded frame at ${target}: ${pixel}`);
+      assert.ok(milliseconds<1800,`seek must decode promptly, not just move the slider: ${milliseconds}ms`);
+      assert.ok(Number(await page.locator('video').getAttribute('data-segment-loads'))>loads,'must test an unbuffered backend seek, not just an already-loaded segment');
+      assert.equal(await page.locator('video').getAttribute('data-preview-mode'),'copy');
+      result.cases.push({name:'native copied seek',target,milliseconds,pixel});
+    }
+    await page.evaluate(()=>window.endPreview());
   });
   await step('keyboard seeking, narrow controls and repeated cleanup',async()=>{
     await page.evaluate(()=>window.beginPreview('sample.mp4'));

@@ -1123,10 +1123,19 @@ async fn preview_first_pixel(
         )
         .await
         .unwrap();
+    let offset = response
+        .headers()
+        .get("x-streamcap-offset")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .parse::<f64>()
+        .unwrap();
+    let local_start = (start - offset).max(0.0);
     let mut stream = response.into_body().into_data_stream();
     let mut prefix = Vec::new();
     tokio::time::timeout(Duration::from_secs(8), async {
-        while prefix.len() < 12 * 1024 {
+        while prefix.len() < 160 * 1024 {
             match stream.next().await {
                 Some(Ok(bytes)) => prefix.extend_from_slice(&bytes),
                 Some(Err(error)) => panic!("{error}"),
@@ -1149,6 +1158,8 @@ async fn preview_first_pixel(
             "mpegts",
             "-i",
             "pipe:0",
+            "-ss",
+            &format!("{local_start:.6}"),
             "-frames:v",
             "1",
             "-pix_fmt",
@@ -1306,5 +1317,95 @@ async fn media_preview_buffers_ahead_and_keeps_source_unchanged() {
         original
     );
     state.preview.shutdown().await;
+    assert_eq!(state.preview.active(), 0);
+}
+
+#[tokio::test]
+#[ignore = "requires FFmpeg and project Playwright; real Rust copy-preview decoded in browser, isolated media only"]
+async fn media_browser_copy_preview_has_correct_frames_and_bounded_seek_latency() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = state(temp.path(), false).await;
+    let root = temp.path().join("downloads");
+    let file = root.join("native-copy.ts");
+    let generated = command(&ffmpeg())
+        .args([
+            "-v",
+            "error",
+            "-nostdin",
+            "-n",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=red:size=640x360:rate=25:d=90",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=blue:size=640x360:rate=25:d=90",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000",
+            "-filter_complex",
+            "[0:v][1:v]concat=n=2:v=1:a=0[v]",
+            "-map",
+            "[v]",
+            "-map",
+            "2:a",
+            "-t",
+            "180",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-bf",
+            "2",
+            "-g",
+            "25",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-f",
+            "mpegts",
+        ])
+        .arg(&file)
+        .output()
+        .await
+        .unwrap();
+    assert!(generated.status.success());
+    let before =
+        streamcap_core::storage::source_identity(&std::fs::File::open(&file).unwrap()).unwrap();
+    let server = Server::start(
+        state.clone(),
+        ServerOptions {
+            port: 0,
+            monitoring: false,
+        },
+    )
+    .await
+    .unwrap();
+    let desktop = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let result = command(Path::new("node"))
+        .arg("tests/player-regression.mjs")
+        .current_dir(desktop)
+        .env(
+            "STREAMCAP_TEST_BACKEND",
+            format!("http://{}", server.address()),
+        )
+        .env("STREAMCAP_TEST_FFMPEG", ffmpeg())
+        .output()
+        .await
+        .unwrap();
+    println!("{}", String::from_utf8_lossy(&result.stdout));
+    server.shutdown().await.unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        streamcap_core::storage::source_identity(&std::fs::File::open(&file).unwrap()).unwrap(),
+        before
+    );
     assert_eq!(state.preview.active(), 0);
 }

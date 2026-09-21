@@ -267,6 +267,31 @@ fn douyin_pace_room_store_preserves_anchor_and_explicit_offline() {
     assert!(!info.is_live);
     assert_eq!(info.anchor_name, "Fixture");
 }
+
+#[tokio::test]
+#[ignore = "requires explicit STREAMCAP_PROBE_ROOM_URL; one read-only page request, no task changes"]
+async fn selected_douyin_page_readonly_probe() {
+    use streamcap_core::platforms::http::PlatformHttp;
+    let url = std::env::var("STREAMCAP_PROBE_ROOM_URL").expect("explicit selected room");
+    let url = reqwest::Url::parse(&url).unwrap();
+    assert_eq!(url.host_str(), Some("live.douyin.com"));
+    let http =
+        PlatformHttp::new("douyin.com", None, None, std::time::Duration::from_secs(18)).unwrap();
+    let page = http.get(url, "https://live.douyin.com/").await.unwrap();
+    let result = douyin::parse_page(&page, None);
+    println!(
+        "SELECTED_PAGE {}",
+        match &result {
+            Ok(info) =>
+                json!({"readable":true,"isLive":info.is_live,"anchorPresent":!info.anchor_name.is_empty()}),
+            Err(error) => json!({"readable":false,"error":error,"bytes":page.len()}),
+        }
+    );
+    assert!(
+        result.is_ok(),
+        "selected page must yield verified room state"
+    );
+}
 #[test]
 fn douyin_pace_web_stream_url_uses_requested_quality() {
     let store = json!({"roomInfo":{"room":{"id_str":"fixture-room","status":2},"anchor":{"nickname":"Fixture","avatar_thumb":{}},"web_stream_url":{"flv_pull_url":{"FULL_HD1":"https://media.invalid/high.flv","SD1":"https://media.invalid/low.flv"}}}});

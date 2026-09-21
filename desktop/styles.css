@@ -174,6 +174,7 @@ h3 { font-size: 14px; font-weight: 600; }
 .recording-card.selected { border-color: var(--accent); box-shadow: 0 0 0 1px rgba(var(--accent-rgb),.22); }
 .card-head, .card-head-right, .card-platform { display: flex; align-items: center; }
 .card-head { justify-content: space-between; gap: 9px; }
+.card-head-right .badge { flex-shrink: 0; white-space: nowrap; }
 .card-head-right { gap: 9px; }
 .card-platform { gap: 7px; color: var(--muted); font-size: 10px; }
 .platform-mark { display: grid; place-items: center; width: 24px; height: 24px; border-radius: 7px; background: var(--surface-hover); color: var(--text); font-size: 10px; font-weight: 700; }

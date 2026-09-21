@@ -100,6 +100,8 @@ pub fn router(state: ApiState) -> Router {
                     header::CONTENT_LENGTH,
                     header::CONTENT_RANGE,
                     header::ACCEPT_RANGES,
+                    header::HeaderName::from_static("x-streamcap-offset"),
+                    header::HeaderName::from_static("x-streamcap-preview-mode"),
                 ]),
         )
         .layer(axum::middleware::from_fn_with_state(

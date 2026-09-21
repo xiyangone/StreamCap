@@ -189,22 +189,50 @@ pub fn parse_recordings(raw: &str) -> Result<Vec<NewRecording>, String> {
 
 /// Keep failures and active captures visible in both dashboard and task sorting.
 pub fn recording_priority(record: &crate::api::gateway::Recording) -> u8 {
-    if record.needs_attention() {
-        0
-    } else if record.is_recording {
-        1
-    } else if record.is_live && record.monitor_status {
-        2
-    } else if record.monitor_status {
-        3
-    } else {
-        4
+    use crate::api::gateway::TaskPhase;
+    match record.task_phase() {
+        TaskPhase::Attention => 0,
+        TaskPhase::Recording => 1,
+        TaskPhase::LiveIdle => 2,
+        TaskPhase::Waiting => 3,
+        TaskPhase::Paused => 4,
     }
+}
+
+pub fn recording_subtitle(record: &crate::api::gateway::Recording) -> String {
+    if !record.is_recording && record.check_state == "rechecking" {
+        return t("录制已结束，正在确认直播状态").into();
+    }
+    if !record.is_recording && record.check_error.as_ref().is_some_and(|s| !s.is_empty()) {
+        return t(if record.recorded_seconds > 0.0 {
+            "录制已结束，直播状态待确认"
+        } else {
+            "直播状态待确认"
+        })
+        .into();
+    }
+    record
+        .live_title
+        .as_ref()
+        .filter(|s| !s.is_empty())
+        .cloned()
+        .unwrap_or_else(|| {
+            t(if record.is_recording {
+                "正在录制"
+            } else if record.is_live {
+                "直播未录制"
+            } else {
+                "等待开播"
+            })
+            .into()
+        })
 }
 
 pub fn monitoring_label(record: &crate::api::gateway::Recording) -> &'static str {
     if !record.monitor_status {
         t("监控已暂停")
+    } else if record.check_state == "rechecking" {
+        t("正在复核，监控保持开启")
     } else if record.check_state == "checking" {
         t("检测中")
     } else if record.verification_required {
@@ -239,6 +267,27 @@ pub fn monitoring_label(record: &crate::api::gateway::Recording) -> &'static str
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn an_ended_recording_never_displays_a_stale_live_title_as_current() {
+        use crate::api::gateway::Recording;
+        let mut r = Recording {
+            is_live: true,
+            live_title: Some("旧直播标题".into()),
+            recorded_seconds: 100.0,
+            check_state: "rechecking".into(),
+            monitor_status: true,
+            ..Default::default()
+        };
+        assert_eq!(recording_subtitle(&r), "录制已结束，正在确认直播状态");
+        assert_eq!(monitoring_label(&r), "正在复核，监控保持开启");
+        r.check_state = "idle".into();
+        r.check_error = Some("empty".into());
+        assert_eq!(recording_subtitle(&r), "录制已结束，直播状态待确认");
+        r.check_error = None;
+        r.is_live = false;
+        r.live_title = None;
+        assert_eq!(recording_subtitle(&r), "等待开播");
+    }
     #[test]
     fn monitoring_labels_and_attention_order_are_explicit() {
         use crate::api::gateway::Recording;

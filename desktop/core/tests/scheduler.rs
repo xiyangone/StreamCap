@@ -3,6 +3,76 @@ use std::{sync::Arc, time::Duration};
 use streamcap_core::{api::bootstrap, Recording, Scheduler, Workspace};
 
 #[tokio::test]
+async fn recording_progress_is_published_each_second_without_waiting_for_disk_sampling() {
+    use axum::{body::Body, routing::get, Router};
+    let app = Router::new().route(
+        "/fixture.flv",
+        get(|| async {
+            let bytes = futures::stream::unfold(0usize, |index| async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let chunk = if index == 0 {
+                    b"FLV\x01\x05\x00\x00\x00\x09".to_vec()
+                } else {
+                    vec![0; 256]
+                };
+                Some((Ok::<_, std::io::Error>(chunk), index + 1))
+            });
+            ([("content-type", "video/x-flv")], Body::from_stream(bytes))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/fixture.flv", listener.local_addr().unwrap());
+    let source = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let dir = tempfile::tempdir().unwrap();
+    let state = bootstrap(Workspace::from_repo_root(dir.path()))
+        .await
+        .unwrap();
+    state.config.write().await.update_user_config(json!({"live_save_path":dir.path().join("downloads"),"convert_to_mp4":false,"generate_time_subtitle_file":false}).as_object().unwrap().clone()).unwrap();
+    let mut r = Recording::new("progress".into(), url.clone(), "Fixture".into());
+    r.record_format = Some("FLV".into());
+    r.segment_record = Some(false);
+    r.flv_use_direct_download = Some(true);
+    state.store.insert(vec![r]).await.unwrap();
+    let mut events = state.store.subscribe();
+    state
+        .scheduler
+        .start_recording(
+            "progress".into(),
+            &streamcap_core::resolver::StreamInfo {
+                is_live: true,
+                record_url: url,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let started = tokio::time::Instant::now();
+    let mut updates = Vec::new();
+    while updates.len() < 4 {
+        let event = tokio::time::timeout(Duration::from_secs(3), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if event.topic == "update" && event.payload["isRecording"] == true {
+            updates.push(started.elapsed());
+        }
+    }
+    state.scheduler.stop_recording("progress").await;
+    streamcap_core::api::shutdown(&state).await.unwrap();
+    source.abort();
+    assert!(
+        updates[1] < Duration::from_millis(1800),
+        "first progress must not wait for the 2s scan: {updates:?}"
+    );
+    for pair in updates.windows(2) {
+        assert!(
+            pair[1] - pair[0] < Duration::from_millis(1800),
+            "one-second progress: {updates:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn browser_access_failures_are_runtime_only_and_preserve_last_verified_room() {
     use streamcap_core::platforms::kuaishou;
     let dir = tempfile::tempdir().unwrap();
