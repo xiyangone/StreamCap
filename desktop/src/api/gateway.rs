@@ -75,6 +75,19 @@ pub struct Recording {
 }
 
 impl Recording {
+    pub fn task_phase(&self) -> TaskPhase {
+        if self.is_recording {
+            TaskPhase::Recording
+        } else if self.needs_attention() || self.check_state == "rechecking" {
+            TaskPhase::Attention
+        } else if self.is_live {
+            TaskPhase::LiveIdle
+        } else if self.monitor_status {
+            TaskPhase::Waiting
+        } else {
+            TaskPhase::Paused
+        }
+    }
     pub fn needs_attention(&self) -> bool {
         !self.is_recording
             && (self.verification_required
@@ -100,6 +113,14 @@ impl Recording {
     pub fn status(&self) -> StatusKind {
         if self.is_recording {
             StatusKind::Recording
+        } else if self.check_state == "rechecking" {
+            StatusKind::Rechecking
+        } else if self
+            .recording_error
+            .as_ref()
+            .is_some_and(|error| !error.is_empty())
+        {
+            StatusKind::RecordingFailed
         } else if self.check_state == "checking" {
             StatusKind::Checking
         } else if self.verification_required {
@@ -122,12 +143,6 @@ impl Recording {
             StatusKind::Queued
         } else if self.is_live {
             StatusKind::Live
-        } else if self
-            .recording_error
-            .as_ref()
-            .is_some_and(|error| !error.is_empty())
-        {
-            StatusKind::RecordingFailed
         } else if self.check_state == "waiting" && self.monitor_status {
             StatusKind::Waiting
         } else if self.monitor_status {
@@ -136,6 +151,16 @@ impl Recording {
             StatusKind::Stopped
         }
     }
+}
+
+/// A task belongs to exactly one phase. Monitoring intent is not a recording phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskPhase {
+    Recording,
+    Attention,
+    LiveIdle,
+    Waiting,
+    Paused,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,6 +172,7 @@ pub enum StatusKind {
     Waiting,
     Queued,
     Checking,
+    Rechecking,
     RecordingFailed,
     Verification,
     CheckFailed,
@@ -165,12 +191,13 @@ impl StatusKind {
             Self::Waiting => crate::app::i18n::t("等待首检"),
             Self::Queued => crate::app::i18n::t("排队中"),
             Self::Checking => crate::app::i18n::t("检测中"),
+            Self::Rechecking => crate::app::i18n::t("录制结束，复核中"),
             Self::RecordingFailed => crate::app::i18n::t("录制异常"),
             Self::Verification => crate::app::i18n::t("待验证"),
             Self::CheckFailed => crate::app::i18n::t("检测异常"),
             Self::Recording => crate::app::i18n::t("录制中"),
-            Self::Live => crate::app::i18n::t("直播中"),
-            Self::Monitoring => crate::app::i18n::t("监控中"),
+            Self::Live => crate::app::i18n::t("直播未录制"),
+            Self::Monitoring => crate::app::i18n::t("等待开播"),
             Self::Stopped => crate::app::i18n::t("已暂停"),
         }
     }
@@ -184,9 +211,12 @@ impl StatusKind {
             | Self::LoginPrompt => "badge attention",
             Self::Recording => "badge recording",
             Self::Live => "badge live",
-            Self::Monitoring | Self::Waiting | Self::Queued | Self::Checking | Self::PageCheck => {
-                "badge monitoring"
-            }
+            Self::Monitoring
+            | Self::Waiting
+            | Self::Queued
+            | Self::Checking
+            | Self::Rechecking
+            | Self::PageCheck => "badge monitoring",
             Self::Stopped => "badge stopped",
         }
     }
@@ -195,6 +225,42 @@ impl StatusKind {
 #[cfg(test)]
 mod detection_status_tests {
     use super::*;
+    #[test]
+    fn recording_live_error_and_monitoring_phases_never_overlap() {
+        for live in [false, true] {
+            for monitor in [false, true] {
+                let mut record = Recording {
+                    is_live: live,
+                    monitor_status: monitor,
+                    is_recording: true,
+                    ..Default::default()
+                };
+                assert_eq!(record.task_phase(), TaskPhase::Recording);
+                assert_eq!(record.status(), StatusKind::Recording);
+                record.is_recording = false;
+                record.recording_error = Some("encoder failed".into());
+                assert_eq!(record.task_phase(), TaskPhase::Attention);
+                assert_eq!(record.status(), StatusKind::RecordingFailed);
+                record.recording_error = None;
+                assert_eq!(
+                    record.task_phase(),
+                    if live {
+                        TaskPhase::LiveIdle
+                    } else if monitor {
+                        TaskPhase::Waiting
+                    } else {
+                        TaskPhase::Paused
+                    }
+                );
+                record.check_error = Some("empty response".into());
+                assert_eq!(record.task_phase(), TaskPhase::Attention);
+                assert_eq!(record.status(), StatusKind::CheckFailed);
+                record.check_state = "rechecking".into();
+                assert_eq!(record.task_phase(), TaskPhase::Attention);
+                assert_eq!(record.status(), StatusKind::Rechecking);
+            }
+        }
+    }
     #[test]
     fn page_rate_limit_login_and_captcha_have_distinct_statuses() {
         for (access, expected) in [

@@ -482,7 +482,7 @@ try {
     await visible(card('fixture-5').getByRole('button', { name: '自动识别主播', exact: true }));
     h.failRecording('fixture-5', '播放地址返回 HTTP 404');
     await visible(card('fixture-5').locator('.card-recording-error'));
-    assert.equal(await card('fixture-5').locator('.badge').innerText(), '直播中');
+    assert.equal(await card('fixture-5').locator('.badge').innerText(), '录制异常');
     assert.match(await card('fixture-5').locator('.card-recording-error').innerText(), /录制失败：播放地址返回 HTTP 404/);
     assert.equal(await card('fixture-5').getByRole('button', { name: '单次录制', exact: true }).isEnabled(), true);
     for (const width of [1280, 800, 375]) {
@@ -508,10 +508,33 @@ try {
     await card('fixture-5').getByRole('button', { name: '停止录制', exact: true }).click();
     await visible(card('fixture-5').getByRole('button', { name: '单次录制', exact: true }));
     assert.equal(await card('fixture-5').locator('.card-recording-error').count(), 0);
-    assert.equal(await card('fixture-5').locator('.badge').innerText(), '直播中');
+    assert.equal(await card('fixture-5').locator('.badge').innerText(), '直播未录制');
     Object.assign(record('fixture-5'), original);
     h.emit('update', record('fixture-5'));
     await visible(card('fixture-5').getByRole('button', { name: original.streamerName, exact: true }));
+  });
+  await step('录制、直播未录制和下播复核各归一类，旧直播状态不重复计数', async () => {
+    const r=record('fixture-5'), original=structuredClone(r);
+    const filter=name=>page.getByRole('button',{name:new RegExp('^'+name)});
+    const all=()=>filter('全部').click();
+    Object.assign(r,{isLive:true,isRecording:true,monitorStatus:true,recordingError:null,checkError:null,verificationRequired:false,accessState:'',checkState:'idle'}); h.emit('update',r);
+    await filter('录制中').click();await visible(card(r.recId));
+    await filter('直播未录制').click();await hidden(card(r.recId));
+    Object.assign(r,{isRecording:false});h.emit('update',r);await visible(card(r.recId));
+    assert.equal(await card(r.recId).locator('.badge').innerText(),'直播未录制');
+    Object.assign(r,{checkState:'rechecking',recordedSeconds:2584.9});h.emit('update',r);await hidden(card(r.recId));
+    await all();await visible(card(r.recId).getByText('录制结束，复核中',{exact:true}));
+    assert.equal(await card(r.recId).locator('.card-check-error').count(),0);
+    Object.assign(r,{checkState:'idle',checkError:'平台返回空响应（未验证直播状态）'});h.emit('update',r);
+    await visible(card(r.recId).getByText('录制已结束，直播状态待确认',{exact:true}));
+    await filter('直播未录制').click();await hidden(card(r.recId));
+    Object.assign(r,{isLive:false,liveTitle:null,checkError:null});h.emit('update',r);
+    await filter('等待开播').click();await visible(card(r.recId));
+    assert.equal(await card(r.recId).locator('.badge').innerText(),'等待开播');
+    assert.equal(await card(r.recId).locator('.card-check-error').count(),0);
+    const counts=await page.locator('.filter-tab span').allTextContents();
+    assert.equal(counts.slice(1).reduce((a,n)=>a+Number(n),0),Number(counts[0]));
+    Object.assign(r,original);h.emit('update',r);await all();
   });
   await step('删除确认、取消与 SSE 删除后无信号生命周期错误', async () => {
     const before = requests('DELETE', '/api/recordings/fixture-7').length;

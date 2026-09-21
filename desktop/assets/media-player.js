@@ -134,6 +134,12 @@ export function attachMedia(video, apiOrigin, relativePath, onState, onCapture) 
   const settle = () => {
     if (disposed || video.readyState < 2 || video.seeking) return;
     if (changing) {
+      if (mode === 'timeline' && acceptedTarget != null && position() < acceptedTarget - 0.08) {
+        const target = acceptedTarget - offset;
+        if (!hasBuffered(acceptedTarget)) return;
+        video.currentTime = Math.max(0, target);
+        return;
+      }
       changing = false; clearLoadTimeout(); freeze.hidden = true;
       if (seekStarted) video.dataset.seekLatencyMs = String(performance.now() - seekStarted);
       video.dataset.framePosition = String(position());
@@ -162,10 +168,50 @@ export function attachMedia(video, apiOrigin, relativePath, onState, onCapture) 
     const mpegts = window.mpegts;
     if (!mpegts || !mpegts.isSupported()) throw Error(label('当前系统 WebView2 不支持媒体预览', 'This WebView2 runtime cannot preview this media'));
     mpegts.LoggingControl.enableAll = false;
+    // Read the backend's actual first-DTS offset before giving any bytes to MSE.
+    // Every disposed seek aborts its own response; stale completions cannot move the timeline.
+    class TimelineLoader extends mpegts.BaseLoader {
+      constructor() { super('streamcap-timeline'); this._needStash = true; this.controller = null; }
+      abort() { this.controller?.abort(); this.controller = null; this._status = mpegts.LoaderStatus.kIdle; }
+      destroy() { this.abort(); super.destroy(); }
+      open(source, range) {
+        this.abort(); const controller = this.controller = new AbortController();
+        this._status = mpegts.LoaderStatus.kConnecting;
+        (async () => {
+          let reader;
+          try {
+            const response = await fetch(source.url, { signal: controller.signal });
+            if (!response.ok) throw Error('Preview HTTP ' + response.status);
+            const header = response.headers.get('x-streamcap-offset');
+            if (!disposed && version === generation && header != null) {
+              const actual = Number(header);
+              if (!Number.isFinite(actual) || Math.abs(actual - acceptedTarget) > 15.5) throw Error('Invalid preview timeline offset');
+              offset = actual; video.dataset.seekOffset = String(offset);
+              video.dataset.previewMode = response.headers.get('x-streamcap-preview-mode') || 'transcode';
+            }
+            if (disposed || version !== generation || controller.signal.aborted) { await response.body.cancel(); return; }
+            this._status = mpegts.LoaderStatus.kBuffering;
+            reader = response.body.getReader(); let received = 0;
+            while (!controller.signal.aborted && !disposed && version === generation) {
+              const { done, value } = await reader.read();
+              if (done) { this._status = mpegts.LoaderStatus.kComplete; this._onComplete?.(range.from, range.from + received - 1); return; }
+              const start = received; received += value.byteLength;
+              this._onDataArrival?.(value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength), start, received);
+            }
+          } catch (error) {
+            if (!controller.signal.aborted && !disposed && version === generation) {
+              this._status = mpegts.LoaderStatus.kError;
+              this._onError?.(mpegts.LoaderErrors.EXCEPTION, { code: -1, msg: error.message });
+            }
+          } finally { if (controller.signal.aborted) await reader?.cancel().catch(() => {}); }
+        })();
+      }
+    }
     const next = mpegts.createPlayer({ type: 'mpegts', isLive: live, url }, {
       enableWorker: false, enableWorkerForMSE: false, enableStashBuffer: false,
       lazyLoad: false, accurateSeek: true, autoCleanupSourceBuffer: live,
       autoCleanupMaxBackwardDuration: 30, autoCleanupMinBackwardDuration: 15,
+      ...(live ? {} : { customLoader: TimelineLoader }),
     });
     next.on(mpegts.Events.ERROR, (type) => {
       if (!disposed && generation === version) {
@@ -198,7 +244,7 @@ export function attachMedia(video, apiOrigin, relativePath, onState, onCapture) 
   function flushSeek(force = false) {
     clearTimeout(seekTimer); seekTimer = null;
     if (disposed || pendingTarget == null || !(total > 0)) return;
-    if (changing && mode === 'timeline' && !force) return;
+    if (changing && acceptedTarget != null && Math.abs(pendingTarget - acceptedTarget) < 0.07) { pendingTarget = null; return; }
     const target = clamp(pendingTarget); pendingTarget = null; lastDispatch = performance.now();
     const bufferedTarget = mode === 'timeline' && hasBuffered(target);
     if (mode === 'native' || bufferedTarget) {
@@ -210,9 +256,10 @@ export function attachMedia(video, apiOrigin, relativePath, onState, onCapture) 
     render();
   }
   function scheduleFlush() {
-    if (seekTimer != null || disposed) return;
-    const interval = mode === 'native' || (pendingTarget != null && hasBuffered(pendingTarget)) ? 70 : 220;
-    seekTimer = setTimeout(() => flushSeek(), Math.max(0, interval - (performance.now() - lastDispatch)));
+    if (disposed) return;
+    clearTimeout(seekTimer);
+    const interval = mode === 'native' || (pendingTarget != null && hasBuffered(pendingTarget)) ? 40 : 120;
+    seekTimer = setTimeout(() => flushSeek(), scrubbing ? interval : Math.max(0, interval - (performance.now() - lastDispatch)));
   }
   const requestSeek = (target, force = false) => {
     if (!(total > 0) || mode === 'live') return;
@@ -318,7 +365,7 @@ export function attachMedia(video, apiOrigin, relativePath, onState, onCapture) 
   buildControls();
   listen(video, 'loadedmetadata', () => { video.playbackRate = Number(rate.value); render(); renderBuffer(); });
   listen(video, 'durationchange', () => { render(); renderBuffer(); });
-  listen(video, 'progress', renderBuffer);
+  listen(video, 'progress', () => { renderBuffer(); settle(); });
   listen(video, 'loadeddata', settle); listen(video, 'seeked', settle); listen(video, 'canplay', settle);
   listen(video, 'play', () => { if (!changing && !scrubbing) wantedPlay = true; startAnimation(); render(); });
   listen(video, 'pause', () => { if (!changing && !scrubbing && !video.ended) wantedPlay = false; render(); });
@@ -342,7 +389,7 @@ export function attachMedia(video, apiOrigin, relativePath, onState, onCapture) 
             try { const before = total; const ready = await refreshInfo(); if (ready && before === 0) loadAt(info.isRecording ? Math.max(0, total - 3) : 0); }
             catch (error) { if (!disposed && error.name !== 'AbortError') update('error', error.message); }
           }
-        }, 4000);
+        }, 1000);
       } else {
         if (info.isRecording && ['mp4', 'm4v'].includes(info.format)) throw Error(label('该 MP4 尚在录制，完成封装后可预览。', 'MP4 preview is available after recording finalizes.'));
         video.src = apiOrigin + '/api/videos?path=' + encodeURIComponent(relativePath); video.load(); playSafely();

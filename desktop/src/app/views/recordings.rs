@@ -1,6 +1,6 @@
 use crate::app::i18n::t;
 use crate::{
-    api::gateway::{self, Recording},
+    api::gateway::{self, Recording, TaskPhase},
     app::{
         components::{
             AddRecordingDialog, BatchEditDialog, CardInfoDialog, ConfirmDialog,
@@ -24,11 +24,46 @@ impl Filter {
     fn matches(self, rec: &Recording) -> bool {
         match self {
             Self::All => true,
-            Self::Recording => rec.is_recording,
-            Self::Live => rec.is_live,
-            Self::Monitoring => rec.monitor_status && !rec.is_recording,
-            Self::Paused => !rec.monitor_status,
-            Self::Attention => rec.needs_attention(),
+            Self::Recording => rec.task_phase() == TaskPhase::Recording,
+            Self::Live => rec.task_phase() == TaskPhase::LiveIdle,
+            Self::Monitoring => rec.task_phase() == TaskPhase::Waiting,
+            Self::Paused => rec.task_phase() == TaskPhase::Paused,
+            Self::Attention => rec.task_phase() == TaskPhase::Attention,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn each_task_matches_one_and_only_one_status_filter() {
+        for live in [false, true] {
+            for recording in [false, true] {
+                for monitor in [false, true] {
+                    for error in [false, true] {
+                        let r = Recording {
+                            is_live: live,
+                            is_recording: recording,
+                            monitor_status: monitor,
+                            check_error: error.then(|| "unreadable".into()),
+                            ..Default::default()
+                        };
+                        let filters = [
+                            Filter::Recording,
+                            Filter::Live,
+                            Filter::Monitoring,
+                            Filter::Paused,
+                            Filter::Attention,
+                        ];
+                        assert_eq!(
+                            filters.into_iter().filter(|f| f.matches(&r)).count(),
+                            1,
+                            "{r:?}"
+                        );
+                    }
+                }
+            }
         }
     }
 }
@@ -221,7 +256,7 @@ pub fn RecordingsView() -> impl IntoView {
             <header class="page-header"><div><h1>{t("录制任务")}<span class="heading-count">{move || state.recordings.get().len()}</span></h1><p>{t("新增直播间自动监控，开播后自动录制；单次录制用于手动操作。")}</p></div><div class="header-actions"><button class="button secondary" disabled=move || busy.get() on:click=refresh><Icon name="refresh" size=17 />{t("刷新列表")}</button><button class="button primary" on:click=move |_| add.set(true)><Icon name="plus" size=18 />{t("添加直播间")}</button></div></header>
             <section class="task-toolbar glass" aria-label=t("任务筛选")>
                 <div class="filter-tabs" role="group" aria-label=t("状态筛选")>
-                    {[(Filter::All,t("全部")),(Filter::Attention,t("需关注")),(Filter::Recording,t("录制中")),(Filter::Live,t("直播中")),(Filter::Monitoring,t("监控中")),(Filter::Paused,t("已暂停"))].into_iter().map(|(mode,label)| view! {
+                    {[(Filter::All,t("全部")),(Filter::Attention,t("需关注")),(Filter::Recording,t("录制中")),(Filter::Live,t("直播未录制")),(Filter::Monitoring,t("等待开播")),(Filter::Paused,t("已暂停"))].into_iter().map(|(mode,label)| view! {
                         <button class="filter-tab" class:active=move || filter.get() == mode aria-pressed=move || (filter.get() == mode).to_string() on:click=move |_| filter.set(mode)>{label}<span>{move || state.recordings.with(|items| items.iter().filter(|r| mode.matches(r)).count())}</span></button>
                     }).collect_view()}
                 </div>

@@ -662,5 +662,14 @@
   "任务操作": "Task actions",
   "操作正在进行，请稍候": "An operation is in progress. Please wait.",
   "请先完成快手验证": "Complete Kuaishou verification first",
-  "直播解析服务尚未就绪": "The stream resolver is not ready"
+  "直播解析服务尚未就绪": "The stream resolver is not ready",
+  "直播未录制": "Live, not recording",
+  "录制已结束，直播状态待确认": "Recording ended; live status unconfirmed",
+  "直播状态待确认": "Live status unconfirmed",
+  "录制结束，复核中": "Recording ended; checking",
+  "录制已结束，正在确认直播状态": "Recording ended; confirming live status",
+  "正在复核，监控保持开启": "Checking; monitoring remains enabled",
+  "直播已开播，当前未录制": "Live now, not recording",
+  "有任务需要确认状态": "Some tasks need a status check",
+  "请查看任务的录制与通知设置。": "Check the recording and notification settings for these tasks."
 }
