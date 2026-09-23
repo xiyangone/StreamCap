@@ -296,6 +296,99 @@ async fn settings_read_and_write_roundtrip() {
 }
 
 #[tokio::test]
+async fn settings_only_broadcast_changed_inherited_tasks_and_skip_noop_updates() {
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = Workspace::from_repo_root(directory.path());
+    seed_defaults(&workspace);
+    let state = bootstrap(workspace.clone()).await.unwrap();
+    let inherited = streamcap_core::Recording::new(
+        "inherited".into(),
+        "http://127.0.0.1:1/inherited".into(),
+        "Inherited".into(),
+    );
+    let mut explicit = streamcap_core::Recording::new(
+        "explicit".into(),
+        "http://127.0.0.1:1/explicit".into(),
+        "Explicit".into(),
+    );
+    explicit.record_format = Some("MKV".into());
+    explicit
+        .inherited_fields
+        .retain(|field| field != "record_format");
+    state.store.insert(vec![inherited, explicit]).await.unwrap();
+    {
+        let config = state.config.read().await;
+        streamcap_core::store::apply_global_defaults(&state.store, &config).await;
+    }
+    let stored = std::fs::read(workspace.recordings_path()).unwrap();
+    let mut events = state.store.subscribe();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = router(state.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    for (patch, changed, updated_ids) in [
+        (json!({"theme_mode":"dark"}), vec!["theme_mode"], vec![]),
+        (json!({"theme_mode":"dark"}), vec![], vec![]),
+        (
+            json!({"video_format":"MP4"}),
+            vec!["video_format"],
+            vec!["inherited"],
+        ),
+        (json!({"video_format":"MP4"}), vec![], vec![]),
+    ] {
+        let response: Value = client
+            .put(format!("{base}/api/settings"))
+            .json(&json!({"userConfig":patch}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(response["changed"], json!(changed));
+        let mut updated = Vec::new();
+        let mut settings_events = 0;
+        while let Ok(event) = events.try_recv() {
+            if event.topic == "update" {
+                updated.push(event.payload["recId"].as_str().unwrap().to_owned());
+            }
+            if event.topic == "settings" {
+                settings_events += 1;
+            }
+        }
+        assert_eq!(updated, updated_ids);
+        assert_eq!(settings_events, usize::from(!changed.is_empty()));
+    }
+    assert_eq!(
+        state
+            .store
+            .get("inherited")
+            .await
+            .unwrap()
+            .record_format
+            .as_deref(),
+        Some("MP4")
+    );
+    assert_eq!(
+        state
+            .store
+            .get("explicit")
+            .await
+            .unwrap()
+            .record_format
+            .as_deref(),
+        Some("MKV")
+    );
+    assert_eq!(std::fs::read(workspace.recordings_path()).unwrap(), stored);
+    streamcap_core::api::shutdown(&state).await.unwrap();
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
 async fn cookies_write_read_and_clear() {
     let (base, _guard) = start_backend().await;
     let client = reqwest::Client::new();

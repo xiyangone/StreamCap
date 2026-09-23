@@ -50,6 +50,7 @@ impl CheckOutcome {
 
 type LiveSourceCache =
     std::collections::HashMap<String, (String, std::time::Instant, crate::resolver::StreamInfo)>;
+const LIVE_SOURCE_TTL: Duration = Duration::from_secs(300);
 
 pub struct Scheduler {
     pacer: crate::pacing::Pacer,
@@ -145,14 +146,24 @@ impl FinishPlan {
             .await
             {
                 self.options.delete_original = false;
-                store.snack(format!("时间字幕未生成：{error}；本次源文件保留"));
+                store.snack_error(format!("时间字幕未生成：{error}；本次源文件保留"));
             }
         }
+        let room = if self.script.is_some() {
+            store
+                .get(&process.rec_id)
+                .await
+                .map(|record| record.streamer_name)
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         // Subtitles may probe many files. Only the short reservation/job handoff is locked.
         let filesystem = engine.filesystem_guard().await;
         drop(reservation);
+        let mut conversions = Vec::new();
         if self.convert {
-            if let Err(error) = postprocess
+            match postprocess
                 .enqueue_recording_locked(
                     &self.root,
                     &process.output_path,
@@ -161,25 +172,41 @@ impl FinishPlan {
                 )
                 .await
             {
-                store.snack(format!("自动转 MP4 未开始：{error}；原 TS 保留"));
+                Ok(batch) => {
+                    conversions = batch.jobs;
+                    if !batch.failures.is_empty() {
+                        store.snack_error(format!(
+                            "部分文件未转 MP4：{}；对应原 TS 保留",
+                            batch.failures.join("；")
+                        ));
+                    }
+                }
+                Err(error) => {
+                    store.snack_error(format!("自动转 MP4 未开始：{error}；原 TS 保留"));
+                }
             }
         }
-        drop(filesystem);
         if let Some(script) = self.script {
-            let room = store
-                .get(&process.rec_id)
-                .await
-                .map(|r| r.streamer_name)
-                .unwrap_or_default();
+            let mut paths = vec![process.output_path.clone()];
+            if self.convert {
+                paths.push(process.output_path.with_extension("mp4"));
+            }
+            if self.subtitles.is_some() {
+                paths.push(process.output_path.with_extension("srt"));
+            }
             automation.after_recording(
                 script,
-                self.root,
-                process.output_path.clone(),
-                room,
-                process.rec_id.clone(),
-                postprocess.clone(),
+                crate::automation::ScriptInput {
+                    root: self.root,
+                    pattern: process.output_path.clone(),
+                    room,
+                    conversions,
+                    processor: postprocess.clone(),
+                    reservation: engine.reserve_media(paths),
+                },
             );
         }
+        drop(filesystem);
     }
 }
 impl Scheduler {
@@ -526,7 +553,9 @@ impl Scheduler {
             .ok_or_else(|| format!("任务不存在: {rec_id}"))?;
         if let Some(rec) = self.store.get(&rec_id).await {
             if info.is_live {
-                self.live_sources.write().await.insert(
+                let mut sources = self.live_sources.write().await;
+                sources.retain(|_, (_, when, _)| when.elapsed() <= LIVE_SOURCE_TTL);
+                sources.insert(
                     rec_id.clone(),
                     (rec.url, std::time::Instant::now(), info.clone()),
                 );
@@ -596,7 +625,7 @@ impl Scheduler {
                     .await
                 {
                     self.store
-                        .snack(format!("{}：录制失败，{error}", record.streamer_name));
+                        .snack_error(format!("{}：录制失败，{error}", record.streamer_name));
                 }
             }
         }
@@ -611,15 +640,8 @@ impl Scheduler {
         if self.stopping.is_cancelled() || !self.recording_enabled.load(Ordering::SeqCst) {
             return Err("已暂停录制或正在退出".into());
         }
-        let ffmpeg = {
-            let config = self.config.read().await;
-            let bundled = config.workspace().user_data_dir.join("ffmpeg/ffmpeg.exe");
-            if bundled.is_file() {
-                Some(bundled)
-            } else {
-                self.ffmpeg.clone()
-            }
-        };
+        let ffmpeg =
+            crate::paths::configured_ffmpeg(self.store.workspace(), self.ffmpeg.as_deref());
 
         let Some(rec) = self.store.get(&rec_id).await else {
             return Err(format!("任务不存在: {rec_id}"));
@@ -904,7 +926,10 @@ impl Scheduler {
                             );
                         }
                         if let (Some(record), Some(error)) = (&updated, error) {
-                            store.snack(format!("{}：录制失败，{error}", record.streamer_name));
+                            store.snack_error(format!(
+                                "{}：录制失败，{error}",
+                                record.streamer_name
+                            ));
                         }
                         if updated.is_some() {
                             live_sources.write().await.remove(&process.rec_id);
@@ -1125,12 +1150,47 @@ impl Scheduler {
     fn begin_check(&self, rec_id: &str) -> Result<CheckLease, String> {
         self.room_check().begin_check(rec_id)
     }
+    /// Called only after task removal has committed; active recordings remain protected by Store.
+    pub async fn forget_recordings(&self, ids: &[String]) {
+        {
+            let checks = self.checks.lock().expect("active checks");
+            for id in ids {
+                if let Some(cancel) = checks.get(id) {
+                    cancel.cancel();
+                }
+            }
+        }
+        self.monitor_requests
+            .lock()
+            .expect("monitor requests")
+            .retain(|id| !ids.contains(id));
+        self.schedule_edges
+            .lock()
+            .expect("schedule edges")
+            .retain(|id, _| !ids.contains(id));
+        self.live_sources
+            .write()
+            .await
+            .retain(|id, _| !ids.contains(id));
+        self.monitor_changed.notify_one();
+    }
+
     /// Preview reuses a fresh verified source and never performs a background room request.
     pub async fn preview_input(&self, rec_id: &str) -> Result<crate::preview::LiveInput, String> {
         let record = self.store.get(rec_id).await.ok_or("任务不存在")?;
-        let cache = self.live_sources.read().await;
-        let (url, when, info) = cache.get(rec_id).ok_or("请先检测直播状态，再预览直播源")?;
-        if &record.url != url || !record.is_live || when.elapsed() > Duration::from_secs(300) {
+        let (url, when, info) = {
+            let mut cache = self.live_sources.write().await;
+            let expired = cache
+                .get(rec_id)
+                .is_some_and(|(_, when, _)| when.elapsed() > LIVE_SOURCE_TTL);
+            cache.retain(|_, (_, when, _)| when.elapsed() <= LIVE_SOURCE_TTL);
+            cache.get(rec_id).cloned().ok_or(if expired {
+                "直播源已过期，请先手动检测状态"
+            } else {
+                "请先检测直播状态，再预览直播源"
+            })?
+        };
+        if record.url != url || !record.is_live || when.elapsed() > LIVE_SOURCE_TTL {
             return Err("直播源已过期，请先手动检测状态".into());
         }
         let config = self.config.read().await;
@@ -1167,7 +1227,7 @@ impl Scheduler {
             0,
         ) {
             self.recording_enabled.store(false, Ordering::Relaxed);
-            self.store.snack(format!("录制空间保护：{error}"));
+            self.store.snack_error(format!("录制空间保护：{error}"));
             for id in self.engine.active_ids().await {
                 self.stop_recording(&id).await;
             }
@@ -1666,6 +1726,63 @@ mod tests {
     use super::*;
     use crate::model::Recording;
     use crate::paths::Workspace;
+
+    #[tokio::test]
+    async fn live_source_expiry_and_task_removal_release_cached_state() {
+        let (_dir, state, expected) = finished_recording_fixture().await;
+        state.store.update("finished", |r| r.is_live = true).await;
+        let info = crate::resolver::StreamInfo {
+            is_live: true,
+            record_url: "https://media.example.invalid/stream.flv".into(),
+            ..Default::default()
+        };
+        state.scheduler.live_sources.write().await.insert(
+            "finished".into(),
+            (
+                expected.url.clone(),
+                std::time::Instant::now() - LIVE_SOURCE_TTL - Duration::from_secs(1),
+                info.clone(),
+            ),
+        );
+        assert!(state
+            .scheduler
+            .preview_input("finished")
+            .await
+            .err()
+            .unwrap()
+            .contains("过期"));
+        assert!(state.scheduler.live_sources.read().await.is_empty());
+        state.scheduler.live_sources.write().await.insert(
+            "finished".into(),
+            (expected.url, std::time::Instant::now(), info),
+        );
+        assert!(state.scheduler.preview_input("finished").await.is_ok());
+        let lease = state.scheduler.begin_check("finished").unwrap();
+        let cancel = state
+            .scheduler
+            .checks
+            .lock()
+            .unwrap()
+            .get("finished")
+            .unwrap()
+            .clone();
+        state.scheduler.request_monitoring(["finished".into()]);
+        state
+            .scheduler
+            .schedule_edges
+            .lock()
+            .unwrap()
+            .insert("finished".into(), true);
+        let ids = ["finished".into()];
+        state.store.remove(&ids).await.unwrap();
+        state.scheduler.forget_recordings(&ids).await;
+        assert!(cancel.is_cancelled());
+        assert!(state.scheduler.live_sources.read().await.is_empty());
+        assert!(state.scheduler.monitor_requests.lock().unwrap().is_empty());
+        assert!(state.scheduler.schedule_edges.lock().unwrap().is_empty());
+        drop(lease);
+        assert!(state.scheduler.checks.lock().unwrap().is_empty());
+    }
 
     #[tokio::test(start_paused = true)]
     async fn ended_room_empty_response_is_retried_without_publishing_a_false_live_or_error() {

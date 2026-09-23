@@ -30,8 +30,6 @@ pub const BUILD_INPUTS: &[&str] = &[
     "src-tauri/permissions",
     "src-tauri/icons",
     "../config/default_settings.json",
-    "../config/language.json",
-    "../config/version.json",
 ];
 
 fn hash_bytes(bytes: impl IntoIterator<Item = u8>, hash: &mut u64) {

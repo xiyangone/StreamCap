@@ -1,5 +1,6 @@
 name: Native validation
 on:
+  workflow_dispatch:
   push:
     branches: [main]
   pull_request:
@@ -7,7 +8,7 @@ on:
 permissions:
   contents: read
 env:
-  PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/desktop/target/playwright
+  PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/desktop/build/playwright
 jobs:
   native:
     runs-on: windows-latest
@@ -26,6 +27,7 @@ jobs:
           desktop/core/target
           desktop/src-tauri/target
           desktop/build/npm-cache
+          desktop/build/playwright
         key: native-${{ runner.os }}-rust195-${{ hashFiles('desktop/**/Cargo.lock', 'desktop/package-lock.json') }}
         restore-keys: native-${{ runner.os }}-rust195-
     - name: Install Rust toolchain and project tools
@@ -39,6 +41,8 @@ jobs:
         cargo install trunk --version 0.21.14 --locked --root target/tools
         if ($LASTEXITCODE) { exit $LASTEXITCODE }
         cargo install wasm-bindgen-cli --version 0.2.128 --locked --root target/tools
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        cargo install cargo-audit --version 0.22.2 --locked --root target/tools
         if ($LASTEXITCODE) { exit $LASTEXITCODE }
     - name: Restore locked dependencies
       shell: pwsh
@@ -73,7 +77,17 @@ jobs:
           desktop/tests/artifacts/**/verification.json
           desktop/tests/artifacts/**/result.json
           desktop/tests/artifacts/**/ui-result.json
+          desktop/tests/artifacts/**/*audit*.json
           desktop/tests/artifacts/**/*.log
           desktop/tests/artifacts/**/*.png
         retention-days: 14
         if-no-files-found: warn
+    - name: Upload verified executable
+      if: github.event_name == 'workflow_dispatch'
+      uses: actions/upload-artifact@v7.0.1
+      with:
+        name: StreamCap-windows-x64-noFF
+        path: |
+          ${{ steps.verify.outputs.release-directory }}/StreamCap.exe
+          ${{ steps.verify.outputs.release-directory }}/StreamCap.exe.sha256
+        if-no-files-found: error

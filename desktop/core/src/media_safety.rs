@@ -135,22 +135,6 @@ pub fn unique_output(root: &Path, relative: &Path) -> io::Result<PathBuf> {
     Err(io::Error::other("无法分配未使用的录像文件名"))
 }
 
-pub fn matches_output(pattern: &Path, target: &Path) -> bool {
-    if pattern.parent() != target.parent() {
-        return false;
-    }
-    let pattern = pattern.file_name().unwrap_or_default().to_string_lossy();
-    let target = target.file_name().unwrap_or_default().to_string_lossy();
-    if let Some((before, after)) = pattern.split_once("%03d") {
-        target
-            .strip_prefix(before)
-            .and_then(|s| s.strip_suffix(after))
-            .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
-    } else {
-        pattern == target
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

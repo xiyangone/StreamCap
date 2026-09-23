@@ -6,7 +6,7 @@ use crate::{
             AddRecordingDialog, BatchEditDialog, CardInfoDialog, ConfirmDialog,
             EditRecordingDialog, EmptyState, Icon, PreviewDialog, RecordingCard,
         },
-        labels::{platform_label, recording_priority},
+        labels::platform_label,
     },
 };
 use leptos::prelude::*;
@@ -21,14 +21,14 @@ enum Filter {
     Attention,
 }
 impl Filter {
-    fn matches(self, rec: &Recording) -> bool {
+    fn matches(self, phase: TaskPhase) -> bool {
         match self {
             Self::All => true,
-            Self::Recording => rec.task_phase() == TaskPhase::Recording,
-            Self::Live => rec.task_phase() == TaskPhase::LiveIdle,
-            Self::Monitoring => rec.task_phase() == TaskPhase::Waiting,
-            Self::Paused => rec.task_phase() == TaskPhase::Paused,
-            Self::Attention => rec.task_phase() == TaskPhase::Attention,
+            Self::Recording => phase == TaskPhase::Recording,
+            Self::Live => phase == TaskPhase::LiveIdle,
+            Self::Monitoring => phase == TaskPhase::Waiting,
+            Self::Paused => phase == TaskPhase::Paused,
+            Self::Attention => phase == TaskPhase::Attention,
         }
     }
 }
@@ -57,7 +57,10 @@ mod tests {
                             Filter::Attention,
                         ];
                         assert_eq!(
-                            filters.into_iter().filter(|f| f.matches(&r)).count(),
+                            filters
+                                .into_iter()
+                                .filter(|f| f.matches(r.task_phase()))
+                                .count(),
                             1,
                             "{r:?}"
                         );
@@ -89,56 +92,52 @@ pub fn RecordingsView() -> impl IntoView {
         let query = keyword.get().trim().to_lowercase();
         let key = platform.get();
         let mode = filter.get();
-        let mut items: Vec<_> = state
-            .recordings
-            .get()
-            .into_iter()
-            .filter(|rec| mode.matches(rec))
-            .filter(|rec| key.is_empty() || rec.platform_key.as_deref().unwrap_or("custom") == key)
-            .filter(|rec| {
-                query.is_empty()
-                    || rec.name().to_lowercase().contains(&query)
-                    || rec.url.to_lowercase().contains(&query)
-                    || rec
-                        .live_title
-                        .as_deref()
-                        .unwrap_or("")
-                        .to_lowercase()
-                        .contains(&query)
-            })
-            .collect();
-        if sorting.get() == "name" {
-            items.sort_by_key(|r| r.name().to_lowercase());
-        } else {
-            items.sort_by_key(|r| (recording_priority(r), r.name().to_lowercase()));
-        }
-        items
+        let by_name = sorting.get() == "name";
+        state.recording_list.with(|list| {
+            let mut items: Vec<_> = list
+                .iter()
+                .filter(|rec| mode.matches(rec.phase))
+                .filter(|rec| key.is_empty() || rec.platform_key == key)
+                .filter(|rec| query.is_empty() || rec.search_text.contains(&query))
+                .collect();
+            items.sort_by_cached_key(|rec| {
+                (if by_name { 0 } else { rec.priority }, rec.name.clone())
+            });
+            items
+                .into_iter()
+                .map(|rec| rec.rec_id.clone())
+                .collect::<Vec<_>>()
+        })
     });
     let platforms = Memo::new(move |_| {
         let mut keys: Vec<String> = state
-            .recordings
-            .get()
-            .into_iter()
-            .map(|r| r.platform_key.unwrap_or_else(|| "custom".into()))
-            .collect();
+            .recording_list
+            .with(|items| items.iter().map(|rec| rec.platform_key.clone()).collect());
         keys.sort();
         keys.dedup();
         keys
     });
+    let all_ids = Memo::new(move |_| {
+        state.recording_list.with(|items| {
+            items
+                .iter()
+                .map(|rec| rec.rec_id.clone())
+                .collect::<std::collections::HashSet<_>>()
+        })
+    });
     Effect::new(move |_| {
-        let items = state.recordings.get();
-        selected.update(|ids| ids.retain(|id| items.iter().any(|rec| &rec.rec_id == id)));
+        all_ids.with(|items| {
+            if selected.with_untracked(|ids| ids.iter().any(|id| !items.contains(id))) {
+                selected.update(|ids| ids.retain(|id| items.contains(id)));
+            }
+        });
     });
     let all_visible_selected = move || {
         let items = visible.get();
-        !items.is_empty() && selected.with(|ids| items.iter().all(|rec| ids.contains(&rec.rec_id)))
+        !items.is_empty() && selected.with(|ids| items.iter().all(|id| ids.contains(id)))
     };
     let select_visible = move |_| {
-        let ids: Vec<_> = visible
-            .get_untracked()
-            .into_iter()
-            .map(|rec| rec.rec_id)
-            .collect();
+        let ids = visible.get_untracked();
         let all = all_visible_selected();
         selected.update(|values| {
             if all {
@@ -154,10 +153,10 @@ pub fn RecordingsView() -> impl IntoView {
     };
     let has_active_selection = move || {
         selected.with(|ids| {
-            state.recordings.with(|items| {
+            state.recording_list.with(|items| {
                 items
                     .iter()
-                    .any(|r| ids.contains(&r.rec_id) && r.is_recording)
+                    .any(|r| ids.contains(&r.rec_id) && r.phase == TaskPhase::Recording)
             })
         })
     };
@@ -253,11 +252,11 @@ pub fn RecordingsView() -> impl IntoView {
     });
     view! {
         <div class="page recordings-page">
-            <header class="page-header"><div><h1>{t("录制任务")}<span class="heading-count">{move || state.recordings.get().len()}</span></h1><p>{t("新增直播间自动监控，开播后自动录制；单次录制用于手动操作。")}</p></div><div class="header-actions"><button class="button secondary" disabled=move || busy.get() on:click=refresh><Icon name="refresh" size=17 />{t("刷新列表")}</button><button class="button primary" on:click=move |_| add.set(true)><Icon name="plus" size=18 />{t("添加直播间")}</button></div></header>
+            <header class="page-header"><div><h1>{t("录制任务")}<span class="heading-count">{move || state.recording_list.with(Vec::len)}</span></h1><p>{t("新增直播间自动监控，开播后自动录制；单次录制用于手动操作。")}</p></div><div class="header-actions"><button class="button secondary" disabled=move || busy.get() on:click=refresh><Icon name="refresh" size=17 />{t("刷新列表")}</button><button class="button primary" on:click=move |_| add.set(true)><Icon name="plus" size=18 />{t("添加直播间")}</button></div></header>
             <section class="task-toolbar glass" aria-label=t("任务筛选")>
                 <div class="filter-tabs" role="group" aria-label=t("状态筛选")>
                     {[(Filter::All,t("全部")),(Filter::Attention,t("需关注")),(Filter::Recording,t("录制中")),(Filter::Live,t("直播未录制")),(Filter::Monitoring,t("等待开播")),(Filter::Paused,t("已暂停"))].into_iter().map(|(mode,label)| view! {
-                        <button class="filter-tab" class:active=move || filter.get() == mode aria-pressed=move || (filter.get() == mode).to_string() on:click=move |_| filter.set(mode)>{label}<span>{move || state.recordings.with(|items| items.iter().filter(|r| mode.matches(r)).count())}</span></button>
+                        <button class="filter-tab" class:active=move || filter.get() == mode aria-pressed=move || (filter.get() == mode).to_string() on:click=move |_| filter.set(mode)>{label}<span>{move || state.recording_list.with(|items| items.iter().filter(|r| mode.matches(r.phase)).count())}</span></button>
                     }).collect_view()}
                 </div>
                 <div class="toolbar-controls">
@@ -272,7 +271,7 @@ pub fn RecordingsView() -> impl IntoView {
             <Show when=move || state.loading.get()><div class="skeleton-grid" aria-label=t("加载任务")><div class="skeleton" /><div class="skeleton" /><div class="skeleton" /></div></Show>
             <Show when=move || !state.loading.get() && visible.get().is_empty()><div class="glass empty-panel"><EmptyState icon="search" title=t("没有匹配的直播间") description=t("尝试调整搜索条件，或添加新的直播间。") /><button class="button secondary" on:click=move |_| { keyword.set(String::new()); platform.set(String::new()); filter.set(Filter::All); }>{t("清除筛选")}</button></div></Show>
             <div class="cards-grid" class:list-view=move || !state.grid_view.get()>
-                <For each=move || visible.get() key=|rec| rec.rec_id.clone() children=move |rec| view! { <RecordingCard recording=rec selectable=true selected=selected on_edit=Callback::new(move |r| editing.set(Some(r))) on_info=Callback::new(move |r| info.set(Some(r))) on_preview=Callback::new(move |r| preview.set(Some(r))) /> } />
+                <For each=move || visible.get() key=|id| id.clone() children=move |id| state.recording_untracked(&id).map(|rec| view! { <RecordingCard recording=rec selectable=true selected=selected on_edit=Callback::new(move |r| editing.set(Some(r))) on_info=Callback::new(move |r| info.set(Some(r))) on_preview=Callback::new(move |r| preview.set(Some(r))) /> }) />
             </div>
         </div>
         <AddRecordingDialog open=add /><EditRecordingDialog target=editing /><BatchEditDialog open=batch_open ids=batch_ids /><CardInfoDialog target=info /><PreviewDialog target=preview />

@@ -10,7 +10,7 @@
 npm run verify
 ```
 
-统一验收脚本执行 Rust 格式/Clippy/测试、WASM 构建、UI 与布局回归、原生 EXE 的关闭和托盘 smoke，并写入新的测试证据目录。任一必要检查失败会返回非零，不发布成功报告。
+统一验收脚本执行 Rust 格式/Clippy/测试、依赖审计、WASM 构建、UI 与布局回归、原生 EXE 的关闭和托盘 smoke，并写入新的测试证据目录。任一必要检查失败会返回非零，不发布成功报告。
 
 ```powershell
 pwsh -NoProfile -File .\scripts\build-release.ps1
@@ -26,6 +26,8 @@ pwsh -NoProfile -File .\scripts\build-release.ps1
 - Node.js 24/npm 用于 Tauri API、锁定版本的 mpegts.js 本地资源和 Playwright；不会随 EXE 启动 Node。
 - FFmpeg 与同目录 ffprobe 用于生成隔离媒体夹具和校验转封装；noFF 成品不捆绑这两个工具。
 - Trunk 0.21.14、wasm-bindgen-cli 0.2.128 安装在 desktop/target/tools。升级 wasm-bindgen 库时必须同步项目本地 CLI，构建时会检查版本。
+- cargo-audit 0.22.2 同样安装在 desktop/target/tools。首次审计联网更新 desktop/target/advisory-db，三份锁文件使用同一数据库版本；npm audit 也需要网络。审计 JSON 和数据库提交号保留在验收目录，已知漏洞阻断验收，维护状态警告单独保留，不自动忽略漏洞。
+- Playwright 浏览器默认使用 desktop/build/playwright，可通过进程级 PLAYWRIGHT_BROWSERS_PATH 明确指定。安装浏览器时使用相同路径；验收会先启动并关闭一次无页面的隔离 Chromium，缺少浏览器会明确失败。
 - Tauri 命令权限自动文件由 build.rs 生成，不手动维护；手写权限在 src-tauri/permissions/desktop.toml。
 
 ## 验收隔离
@@ -40,17 +42,23 @@ native-smoke.ps1 只接受项目 src-tauri/target 内的构建产物，使用新
 
 默认用户目录为 %APPDATA%\StreamCap，下载路径由用户配置决定。--data-dir 可以显式指定独立数据目录；--api-port 可以指定本地端口，前端地址由原生启动配置注入。
 
-不得整目录打包根 config、用户 profile、下载目录或旧备份。编译使用的默认配置只有 config/default_settings.json、config/language.json、config/version.json；保持既有任务与 Cookie 的持久化契约。不要清空系统 WebView2 数据，也不要因发布 noFF 而移除用户已有 FFmpeg。
+不得整目录打包根 config、用户 profile、下载目录或旧备份。编译仅内嵌 config/default_settings.json；语言与版本使用原生界面数据，不再播种旧版语言/版本元数据。已有用户目录中的这些文件仍保留，任务与 Cookie 的持久化契约不变。不要清空系统 WebView2 数据，也不要因发布 noFF 而移除用户已有 FFmpeg。
 
 向现有安装位置替换 EXE、提交 Git 或推送不属于构建脚本行为。
 
-## 本轮补齐的验证范围
+## 回归验证范围
 
 - 扩展平台通过注入式 HTTP 响应夹具逐分支验证；测试从不发送真实平台或登录请求。夹具覆盖不代表外站当前可用性证明。
 - 全录制格式分别验证普通与分段文件；同时覆盖 TS 清理、失败保留、锁定源文件、队列重启恢复、时间字幕、FLV 原生直下及兼容/直播源预览。
-- UI 测试运行真正的发布 WASM，模拟账号/工具/关机端点，验证截图、删源后切换播放器、语言切换、快捷键和页面恢复。真实通知、关机及用户脚本不在自动验收中执行。
+- UI 测试运行真正的发布 WASM，模拟账号/工具/关机端点，验证账号读写期间的草稿与凭据保护、更新链接、截图、删源后切换播放器、语言切换、快捷键和页面恢复。真实通知、关机及用户脚本不在自动验收中执行。
 - Windows 脚本进程树门禁仅启动合成的 pwsh 睡眠进程，校验关闭 Job Object 后父子进程均退出，不执行用户脚本。
 - 原生关闭/托盘 smoke 使用新数据目录。noFF 只保留一条 Rust 后端路径，不启动 Python 或 Node。
-- 依赖风险核对可使用项目内 cargo-audit（0.22.2）与 npm audit；保留审计数据库版本和报告，不以编译成功替代漏洞检查。
+- 设置竞态回归覆盖乱序读取、串行外观保存和未保存草稿；列表负载回归在 100、250、500 个任务中更新五路进度，校验单轮一秒预算和卡片身份不变。
+- 录后脚本回归覆盖同名再次录制、转换失败、关闭转换和分段部分成功；脚本只接收当前录制对应的文件。
+- 退役入口检查同时禁止旧字体、旧 macOS 图标、旧截图和静态语言/版本文件重新进入仓库；保留品牌 SVG 母版及现用运行资源、许可证。
+
+需要指定候选输出目录时，运行 `scripts/verify-native.ps1 -OutputDirectory <绝对目录>`。目录必须位于 desktop/src-tauri/target 内，且不能覆盖已有候选 EXE。
+
+CI 统一使用 .github/workflows/test.yml，支持 push、PR 和 workflow_dispatch。各入口执行同一验收脚本并上传证据；只有手动运行且验收成功时上传 noFF EXE，不额外保留第二条构建工作流。
 
 按时间预览门禁使用超过 600 MiB 的合成红/蓝 TS，直接跳到后段再跳回前段，并解码首帧核对画面。原生窗口用鼠标拖动录中进度条、返回最新位置，并确认录制未停止；只更新界面数字不能视为通过。

@@ -12,6 +12,15 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 pub struct ScriptSpec {
     pub argv: Vec<String>,
 }
+
+pub(crate) struct ScriptInput {
+    pub root: PathBuf,
+    pub pattern: PathBuf,
+    pub room: String,
+    pub conversions: Vec<crate::model::MediaJob>,
+    pub processor: crate::postprocess::Postprocessor,
+    pub reservation: crate::engine::MediaReservation,
+}
 impl ScriptSpec {
     pub fn parse(value: &str) -> Result<Self, String> {
         let argv: Vec<String> = serde_json::from_str(value)
@@ -142,38 +151,136 @@ impl Automation {
                 .emit("nativeShutdown", serde_json::json!({"countdownSeconds":60}));
         }
     }
-    pub fn after_recording(
-        &self,
-        spec: ScriptSpec,
-        root: PathBuf,
-        pattern: PathBuf,
-        room: String,
-        task_id: String,
-        processor: crate::postprocess::Postprocessor,
-    ) {
+    /// The scheduler transfers this reservation while still holding the filesystem guard.
+    pub(crate) fn after_recording(&self, spec: ScriptSpec, input: ScriptInput) {
         let _admission = self.admission.lock().expect("script admission");
         if self.stop.is_cancelled() {
             return;
         }
         let Ok(permit) = self.slots.clone().try_acquire_owned() else {
-            self.store.snack("录后脚本队列已满");
+            self.store.snack_error("录后脚本队列已满");
             return;
         };
         let manager = self.clone();
-        self.tasks.spawn(async move{
-      let _permit=permit;
-      let work=async {
-        while processor.jobs().iter().any(|j|j.task_id.as_deref()==Some(&task_id)&&crate::media_safety::matches_output(&pattern,&root.join(&j.source))&&j.state.pending()){tokio::select!{biased;_=manager.stop.cancelled()=>return,_=tokio::time::sleep(Duration::from_millis(200))=>{}}}
-        let root=match root.canonicalize(){Ok(root)=>root,Err(_)=>return};
-        let paths=crate::media_safety::recording_outputs(&pattern).unwrap_or_default();let mut outputs=paths;
-        for job in processor.jobs().into_iter().filter(|j|j.task_id.as_deref()==Some(&task_id)&&crate::media_safety::matches_output(&pattern,&root.join(&j.source))&&matches!(j.state,crate::model::MediaJobState::Complete|crate::model::MediaJobState::CleanupFailed)) {let source=root.join(&job.source);outputs.retain(|p|p!=&source);outputs.push(root.join(&job.output));}
-        outputs.sort();outputs.dedup();
-        for file in outputs{if manager.stop.is_cancelled(){return;}let args=spec.arguments(&file.to_string_lossy(),&room);let mut command=tokio::process::Command::new(&args[0]);command.args(&args[1..]).current_dir(&root).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).kill_on_drop(true);
-            #[cfg(windows)]command.creation_flags(0x08000000);
-            match command.spawn(){Ok(mut child)=>{let _owned_job=match crate::owned_process::ChildJob::attach(&child){Ok(job)=>job,Err(_)=>{let _=child.kill().await;let _=child.wait().await;manager.store.snack("无法隔离录后脚本进程，已停止本次脚本");continue;}};let result=tokio::select!{biased;_=manager.stop.cancelled()=>None,result=tokio::time::timeout(Duration::from_secs(300),child.wait())=>result.ok().and_then(Result::ok)};match result{Some(status)if status.success()=>{},Some(_)=>manager.store.snack("录后脚本退出失败"),None=>{let _=child.kill().await;let _=child.wait().await;manager.store.snack("录后脚本已超时或取消");}}},Err(_)=>manager.store.snack("无法启动录后脚本，请检查路径和权限")}
+        self.tasks.spawn(async move {
+            let _permit = permit;
+            let _reservation = input.reservation;
+            let result = manager
+                .run_after_recording(
+                    &spec,
+                    input.root,
+                    input.pattern,
+                    input.room,
+                    input.conversions,
+                    input.processor,
+                )
+                .await;
+            if let Err(error) = result {
+                manager.store.snack_error(error);
+            }
+        });
+    }
+
+    async fn run_after_recording(
+        &self,
+        spec: &ScriptSpec,
+        root: PathBuf,
+        pattern: PathBuf,
+        room: String,
+        mut conversions: Vec<crate::model::MediaJob>,
+        processor: crate::postprocess::Postprocessor,
+    ) -> Result<(), String> {
+        let root = root
+            .canonicalize()
+            .map_err(|_| "录后脚本的录制目录不可用")?;
+        loop {
+            let latest = processor.jobs();
+            for conversion in &mut conversions {
+                if !conversion.state.pending() {
+                    continue;
+                }
+                let job = latest
+                    .iter()
+                    .find(|job| job.id == conversion.id)
+                    .ok_or("本次转 MP4 状态已失效，录后脚本未运行")?;
+                *conversion = job.clone();
+            }
+            if conversions.iter().all(|job| !job.state.pending()) {
+                break;
+            }
+            tokio::select! { biased;
+                _ = self.stop.cancelled() => return Ok(()),
+                _ = tokio::time::sleep(Duration::from_millis(200)) => {},
+            }
         }
-      };work.await;
-    });
+        let mut outputs = crate::media_safety::recording_outputs(&pattern)
+            .map_err(|_| "录后脚本无法读取本次录制文件")?;
+        for job in conversions.iter().filter(|job| {
+            matches!(
+                job.state,
+                crate::model::MediaJobState::Complete | crate::model::MediaJobState::CleanupFailed
+            )
+        }) {
+            outputs.retain(|path| path != &root.join(&job.source));
+            outputs.push(root.join(&job.output));
+        }
+        outputs.sort();
+        outputs.dedup();
+        for file in outputs {
+            if self.stop.is_cancelled() {
+                return Ok(());
+            }
+            let relative = file
+                .strip_prefix(&root)
+                .map_err(|_| "录后脚本文件超出录制目录")?;
+            let checked = crate::storage::checked_target(&root, &relative.to_string_lossy(), false)
+                .map_err(|_| "录后脚本文件已改变或不可用")?;
+            if !checked.is_file() {
+                return Err("录后脚本输入不是普通文件".into());
+            }
+            let args = spec.arguments(&checked.to_string_lossy(), &room);
+            if let Err(error) = self.run_script(&root, &args).await {
+                self.store.snack_error(error);
+            }
+        }
+        Ok(())
+    }
+
+    async fn run_script(&self, root: &std::path::Path, args: &[String]) -> Result<(), String> {
+        let mut command = tokio::process::Command::new(&args[0]);
+        command
+            .args(&args[1..])
+            .current_dir(root)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        command.creation_flags(0x08000000);
+        let mut child = command
+            .spawn()
+            .map_err(|_| "无法启动录后脚本，请检查路径和权限")?;
+        let _owned_job = match crate::owned_process::ChildJob::attach(&child) {
+            Ok(job) => job,
+            Err(_) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Err("无法隔离录后脚本进程，已停止本次脚本".into());
+            }
+        };
+        let result = tokio::select! { biased;
+            _ = self.stop.cancelled() => None,
+            result = tokio::time::timeout(Duration::from_secs(300), child.wait()) => result.ok().and_then(Result::ok),
+        };
+        match result {
+            Some(status) if status.success() => Ok(()),
+            Some(_) => Err("录后脚本退出失败".into()),
+            None => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                Err("录后脚本已超时或取消".into())
+            }
+        }
     }
     pub async fn shutdown(&self) {
         {

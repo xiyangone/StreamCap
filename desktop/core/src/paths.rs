@@ -80,8 +80,7 @@ impl Workspace {
 
     /// 确保用户数据目录存在，并补齐缺失的默认配置（不覆盖用户已有文件）。
     ///
-    /// 打包态下 `default_settings.json` / `language.json` 等随安装包分发在资源目录，
-    /// 首次运行时需要播种到 `%APPDATA%/StreamCap/config`，否则设置页在所有默认值上都是空的。
+    /// 仅播种内嵌的录制默认设置；语言与版本由原生界面提供，不写入旧版元数据。
     /// `USER_OWNED_FILES` 里的文件是运行期产物，永不覆盖。
     pub fn ensure_ready(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(self.config_dir())?;
@@ -90,48 +89,37 @@ impl Workspace {
     }
 
     fn seed_defaults(&self) -> std::io::Result<()> {
-        // Only create missing shipped defaults, never seed tasks or login state.
-        let values = crate::config::native_defaults();
-        for (name, contents) in [
-            (
-                "default_settings.json",
-                serde_json::to_string_pretty(&values)?,
-            ),
-            (
-                "language.json",
-                include_str!("../../../config/language.json").to_string(),
-            ),
-            (
-                "version.json",
-                include_str!("../../../config/version.json").to_string(),
-            ),
-        ] {
-            let target = self.config_dir().join(name);
-            match std::fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(target)
-            {
-                Ok(mut file) => {
-                    use std::io::Write;
-                    file.write_all(contents.as_bytes())?;
-                    file.sync_all()?;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error),
+        let target = self.default_settings_path();
+        match std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(target)
+        {
+            Ok(mut file) => {
+                use std::io::Write;
+                let contents = serde_json::to_vec_pretty(&crate::config::native_defaults())?;
+                file.write_all(&contents)?;
+                file.sync_all()
             }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(error) => Err(error),
         }
-        Ok(())
     }
 }
 
-/// 定位 ffmpeg：优先用户数据目录内自带的，其次 PATH。
+/// 启动时发现工具；后台工作使用已确定的路径，不隐式重新搜索 PATH。
 pub fn find_ffmpeg(workspace: &Workspace) -> Option<PathBuf> {
+    let configured = which_in_path("ffmpeg.exe").or_else(|| which_in_path("ffmpeg"));
+    configured_ffmpeg(workspace, configured.as_deref())
+}
+
+/// 新安装的应用内工具优先于启动路径；显式 None 保持不可用。
+pub fn configured_ffmpeg(workspace: &Workspace, configured: Option<&Path>) -> Option<PathBuf> {
     let bundled = workspace.user_data_dir.join("ffmpeg").join("ffmpeg.exe");
     if bundled.is_file() {
         return Some(bundled);
     }
-    which_in_path("ffmpeg.exe").or_else(|| which_in_path("ffmpeg"))
+    configured.map(Path::to_path_buf)
 }
 
 fn which_in_path(name: &str) -> Option<PathBuf> {
@@ -144,6 +132,26 @@ fn which_in_path(name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_tools_preserve_explicit_unavailability_and_allow_a_local_install() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = Workspace::from_repo_root(directory.path());
+        assert_eq!(configured_ffmpeg(&workspace, None), None);
+        let configured = directory.path().join("startup-ffmpeg.exe");
+        assert_eq!(
+            configured_ffmpeg(&workspace, Some(&configured)),
+            Some(configured.clone())
+        );
+        let installed = workspace.user_data_dir.join("ffmpeg/ffmpeg.exe");
+        std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        std::fs::write(&installed, b"fixture only").unwrap();
+        assert_eq!(
+            configured_ffmpeg(&workspace, Some(&configured)),
+            Some(installed.clone())
+        );
+        assert_eq!(configured_ffmpeg(&workspace, None), Some(installed));
+    }
 
     #[test]
     fn repo_root_workspace_uses_root_for_both_dirs() {
@@ -217,11 +225,15 @@ mod tests {
         ws.ensure_ready().unwrap();
 
         assert!(ws.config_dir().join("default_settings.json").is_file());
-        assert!(ws.config_dir().join("language.json").is_file());
+        assert!(!ws.config_dir().join("language.json").exists());
+        assert!(!ws.config_dir().join("version.json").exists());
         assert!(!ws.config_dir().join("recordings.json").exists());
         assert!(!ws.config_dir().join("user_settings.json").exists());
 
         // 已存在的文件不被覆盖
+        for name in ["language.json", "version.json"] {
+            std::fs::write(ws.config_dir().join(name), b"existing user metadata").unwrap();
+        }
         std::fs::write(
             ws.config_dir().join("default_settings.json"),
             r#"{"video_format":"MKV"}"#,
@@ -230,6 +242,12 @@ mod tests {
         ws.ensure_ready().unwrap();
         let kept = std::fs::read_to_string(ws.config_dir().join("default_settings.json")).unwrap();
         assert!(kept.contains("MKV"), "已存在的配置不应被覆盖");
+        for name in ["language.json", "version.json"] {
+            assert_eq!(
+                std::fs::read(ws.config_dir().join(name)).unwrap(),
+                b"existing user metadata"
+            );
+        }
     }
 
     #[test]

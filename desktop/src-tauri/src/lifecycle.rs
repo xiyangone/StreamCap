@@ -368,7 +368,7 @@ pub fn start_native_events(
                         "nativeNotification" => {
                             let title = message.payload["title"].as_str().unwrap_or("StreamCap").chars().take(120).collect::<String>();
                             let body = message.payload["body"].as_str().unwrap_or("").chars().take(1000).collect::<String>();
-                            if app.notification().builder().title(title).body(body).show().is_err() { state.server.state().store.snack("系统通知未送达，请检查 Windows 通知权限"); }
+                            if app.notification().builder().title(title).body(body).show().is_err() { state.server.state().store.snack_error("系统通知未送达，请检查 Windows 通知权限"); }
                         },
                         "shutdownSchedule" => {
                             state.system_shutdown.store(false, Ordering::SeqCst);

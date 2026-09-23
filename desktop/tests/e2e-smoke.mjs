@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { createHarness, eventually, go, hidden, inspectLayout, streamPreviewFixture, visible, waitTheme } from './ui-fixtures.mjs';
+import { apiContracts, createHarness, eventually, go, hidden, inspectLayout, seedRecordings, streamPreviewFixture, visible, waitTheme } from './ui-fixtures.mjs';
 
 const h = await createHarness('interaction');
 const { page, state } = h;
 const steps = [];
+const loadResults = [];
 const card = (id) => page.locator('article[data-rec-id="' + id + '"]');
 const dialog = (name) => page.getByRole('dialog', { name, exact: true });
 const requests = (method, path) => state.requests.filter((r) => r.method === method && r.path === path);
@@ -65,6 +66,24 @@ try {
     const layout = await inspectLayout(page);
     assert.equal(layout.dialogs, 0); assert.ok(layout.glass.includes('blur'));
     await h.shot('01-home-light');
+  });
+  await step('后台错误显示并去重，成功事件不会盖掉未处理告警', async () => {
+    h.emit('snack', apiContracts.backgroundError);
+    await visible(page.locator('.toast.error'));
+    assert.equal(await page.locator('.toast span').innerText(), apiContracts.backgroundError.text);
+    h.emit('snack', apiContracts.backgroundError);
+    h.emit('snack', apiContracts.backgroundSuccess);
+    const original = record('fixture-2').streamerName;
+    record('fixture-2').streamerName = '后台事件顺序已确认'; h.emit('update', record('fixture-2'));
+    await visible(card('fixture-2').getByRole('button', {name:'后台事件顺序已确认',exact:true}));
+    assert.equal(await page.locator('.toast').count(), 1);
+    assert.equal(await page.locator('.toast span').innerText(), apiContracts.backgroundError.text);
+    record('fixture-2').streamerName = original; h.emit('update', record('fixture-2'));
+    await page.getByRole('button', {name:'关闭提示',exact:true}).click();
+    h.emit('snack', apiContracts.backgroundSuccess);
+    await visible(page.locator('.toast:not(.error)'));
+    assert.equal(await page.locator('.toast span').innerText(), apiContracts.backgroundSuccess.text);
+    await page.getByRole('button', {name:'关闭提示',exact:true}).click();
   });
   await step('慢于两秒的文件列表仍能加载，且只保留一个在途请求', async () => {
     await navigate('录制任务');
@@ -224,6 +243,21 @@ try {
     await visible(page.getByText('已添加 0 个直播间，跳过 2 个重复地址',{exact:true}));
     assert.deepEqual(state.recordings,unchanged,'all-duplicate imports must not mutate existing records');
   });
+  await step('弹窗内 Enter 和空格不误关窗口，真正的背景点击仍可关闭', async () => {
+    const before = requests('PUT', '/api/recordings/fixture-3').length;
+    await card('fixture-3').getByRole('button', {name:'编辑任务',exact:true}).click();
+    const modal = dialog('编辑直播间'); await visible(modal);
+    await modal.getByRole('textbox', {name:'主播名称',exact:true}).fill('键盘编辑草稿');
+    const follow = modal.getByRole('button', {name:'跟随全局',exact:true}).first();
+    for (const key of ['Enter', 'Space']) {
+      await follow.focus(); await page.keyboard.press(key);
+      await visible(modal);
+      assert.equal(await modal.getByRole('textbox', {name:'主播名称',exact:true}).inputValue(), '键盘编辑草稿');
+    }
+    assert.equal(requests('PUT', '/api/recordings/fixture-3').length, before);
+    await page.mouse.click(1, 1); await hidden(modal);
+    assert.equal(requests('PUT', '/api/recordings/fixture-3').length, before);
+  });
   await step('单项编辑、字段契约和实时卡片更新', async () => {
     await card('fixture-3').getByRole('button', { name: '编辑任务' }).click();
     const modal = dialog('编辑直播间');
@@ -287,6 +321,34 @@ try {
     await page.locator('.settings-savebar').getByRole('button', { name: '保存修改' }).click();
     await waitState(() => state.userConfig.loop_time_seconds, (v) => v === '120', '重试保存');
     await hidden(page.locator('.settings-savebar'));
+    await waitState(() => interval.isEnabled(), value => value, '保存后的设置刷新已结束');
+  });
+  await step('设置事件只刷新一次，迟到快照不覆盖新设置或未保存草稿', async () => {
+    const interval = page.getByRole('textbox', { name: /检测间隔/ });
+    const original = state.userConfig.loop_time_seconds;
+    const held = h.holdNextSettingsRead();
+    try {
+      state.userConfig.loop_time_seconds = '700'; h.emit('settings', {});
+      await held.received;
+      const before = requests('GET', '/api/settings').length;
+      state.userConfig.loop_time_seconds = '800'; h.emit('settings', {});
+      await waitState(() => interval.inputValue(), value => value === '800', '新设置先发布');
+      assert.equal(requests('GET', '/api/settings').length, before + 1, '页面不能再为同一事件重复请求');
+      held.release();
+      await page.waitForTimeout(120);
+      assert.equal(await interval.inputValue(), '800', '迟到的 700 秒不能覆盖 800 秒');
+      await interval.fill('900');
+      const received = page.waitForResponse(response => response.url().endsWith('/api/settings') && response.request().method() === 'GET');
+      state.userConfig.loop_time_seconds = '810'; h.emit('settings', {});
+      await (await received).finished();
+      await page.waitForTimeout(80);
+      assert.equal(await interval.inputValue(), '900', '刷新不能丢弃正在编辑的字段');
+      await page.getByRole('button', { name: '放弃修改', exact: true }).click();
+      await waitState(() => interval.inputValue(), value => value === '810', '放弃草稿后使用最新服务端值');
+    } finally {
+      held.release(); state.userConfig.loop_time_seconds = original; h.emit('settings', {});
+    }
+    await waitState(() => interval.inputValue(), value => value === original, '恢复原设置');
   });
   await step('录制结束转 MP4 开关按显式选择保存，不改变 TS 与检测间隔', async () => {
     await page.getByRole('button',{name:'录制与存储',exact:true}).click();
@@ -315,6 +377,25 @@ try {
     await page.getByRole('button', { name: '浅色', exact: true }).click();
     await waitState(() => state.userConfig.theme_mode, (v) => v === 'light', '浅色恢复');
   });
+  await step('快速切换主题和强调色串行合并，最后选择不会被旧写入覆盖', async () => {
+    const before = requests('PUT', '/api/settings').length;
+    h.delayNext('PUT', '/api/settings', 900);
+    await page.getByRole('button', { name: '深色', exact: true }).click();
+    await waitState(() => requests('PUT', '/api/settings').length, count => count === before + 1, '首个外观请求在途');
+    await page.getByRole('button', { name: '鸢尾紫', exact: true }).click();
+    await page.getByRole('button', { name: '浅色', exact: true }).click();
+    await waitTheme(page, 'light');
+    await page.waitForTimeout(100);
+    assert.equal(requests('PUT', '/api/settings').length, before + 1, '旧写入完成前不能发出并行写入');
+    await waitState(() => [state.userConfig.theme_mode, state.userConfig.theme_color].join('/'), value => value === 'light/purple', '最后外观持久化');
+    await page.waitForTimeout(120);
+    assert.equal(requests('PUT', '/api/settings').length, before + 2, '中间外观应合并为最后一次选择');
+    await waitTheme(page, 'light');
+    assert.equal(await page.locator('html').getAttribute('data-accent'), 'purple');
+    assert.deepEqual(await page.evaluate(() => JSON.parse(localStorage.getItem('streamcap.appearance'))), { theme: 'light', accent: 'purple' });
+    await page.getByRole('button', { name: '晴空蓝', exact: true }).click();
+    await waitState(() => state.userConfig.theme_color, value => value === 'blue', '恢复强调色');
+  });
   await step('窗口一体化、原生按钮、关闭取消与托盘偏好',async()=>{
     const bounds=await page.locator('.app-shell').boundingBox();assert.equal(bounds.x,0);assert.equal(bounds.y,0);
     assert.equal(await page.locator('.sidebar').evaluate(el=>getComputedStyle(el).borderRadius),'0px');
@@ -339,6 +420,55 @@ try {
     state.native.trayAvailable=false;await page.getByRole('button',{name:'关闭窗口',exact:true}).click();await visible(close);assert.equal(await close.getByRole('button',{name:/最小化到托盘/}).isDisabled(),true);
     await close.getByRole('button',{name:'取消',exact:true}).click();await hidden(close);state.native.trayAvailable=true;
     await h.shot('window-preferences');
+  });
+  await step('账号迟到读取保留草稿，保存只确认对应快照且不回显已存凭据', async () => {
+    state.accounts.douyin = {
+      username: 'stored-fixture', accountType: 'personal',
+      password: 'synthetic-old-secret', accessToken: 'synthetic-old-token',
+    };
+    const heldRead = h.holdNextAccountRead();
+    await page.getByRole('button', { name: '平台登录', exact: true }).click();
+    await heldRead.received;
+    const summary = page.locator('summary').filter({ hasText: '平台账号与访问令牌' });
+    await summary.click();
+    const editor = page.locator('details').filter({ has: summary });
+    const username = editor.getByLabel('账号', { exact: true });
+    const accountType = editor.getByLabel('账号类型', { exact: true });
+    const password = editor.getByLabel('密码', { exact: true });
+    const token = editor.getByLabel('访问令牌', { exact: true });
+    const save = editor.getByRole('button', { name: '保存平台账号', exact: true });
+    try {
+      await username.fill('typed-during-read');
+      heldRead.release();
+      await waitState(() => accountType.inputValue(), value => value === 'personal', '读取账号摘要');
+      assert.equal(await username.inputValue(), 'typed-during-read');
+      assert.equal(await password.inputValue(), '');
+      assert.equal(await token.inputValue(), '');
+    } finally { heldRead.release(); }
+    await password.fill('synthetic-new-secret');
+    const heldWrite = h.holdNextAccountWrite();
+    try {
+      await save.click(); await heldWrite.received;
+      await username.fill('typed-during-write');
+      await accountType.fill('business');
+      heldWrite.release();
+      await waitState(() => save.isEnabled(), value => value, '保存期间新编辑仍可继续保存');
+      await waitState(() => password.inputValue(), value => value === '', '仅清空已确认保存的凭据');
+      assert.equal(await username.inputValue(), 'typed-during-write');
+      assert.equal(await accountType.inputValue(), 'business');
+      assert.equal(state.accounts.douyin.username, 'typed-during-read');
+      assert.equal(state.accounts.douyin.accountType, 'personal');
+    } finally { heldWrite.release(); }
+    h.failNext('PUT', '/api/accounts', '模拟账号保存失败');
+    await save.click(); await visible(page.getByText('模拟账号保存失败', { exact: true }));
+    assert.equal(state.accounts.douyin.username, 'typed-during-read');
+    assert.equal(await username.inputValue(), 'typed-during-write');
+    await waitState(() => save.isEnabled(), value => value, '失败后保留重试入口');
+    await save.click();
+    await waitState(() => state.accounts.douyin.username, value => value === 'typed-during-write', '新账号草稿已保存');
+    assert.equal(state.accounts.douyin.accountType, 'business');
+    await waitState(() => save.isDisabled(), value => value, '已保存快照没有遗留脏标记');
+    await summary.click();
   });
   await step('登录信息按平台局部保存，扫码仅在隔离服务模拟', async () => {
     await page.getByRole('button', { name: '平台登录', exact: true }).click();
@@ -794,7 +924,9 @@ try {
     await waitState(()=>page.locator('html').getAttribute('lang'),value=>value==='en','英文界面');await visible(page.getByRole('heading',{name:'Preferences',exact:true}));
     await page.keyboard.press('Control+3');await visible(page.getByRole('heading',{name:'Media library',exact:true}));await page.goto(h.base+'/');await visible(page.getByRole('heading',{name:'Media library',exact:true}));
     await page.keyboard.press('Control+2');await visible(card('fixture-2').getByRole('button',{name:record('fixture-2').streamerName,exact:true}));await h.shot('english-recordings');
-    await page.keyboard.press('Control+5');await page.getByRole('button',{name:'Check for updates',exact:true}).click();await visible(page.getByRole('link',{name:'v0.1.1-fixture',exact:true}));assert.equal(requests('GET','/api/tools/update').length,1);
+    await page.keyboard.press('Control+5');await page.getByRole('button',{name:'Check for updates',exact:true}).click();
+    const release = page.getByRole('link', { name: apiContracts.updateCheck.release.tag_name, exact: true });
+    await visible(release);assert.equal(await release.getAttribute('href'),apiContracts.updateCheck.release.html_url);assert.equal(requests('GET','/api/tools/update').length,1);
     await page.keyboard.press('Control+,');await page.getByRole('button',{name:'Appearance and window',exact:true}).click();await page.getByRole('combobox',{name:'Interface language',exact:true}).selectOption('zh_CN');await waitState(()=>page.locator('html').getAttribute('lang'),value=>value==='zh-CN','恢复中文');
     assert.equal(state.requests.filter(request=>/\/(check|start)$/.test(request.path)).length,checks,'切页和重载不触发额外平台检查');
   });
@@ -811,6 +943,36 @@ try {
     await page.getByRole('button',{name:/^全部/}).click();
     Object.assign(selected,original);h.emit('update',selected);
   });
+  await step('100、250、500 个任务中的五路秒级进度不重建卡片且在一秒内完成', async () => {
+    const original = state.recordings;
+    const template = seedRecordings()[0];
+    try {
+      for (const count of [100, 250, 500]) {
+        state.recordings = Array.from({ length: count }, (_, index) => ({ ...structuredClone(template),
+          recId: 'load-' + index, streamerName: 'Load ' + String(index).padStart(4, '0'),
+          url: 'https://fixture.example.invalid/' + index, isRecording: index < 5, isLive: index < 5,
+          speed: index < 5 ? '0 MB/s' : null, recordedSeconds: 0,
+        }));
+        await go(page, h.base, '/recordings');
+        await waitState(() => page.locator('article[data-rec-id]').count(), value => value === count, '完整负载列表渲染');
+        const samples = [];
+        for (let round = 0; round < 6; round++) {
+          const speed = `${round + 1}.7 MB/s`;
+          await page.evaluate(() => { window.__progressCard = document.querySelector('[data-rec-id="load-0"]'); window.__progressStart = performance.now(); });
+          for (const record of state.recordings.slice(0, 5)) {
+            record.speed = speed; record.recordedSeconds = (round + 1) * 60; h.emit('update', record);
+          }
+          const ready = await page.waitForFunction(expected => [0, 1, 2, 3, 4].every(index => document.querySelector(`[data-rec-id="load-${index}"] .card-speed`)?.textContent.includes(expected)), speed);
+          await ready.dispose();
+          const elapsed = await page.evaluate(() => performance.now() - window.__progressStart);
+          assert.equal(await page.evaluate(() => window.__progressCard === document.querySelector('[data-rec-id="load-0"]')), true);
+          if (round > 0) samples.push(Math.round(elapsed * 10) / 10);
+        }
+        loadResults.push({ recordings: count, active: 5, milliseconds: samples });
+        assert.ok(Math.max(...samples) < 1000, `${count} tasks exceeded the one-second progress budget: ${samples}`);
+      }
+    } finally { state.recordings = original; await go(page, h.base, '/recordings'); }
+  });
   await step('明确退出而非托盘时显示收尾状态',async()=>{
     await page.getByRole('button',{name:'关闭窗口',exact:true}).click();const close=dialog('关闭 StreamCap');await visible(close);
     await close.getByRole('button',{name:/退出应用/}).click();await hidden(close);await visible(page.getByText('正在安全退出',{exact:true}));assert.equal(state.native.closing,true);
@@ -825,7 +987,7 @@ try {
   await h.shot('failure').catch(() => {});
   console.error(error.stack ?? error);
 } finally {
-  await h.report({ passed: !failure, steps, failure: failure ? String(failure.stack ?? failure) : null });
+  await h.report({ passed: !failure, steps, loadResults, failure: failure ? String(failure.stack ?? failure) : null });
   await h.close();
 }
 console.log(JSON.stringify({ passed: !failure, checks: steps.length, artifacts: h.runDir }));

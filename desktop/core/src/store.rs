@@ -3,7 +3,7 @@
 use crate::model::{detect_platform, Recording};
 use crate::paths::Workspace;
 use serde_json::Value;
-use std::io::{self, Write};
+use std::io;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 
@@ -33,8 +33,8 @@ impl Store {
         }
     }
 
-    pub(crate) fn data_dir(&self) -> &std::path::Path {
-        &self.workspace.user_data_dir
+    pub(crate) fn workspace(&self) -> &Workspace {
+        &self.workspace
     }
 
     // Shared with the scheduler; lock order is lifecycle -> config -> task data.
@@ -59,7 +59,17 @@ impl Store {
     }
 
     pub fn snack(&self, text: impl Into<String>) {
-        self.emit("snack", serde_json::json!({ "text": text.into() }));
+        self.emit(
+            "snack",
+            serde_json::json!({ "text": text.into(), "kind": "success" }),
+        );
+    }
+
+    pub fn snack_error(&self, text: impl Into<String>) {
+        self.emit(
+            "snack",
+            serde_json::json!({ "text": text.into(), "kind": "error" }),
+        );
     }
 
     /// 从 recordings.json 载入任务。
@@ -107,25 +117,7 @@ impl Store {
     fn persist_snapshot(&self, list: &[Recording]) -> io::Result<()> {
         let stored: Vec<_> = list.iter().map(Recording::to_stored).collect();
         let path = self.workspace.recordings_path();
-        let parent = path
-            .parent()
-            .ok_or_else(|| io::Error::other("任务文件缺少父目录"))?;
-        std::fs::create_dir_all(parent)?;
-        let temporary = parent.join(format!(".recordings-{}.tmp", uuid::Uuid::new_v4()));
-        let result = (|| {
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)?;
-            file.write_all(serde_json::to_string_pretty(&stored)?.as_bytes())?;
-            file.sync_all()?;
-            drop(file);
-            std::fs::rename(&temporary, &path)
-        })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(&temporary);
-        }
-        result
+        crate::config::write_atomic(&path, &serde_json::to_vec_pretty(&stored)?)
     }
 
     pub async fn persist(&self) -> io::Result<()> {
@@ -226,14 +218,6 @@ impl Store {
     }
 
     /// 在同一写锁内校验全部目标、写盘再发布，批量编辑不能部分落盘。
-    pub async fn edit_many<F>(&self, ids: &[String], mutate: F) -> io::Result<Vec<Recording>>
-    where
-        F: Fn(&mut Recording),
-    {
-        let lifecycle = self.lifecycle_guard().await;
-        self.edit_many_locked(&lifecycle, ids, mutate).await
-    }
-
     pub(crate) async fn edit_many_locked<F>(
         &self,
         _lifecycle: &tokio::sync::OwnedMutexGuard<()>,
@@ -414,8 +398,11 @@ fn to_camel(snake: &str) -> String {
 pub async fn apply_global_defaults(store: &Store, config: &crate::config::ConfigStore) {
     let mut list = store.inner.write().await;
     for rec in list.iter_mut() {
+        let previous = rec.clone();
         apply_defaults(rec, config);
-        store.emit("update", serde_json::to_value(&*rec).unwrap_or(Value::Null));
+        if *rec != previous {
+            store.emit("update", serde_json::to_value(&*rec).unwrap_or(Value::Null));
+        }
     }
 }
 

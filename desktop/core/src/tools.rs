@@ -239,6 +239,12 @@ pub struct ReleaseInfo {
     pub html_url: String,
     pub body: Option<String>,
 }
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateCheck {
+    pub release: ReleaseInfo,
+    pub current_version: String,
+}
 pub async fn check_update() -> Result<ReleaseInfo, String> {
     let client = reqwest::Client::builder()
         .user_agent("StreamCap-native-update")

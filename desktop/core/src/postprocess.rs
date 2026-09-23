@@ -23,6 +23,13 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 pub struct Postprocessor {
     inner: Arc<Inner>,
 }
+
+#[derive(Default)]
+pub(crate) struct RecordingBatch {
+    pub jobs: Vec<MediaJob>,
+    pub failures: Vec<String>,
+}
+
 #[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct RemuxOptions {
     pub delete_original: bool,
@@ -87,7 +94,7 @@ impl Postprocessor {
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
-                journal_path: store.data_dir().join("config/media_jobs.json"),
+                journal_path: store.workspace().config_dir().join("media_jobs.json"),
                 journal_write: Mutex::new(()),
                 recovery: Mutex::new(std::collections::HashMap::new()),
                 config,
@@ -104,16 +111,7 @@ impl Postprocessor {
         }
     }
     fn executable(&self) -> Option<PathBuf> {
-        let config = self.inner.config.try_read().ok()?;
-        let bundled = config.workspace().user_data_dir.join("ffmpeg/ffmpeg.exe");
-        if bundled.is_file() {
-            Some(bundled)
-        } else {
-            self.inner
-                .ffmpeg
-                .clone()
-                .or_else(|| paths::find_ffmpeg(config.workspace()))
-        }
+        paths::configured_ffmpeg(self.inner.store.workspace(), self.inner.ffmpeg.as_deref())
     }
     pub fn ready(&self) -> bool {
         self.executable()
@@ -305,17 +303,21 @@ impl Postprocessor {
         pattern: &Path,
         task_id: &str,
         options: RemuxOptions,
-    ) -> io::Result<()> {
+    ) -> io::Result<RecordingBatch> {
         let canonical_root = root.canonicalize()?;
         let targets = crate::media_safety::recording_outputs(pattern)?;
-        let mut failures = Vec::new();
-        for target in targets {
-            let relative = target
-                .strip_prefix(&canonical_root)
-                .map_err(|_| invalid("录制输出超出原始保存根目录"))?
-                .to_string_lossy()
-                .replace('\\', "/");
-            if let Err(error) = self
+        let relatives = targets
+            .iter()
+            .map(|target| {
+                target
+                    .strip_prefix(&canonical_root)
+                    .map(|path| path.to_string_lossy().replace('\\', "/"))
+                    .map_err(|_| invalid("录制输出超出原始保存根目录"))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let mut batch = RecordingBatch::default();
+        for relative in relatives {
+            match self
                 .enqueue_locked(
                     root.to_path_buf(),
                     &relative,
@@ -324,17 +326,14 @@ impl Postprocessor {
                 )
                 .await
             {
-                failures.push(error.to_string());
+                Ok(job) => batch.jobs.push(job),
+                Err(error) => batch.failures.push(error.to_string()),
             }
         }
-        if !failures.is_empty() {
-            return Err(io::Error::other(failures.join("；")));
-        }
-        Ok(())
+        Ok(batch)
     }
 
     fn persist(&self) -> io::Result<()> {
-        use std::io::Write;
         let _serial = self.inner.journal_write.lock().expect("media journal");
         let jobs = self.inner.jobs.lock().expect("media jobs lock");
         let mut recovery = self.inner.recovery.lock().expect("media recovery");
@@ -349,27 +348,7 @@ impl Postprocessor {
             })
             .collect::<Vec<_>>();
         let bytes = serde_json::to_vec(&entries)?;
-        let parent = self
-            .inner
-            .journal_path
-            .parent()
-            .ok_or_else(|| invalid("处理队列目录无效"))?;
-        std::fs::create_dir_all(parent)?;
-        let temporary = parent.join(format!(".media-jobs-{}.tmp", uuid::Uuid::new_v4()));
-        let result = (|| {
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            drop(file);
-            std::fs::rename(&temporary, &self.inner.journal_path)
-        })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(&temporary);
-        }
-        result
+        crate::config::write_atomic(&self.inner.journal_path, &bytes)
     }
     /// Restore only this queue's recorded identities. Never scan or convert historical files.
     pub async fn recover(&self) -> io::Result<usize> {
@@ -442,7 +421,10 @@ impl Postprocessor {
                 .await
             {
                 Ok(_) => count += 1,
-                Err(error) => self.inner.store.snack(format!("上次处理暂未恢复：{error}")),
+                Err(error) => self
+                    .inner
+                    .store
+                    .snack_error(format!("上次处理暂未恢复：{error}")),
             }
         }
         Ok(count)
@@ -520,7 +502,7 @@ impl Postprocessor {
                             MediaJobState::CleanupFailed,
                             format!("MP4 已完成，源 TS 未清理：{error}"),
                         );
-                        self.inner.store.snack("MP4 已生成，源 TS 清理未完成");
+                        self.inner.store.snack_error("MP4 已生成，源 TS 清理未完成");
                         return;
                     }
                     if let Some((_, job)) = self
@@ -555,7 +537,7 @@ impl Postprocessor {
                 self.transition(&id, MediaJobState::Failed, format!("{error}；原 TS 保留"));
                 self.inner
                     .store
-                    .snack(format!("转 MP4 失败：{error}；原 TS 保留"));
+                    .snack_error(format!("转 MP4 失败：{error}；原 TS 保留"));
             }
         }
     }
@@ -910,6 +892,39 @@ async fn probe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn readiness_does_not_depend_on_a_settings_write_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = crate::Workspace::from_repo_root(dir.path());
+        workspace.ensure_ready().unwrap();
+        let ffmpeg = dir.path().join("ffmpeg.exe");
+        std::fs::write(&ffmpeg, b"not executed").unwrap();
+        std::fs::write(
+            ffmpeg.with_file_name(if cfg!(windows) {
+                "ffprobe.exe"
+            } else {
+                "ffprobe"
+            }),
+            b"not executed",
+        )
+        .unwrap();
+        let config = Arc::new(tokio::sync::RwLock::new(
+            ConfigStore::load(workspace.clone()).unwrap(),
+        ));
+        let manager = Postprocessor::new(
+            Engine::new(),
+            Store::new(workspace),
+            Some(ffmpeg),
+            config.clone(),
+        );
+        assert!(manager.ready());
+        let _settings_write = config.write().await;
+        assert!(
+            manager.ready(),
+            "a busy configuration is not a missing FFmpeg installation"
+        );
+    }
     #[tokio::test(start_paused = true)]
     async fn continuing_progress_outlives_old_total_timeout_but_idle_still_expires() {
         let advanced = Arc::new(Mutex::new(tokio::time::Instant::now()));

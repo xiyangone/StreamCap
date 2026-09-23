@@ -9,6 +9,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
 const desktop = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+export const apiContracts = JSON.parse(await readFile(join(desktop, 'tests/api-contracts.json'), 'utf8'));
 const dist = join(desktop, 'dist');
 const apiOrigin = 'http://127.0.0.1:6059';
 const defaults = {
@@ -106,6 +107,21 @@ export async function createHarness(label, options = {}) {
   process.env.TEMP = temp;
   process.env.TMP = temp;
   const state = initialState(options);
+  const responseGates = { settingsRead: [], accountRead: [], accountWrite: [] };
+  const responseReleases = new Set();
+  const holdNextResponse = kind => {
+    let received, release;
+    const arrived = new Promise(resolve => { received = resolve; });
+    const wait = new Promise(resolve => { release = resolve; });
+    const gate = { received, wait, release: () => { responseReleases.delete(gate.release); release(); } };
+    responseGates[kind].push(gate);
+    responseReleases.add(gate.release);
+    return { received: arrived, release: gate.release };
+  };
+  const waitForResponseGate = async kind => {
+    const gate = responseGates[kind].shift();
+    if (gate) { gate.received(); await gate.wait; }
+  };
   const streams = new Set();
   const blocked = [];
   const runtimeErrors = [];
@@ -230,19 +246,39 @@ export async function createHarness(label, options = {}) {
       }
       if (path === '/api/settings') {
         if (method === 'PUT') {
-          Object.assign(state.userConfig, body.userConfig);
-          for (const record of state.recordings) { updateInherited(record); emit('update', record); }
-          emit('settings', {});
+          const patch = body.userConfig ?? {};
+          const changed = Object.keys(patch).filter(key => JSON.stringify(state.userConfig[key]) !== JSON.stringify(patch[key]));
+          Object.assign(state.userConfig, patch);
+          if (changed.some(key => Object.values(inheritance).some(([, setting]) => setting === key))) {
+            for (const record of state.recordings) {
+              const before = JSON.stringify(record);
+              updateInherited(record);
+              if (JSON.stringify(record) !== before) emit('update', record);
+            }
+          }
+          if (changed.length) emit('settings', { changed });
+          json(res, { ok: true, changed }); return;
         }
-        json(res, { defaultConfig: state.defaultConfig, userConfig: state.userConfig }); return;
+        const snapshot = structuredClone({ defaultConfig: state.defaultConfig, userConfig: state.userConfig });
+        await waitForResponseGate('settingsRead');
+        json(res, snapshot); return;
       }
       if (path === '/api/accounts') {
-        if(method==='PUT'){Object.assign(state.accounts[body.platform]??={},body.changes??{});json(res,{ok:true});return;}
-        json(res,{accounts:Object.fromEntries(Object.entries(state.accounts).map(([key,value])=>[key,{username:value.username??'',accountType:value.accountType??'',hasPassword:!!value.password,hasAccessToken:!!value.accessToken}]))});return;
+        if (method === 'PUT') {
+          Object.assign(state.accounts[body.platform] ??= {}, body.changes ?? {});
+          await waitForResponseGate('accountWrite');
+          json(res, { ok: true }); return;
+        }
+        const snapshot = Object.fromEntries(Object.entries(state.accounts).map(([key, value]) => [key, {
+          username: value.username ?? '', accountType: value.accountType ?? '',
+          hasPassword: !!value.password, hasAccessToken: !!value.accessToken,
+        }]));
+        await waitForResponseGate('accountRead');
+        json(res, snapshot); return;
       }
       if(path==='/api/tools/status'){json(res,{ffmpegReady:true,ffprobeReady:true,installation:state.installation});return;}
       if(path==='/api/tools/install'){state.installation={state:'complete',message:'FFmpeg 与 ffprobe 已就绪',bytes:0};json(res,{ok:true});return;}
-      if(path==='/api/tools/update'){json(res,{tag_name:'v0.1.1-fixture',html_url:'https://github.com/xiyangone/StreamCap/releases/tag/v0.1.1-fixture',body:'isolated release fixture'});return;}
+      if(path==='/api/tools/update'){json(res,apiContracts.updateCheck);return;}
       if(path==='/api/automation/shutdown'){state.quickShutdown=body.hours??null;json(res,{ok:true});return;}
       if(path==='/api/media/screenshot'){assert.ok(Buffer.from(body.pngBase64,'base64').subarray(0,8).equals(Buffer.from([137,80,78,71,13,10,26,10])));json(res,{path:'fixture-screenshot.png'});return;}
       if (path === '/api/cookies') {
@@ -371,10 +407,13 @@ export async function createHarness(label, options = {}) {
     async restoreNative() {state.native.visible=true;state.native.minimized=false;await page.evaluate(value=>window.__streamcapNativeFixtureEmit("streamcap:window-state",value),nativeStatus());},
     failNext(method, path, message = '模拟操作失败', status = 409) { state.failures.push({ method, path, message, status }); },
     delayNext(method, path, ms = 700) { state.delays.push({ method, path, ms }); },
+    holdNextSettingsRead: () => holdNextResponse('settingsRead'),
+    holdNextAccountRead: () => holdNextResponse('accountRead'),
+    holdNextAccountWrite: () => holdNextResponse('accountWrite'),
     setOffline(value) { state.offline = value; if (value) { for (const stream of streams) stream.end(); streams.clear(); } },
     async shot(name) { const file = join(runDir, name + '.png'); await page.screenshot({ path: file, animations: 'disabled' }); return file; },
     async report(value) { await writeFile(join(runDir, 'result.json'), JSON.stringify({ ...value, isolated: true, blocked, runtimeErrors, unexpectedApi: state.unexpected, requestCount: state.requests.length }, null, 2)); },
-    async close() { await browser.close(); await closeServer(); },
+    async close() { for (const release of responseReleases) release(); await browser.close(); await closeServer(); },
   };
 }
 
