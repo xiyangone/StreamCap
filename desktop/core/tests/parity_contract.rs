@@ -30,6 +30,52 @@ async fn server() -> (tempfile::TempDir, Server, String) {
 fn client() -> reqwest::Client {
     reqwest::Client::builder().no_proxy().build().unwrap()
 }
+
+#[tokio::test]
+async fn shared_frontend_fixtures_match_native_response_contracts() {
+    let fixtures: Value =
+        serde_json::from_str(include_str!("../../tests/api-contracts.json")).unwrap();
+    let (_root, server, base) = server().await;
+    server.state().config.write().await.save_account(
+        "douyin",
+        json!({"username":"fixture-account","accountType":"personal","password":"synthetic-password","accessToken":"synthetic-token"}).as_object().unwrap(),
+    ).unwrap();
+    let accounts: Value = client()
+        .get(format!("{base}/api/accounts"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(accounts, fixtures["accounts"]);
+    let release = serde_json::from_value(fixtures["updateCheck"]["release"].clone()).unwrap();
+    let response = streamcap_core::tools::UpdateCheck {
+        release,
+        current_version: env!("CARGO_PKG_VERSION").into(),
+    };
+    assert_eq!(
+        serde_json::to_value(response).unwrap(),
+        fixtures["updateCheck"]
+    );
+    let mut events = server.state().store.subscribe();
+    server
+        .state()
+        .store
+        .snack_error(fixtures["backgroundError"]["text"].as_str().unwrap());
+    let error = events.recv().await.unwrap();
+    assert_eq!(error.topic, "snack");
+    assert_eq!(error.payload, fixtures["backgroundError"]);
+    server
+        .state()
+        .store
+        .snack(fixtures["backgroundSuccess"]["text"].as_str().unwrap());
+    assert_eq!(
+        events.recv().await.unwrap().payload,
+        fixtures["backgroundSuccess"]
+    );
+    server.shutdown().await.unwrap();
+}
 #[tokio::test]
 async fn account_updates_are_redacted_targeted_and_serialized() {
     let (root, server, base) = server().await;

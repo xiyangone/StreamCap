@@ -19,4 +19,12 @@ Push-Location $desktop
 try {
     if($Serve){& trunk serve --port 1420 --locked --offline}else{& trunk build --release --locked --offline}
     if($LASTEXITCODE -ne 0){throw 'Frontend build failed.'}
+    if(-not $Serve){
+        $required=@('tauri-api/core.js','tauri-api/event.js','tauri-api/external/tslib/tslib.es6.js','tauri-api/LICENSE_MIT','tauri-api/LICENSE_APACHE-2.0','media/mpegts.js','media/mpegts.js.LICENSE.txt','media/LICENSE')
+        $dist=Join-Path $desktop 'dist'
+        foreach($asset in $required){if(-not(Test-Path -LiteralPath (Join-Path $dist $asset) -PathType Leaf)){throw "Missing runtime asset: $asset"}}
+        $actual=@(foreach($directory in @('tauri-api','media')){Get-ChildItem -LiteralPath (Join-Path $dist $directory) -File -Recurse | ForEach-Object {[IO.Path]::GetRelativePath($dist,$_.FullName).Replace('\','/')}})
+        if(Compare-Object ($required|Sort-Object) ($actual|Sort-Object)){throw 'Unexpected runtime assets: keep only the declared modules and licenses.'}
+        Write-Output "Verified $($actual.Count) third-party runtime and license assets."
+    }
 } finally {Pop-Location;$env:PATH=$previousPath;$env:NO_COLOR=$previousColor}

@@ -323,7 +323,7 @@ async fn create_window(app: &AppHandle, session: &Session, smoke: bool) -> Resul
                     .state::<Verification>()
                     .core
                     .store
-                    .snack(error);
+                    .snack_error(error);
             }
         }
         "kuaishou-cancel" => cancel_window(window.app_handle()),
@@ -441,7 +441,7 @@ pub fn begin_complete(app: &AppHandle) -> Result<(), String> {
                     current.busy = false;
                     drop(state);
                     log::info!("快手页面手动检查未完成: {error}");
-                    owner.core.store.snack(error.clone());
+                    owner.core.store.snack_error(error.clone());
                     if let Some(window) = handle.get_webview_window(LABEL) {
                         let _ = window.set_title(&format!("快手页面检查 · {error}"));
                     }
@@ -564,7 +564,7 @@ fn schedule_automatic_check(app: AppHandle, label: String) {
                     .state::<Verification>()
                     .core
                     .store
-                    .snack("快手页面暂不可读，自动检查已停止；可在任务中手动重试");
+                    .snack_error("快手页面暂不可读，自动检查已停止；可在任务中手动重试");
                 handle
                     .state::<Verification>()
                     .core

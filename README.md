@@ -37,7 +37,7 @@ TS 与兼容格式支持按时间跳播，录制过程中也能回看已录部�
 ## 自动化与网络
 
 - 定时任务支持如 08:00,23:00 与对应小时数 2,3，可跨午夜；时间窗开始触发一次受限检测，结束时停止该任务。
-- 录后脚本必须是 JSON 参数数组，首项为绝对 EXE 路径，参数可用 {file}、{room}。不隐式拼接 shell；输出媒体仍受文件保护，脚本失败会明确提示。Windows Job Object 负责清理脚本子进程树。
+- 录后脚本必须是 JSON 参数数组，首项为绝对 EXE 路径，参数可用 {file}、{room}。仅处理本轮源文件或本轮转换成功的 MP4，不使用同名历史转换结果。不隐式拼接 shell；输出媒体在脚本结束前仍受文件保护，脚本失败会明确提示。Windows Job Object 负责清理脚本子进程树。
 - 关机仅在应用运行时生效。到期会显示 60 秒可取消提示，收尾失败不继续提交系统关机。请先保存其他程序中的工作。
 - FFmpeg 录制代理需使用 http://；SOCKS 可用于解析和 FLV 直下。不支持的组合明确报错，不偷偷直连。
 - 快捷键：Ctrl+1 至 Ctrl+5 切换页面，Ctrl+, 打开设置。语言切换仅重载界面，不停止录制。
@@ -52,6 +52,7 @@ rustup target add wasm32-unknown-unknown
 npm ci --cache .\build\npm-cache
 cargo install trunk --version 0.21.14 --locked --root .\target\tools
 cargo install wasm-bindgen-cli --version 0.2.128 --locked --root .\target\tools
+cargo install cargo-audit --version 0.22.2 --locked --root .\target\tools
 cargo fetch --manifest-path Cargo.toml --locked
 cargo fetch --manifest-path core/Cargo.toml --locked
 cargo fetch --manifest-path src-tauri/Cargo.toml --locked
@@ -62,6 +63,7 @@ npm run tauri:dev
 
 ```powershell
 # 完整验证并生成 noFF EXE（首次测试须先安装 Playwright Chromium）
+$env:PLAYWRIGHT_BROWSERS_PATH = Join-Path (Get-Location) 'build/playwright'
 npx playwright install chromium
 npm run verify
 
@@ -69,7 +71,7 @@ npm run verify
 pwsh -NoProfile -File .\scripts\build-release.ps1
 ```
 
-产物：desktop/src-tauri/target/native-noFF-*/StreamCap.exe 和 StreamCap.exe.sha256。不生成安装器，不打包用户配置、Cookie 或下载文件。详细说明见 [打包与验收](docs/packaging.md)。
+产物：desktop/src-tauri/target/native-noFF-*/StreamCap.exe 和 StreamCap.exe.sha256。不生成安装器，不打包用户配置、Cookie 或下载文件。验证包含三份 Cargo.lock 与 npm 的联网依赖审计，审计失败会阻断后续构建；报告保留已知漏洞与维护状态警告，不把两者混为一谈。CI 在同一个 Native validation 工作流中处理 push、PR 与手动运行，仅手动运行上传验证后的 EXE。详细说明见 [打包与验收](docs/packaging.md)。
 
 ## 数据与安全
 

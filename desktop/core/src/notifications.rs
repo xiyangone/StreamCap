@@ -224,7 +224,7 @@ impl Notifications {
         }
         let plan = deliveries(&config, &title, &content);
         for error in plan.errors {
-            self.store.snack(error);
+            self.store.snack_error(error);
         }
         let plan = plan.deliveries;
         let email = config
@@ -236,7 +236,7 @@ impl Notifications {
             return;
         }
         let Ok(permit) = self.slots.clone().try_acquire_owned() else {
-            self.store.snack("通知队列已满，本次消息未发送");
+            self.store.snack_error("通知队列已满，本次消息未发送");
             return;
         };
         let manager = self.clone();
@@ -275,7 +275,7 @@ impl Notifications {
                     }
                     .await;
                     if result.is_err() {
-                        manager.store.snack(format!(
+                        manager.store.snack_error(format!(
                             "{} 通知发送失败，请检查配置和网络",
                             delivery.channel
                         ));
@@ -283,7 +283,9 @@ impl Notifications {
                 }
                 if let Some(email) = email {
                     if send_email(email, &title, &content).await.is_err() {
-                        manager.store.snack("邮件通知发送失败，请检查 SMTP 配置");
+                        manager
+                            .store
+                            .snack_error("邮件通知发送失败，请检查 SMTP 配置");
                     }
                 }
             };

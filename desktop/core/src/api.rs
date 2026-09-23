@@ -284,6 +284,10 @@ async fn delete_one(
             "recording not found: {rec_id}"
         )));
     }
+    state
+        .scheduler
+        .forget_recordings(std::slice::from_ref(&rec_id))
+        .await;
     state.store.snack("已删除录制任务");
     Ok(Json(json!({ "ok": true })))
 }
@@ -303,6 +307,7 @@ async fn delete_many(
         .remove(&payload.rec_ids)
         .await
         .map_err(ApiError::storage)?;
+    state.scheduler.forget_recordings(&payload.rec_ids).await;
     Ok(Json(json!({ "ok": true, "removed": removed })))
 }
 
@@ -795,13 +800,20 @@ async fn update_settings(
             })?
     };
 
-    let config = state.config.read().await;
-    crate::store::apply_global_defaults(&state.store, &config).await;
-    drop(config);
+    if changed.iter().any(|key| {
+        crate::model::INHERITABLE_FIELDS
+            .iter()
+            .any(|(_, setting)| key == setting)
+    }) {
+        let config = state.config.read().await;
+        crate::store::apply_global_defaults(&state.store, &config).await;
+    }
     if changed.iter().any(|key| key == "loop_time_seconds") {
         state.scheduler.refresh_interval();
     }
-    state.store.emit("settings", json!({ "changed": changed }));
+    if !changed.is_empty() {
+        state.store.emit("settings", json!({ "changed": changed }));
+    }
     state.store.snack("设置已保存");
     Ok(Json(json!({ "ok": true, "changed": changed })))
 }
@@ -983,13 +995,14 @@ async fn install_tools(State(state): State<ApiState>) -> ApiResult {
     state.tools.install().map_err(ApiError::bad_request)?;
     Ok(Json(json!({"ok":true})))
 }
-async fn check_update() -> ApiResult {
+async fn check_update() -> Result<Json<crate::tools::UpdateCheck>, ApiError> {
     let release = crate::tools::check_update()
         .await
         .map_err(ApiError::bad_request)?;
-    Ok(Json(
-        json!({"release":release,"currentVersion":env!("CARGO_PKG_VERSION")}),
-    ))
+    Ok(Json(crate::tools::UpdateCheck {
+        release,
+        current_version: env!("CARGO_PKG_VERSION").into(),
+    }))
 }
 async fn account_summaries(State(state): State<ApiState>) -> ApiResult {
     let value = state

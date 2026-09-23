@@ -26,13 +26,8 @@ pub fn RecordingCard(
     let state = gateway::app_state();
     let initial = StoredValue::new(recording);
     let record = Memo::new(move |_| {
-        state
-            .recordings
-            .with(|list| {
-                list.iter()
-                    .find(|r| r.rec_id == initial.with_value(|v| v.rec_id.clone()))
-                    .cloned()
-            })
+        initial
+            .with_value(|value| state.recording(&value.rec_id))
             .unwrap_or_else(|| initial.get_value())
     });
     let busy = RwSignal::new(false);

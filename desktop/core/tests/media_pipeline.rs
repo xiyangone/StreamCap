@@ -1409,3 +1409,410 @@ async fn media_browser_copy_preview_has_correct_frames_and_bounded_seek_latency(
     );
     assert_eq!(state.preview.active(), 0);
 }
+
+#[tokio::test]
+#[ignore = "requires STREAMCAP_TEST_FFMPEG; CONNECT is intercepted by a local synthetic proxy"]
+async fn https_live_preview_reaches_the_configured_http_proxy() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_address = listener.local_addr().unwrap();
+    let proxy = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut bytes = [0; 4096];
+        let count = socket.read(&mut bytes).await.unwrap();
+        socket
+            .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        String::from_utf8_lossy(&bytes[..count]).into_owned()
+    });
+    let preview = streamcap_core::preview::Preview::new(
+        streamcap_core::Engine::new(),
+        tokio_util::sync::CancellationToken::new(),
+    );
+    let response = preview
+        .live(
+            ffmpeg(),
+            streamcap_core::preview::LiveInput {
+                url: "https://media.example.invalid/fixture.ts".into(),
+                headers: None,
+                proxy: Some(format!("http://{proxy_address}")),
+            },
+        )
+        .await
+        .unwrap();
+    let body = tokio::spawn(axum::body::to_bytes(response.into_body(), 65536));
+    let request = tokio::time::timeout(Duration::from_secs(5), proxy)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        request.starts_with("CONNECT media.example.invalid:443 "),
+        "{request}"
+    );
+    let _ = tokio::time::timeout(Duration::from_secs(5), body)
+        .await
+        .unwrap()
+        .unwrap();
+    preview.shutdown().await;
+    assert_eq!(preview.active(), 0);
+}
+
+#[tokio::test]
+#[ignore = "requires explicit STREAMCAP_TEST_FFMPEG and STREAMCAP_TEST_PWSH; only synthesized media and scripts are used"]
+async fn recording_script_protection_survives_remux_and_ends_on_completion_or_cancel() {
+    let shell =
+        std::env::var("STREAMCAP_TEST_PWSH").expect("explicit synthetic script interpreter");
+    for (convert, delete_source, segmented, cancel) in [
+        (false, false, false, false),
+        (true, true, false, false),
+        (true, false, true, true),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path(), convert).await;
+        let marker = root.path().join("script-input.txt");
+        let release = root.path().join("script-release");
+        let script = root.path().join("owned-fixture.ps1");
+        std::fs::write(
+            &script,
+            r#"param([string]$Media,[string]$Marker,[string]$Release)
+[IO.File]::WriteAllText($Marker,$Media)
+while(-not [IO.File]::Exists($Release)){Start-Sleep -Milliseconds 25}
+"#,
+        )
+        .unwrap();
+        let argv = json!([
+            shell,
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            script,
+            "{file}",
+            marker,
+            release
+        ]);
+        state.config.write().await.update_user_config(
+            json!({"execute_custom_script":true,"custom_script_command":argv.to_string(),"delete_original":delete_source})
+                .as_object().unwrap().clone(),
+        ).unwrap();
+        let server = Server::start(
+            state.clone(),
+            ServerOptions {
+                port: 0,
+                monitoring: false,
+            },
+        )
+        .await
+        .unwrap();
+        let stream = source(sample_ts("3.2").await).await;
+        add(&state, stream.url.clone(), segmented).await;
+        state
+            .scheduler
+            .start_recording(
+                "media".into(),
+                &streamcap_core::resolver::StreamInfo {
+                    is_live: true,
+                    record_url: stream.url.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let process = state.engine.process("media").await.unwrap();
+        if !convert {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !process
+                    .output_path
+                    .metadata()
+                    .is_ok_and(|metadata| metadata.len() > 1880)
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(state.scheduler.stop_recording("media").await);
+        }
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let guard = state.engine.filesystem_guard().await;
+                assert!(
+                    state.engine.protects_path(&process.output_path).await,
+                    "no gap between recorder, remux and script"
+                );
+                drop(guard);
+                if marker.is_file() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let input = PathBuf::from(std::fs::read_to_string(&marker).unwrap());
+        assert_eq!(
+            input.extension().unwrap(),
+            if convert { "mp4" } else { "ts" }
+        );
+        let before = std::fs::read(&input).unwrap();
+        assert!(state.engine.protects_path(&input).await);
+        assert!(state.engine.protects_path(input.parent().unwrap()).await);
+        assert!(
+            !state
+                .engine
+                .protects_path(&input.with_file_name("unrelated.ts"))
+                .await
+        );
+        let relative = input
+            .strip_prefix(root.path().join("downloads").canonicalize().unwrap())
+            .unwrap()
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .delete(format!("http://{}/api/storage", server.address()))
+            .query(&[("path", relative)])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 409);
+        if cancel {
+            tokio::time::timeout(Duration::from_secs(10), server.shutdown())
+                .await
+                .unwrap()
+                .unwrap();
+        } else {
+            std::fs::write(&release, b"release only our synthetic script").unwrap();
+            tokio::time::timeout(Duration::from_secs(8), async {
+                while state.engine.protects_path(&process.output_path).await {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
+            server.shutdown().await.unwrap();
+        }
+        assert!(!state.engine.protects_path(&input).await);
+        assert_eq!(std::fs::read(&input).unwrap(), before);
+        if delete_source {
+            assert!(!process.output_path.exists());
+        }
+    }
+}
+
+async fn script_input_marker(state: &api::ApiState, root: &Path, convert: bool) -> PathBuf {
+    let marker = root.join("script-inputs.txt");
+    let script = root.join("record-input.ps1");
+    std::fs::write(
+        &script,
+        "param([string]$Media,[string]$Marker)\n[IO.File]::AppendAllText($Marker,$Media+[Environment]::NewLine)\n",
+    ).unwrap();
+    let argv = json!([
+        std::env::var("STREAMCAP_TEST_PWSH").unwrap(),
+        "-NoProfile",
+        "-NonInteractive",
+        "-File",
+        script,
+        "{file}",
+        marker
+    ]);
+    state.config.write().await.update_user_config(
+        json!({"execute_custom_script":true,"custom_script_command":argv.to_string(),"convert_to_mp4":convert,"delete_original":true})
+            .as_object().unwrap().clone(),
+    ).unwrap();
+    marker
+}
+
+async fn wait_script_inputs(
+    state: &api::ApiState,
+    downloads: &Path,
+    marker: &Path,
+) -> Vec<PathBuf> {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if marker.is_file() && !state.engine.protects_path(downloads).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    std::fs::read_to_string(marker)
+        .unwrap()
+        .lines()
+        .map(PathBuf::from)
+        .collect()
+}
+
+#[tokio::test]
+#[ignore = "requires explicit STREAMCAP_TEST_FFMPEG and STREAMCAP_TEST_PWSH; repeated recordings use only synthetic media"]
+async fn recording_scripts_ignore_historical_jobs_when_filenames_are_reused() {
+    for second_conversion in [true, false] {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path(), true).await;
+        state
+            .config
+            .write()
+            .await
+            .update_user_config(
+                json!({"custom_filename_template":"fixed-name","delete_original":true})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )
+            .unwrap();
+        let server = Server::start(
+            state.clone(),
+            ServerOptions {
+                port: 0,
+                monitoring: false,
+            },
+        )
+        .await
+        .unwrap();
+        let stream = source(sample_ts("1.2").await).await;
+        add(&state, stream.url.clone(), false).await;
+        let info = streamcap_core::resolver::StreamInfo {
+            is_live: true,
+            record_url: stream.url.clone(),
+            ..Default::default()
+        };
+        state
+            .scheduler
+            .start_recording("media".into(), &info)
+            .await
+            .unwrap();
+        let first_pattern = state
+            .engine
+            .process("media")
+            .await
+            .unwrap()
+            .output_path
+            .clone();
+        wait_jobs(&state).await;
+        let downloads = root.path().join("downloads").canonicalize().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.engine.protects_path(&downloads).await {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let first_jobs = state.scheduler.postprocess.jobs();
+        assert!(first_jobs
+            .iter()
+            .all(|job| job.state == MediaJobState::Complete));
+        assert!(first_jobs
+            .iter()
+            .all(|job| !downloads.join(&job.source).exists()));
+        let retained_output = downloads.join(&first_jobs[0].output);
+        let retained_bytes = std::fs::read(&retained_output).unwrap();
+        let marker = script_input_marker(&state, root.path(), second_conversion).await;
+        state
+            .scheduler
+            .start_recording("media".into(), &info)
+            .await
+            .unwrap();
+        let current_pattern = state
+            .engine
+            .process("media")
+            .await
+            .unwrap()
+            .output_path
+            .clone();
+        assert_eq!(
+            current_pattern, first_pattern,
+            "the cleared TS name must be reused"
+        );
+        let mut actual = wait_script_inputs(&state, &downloads, &marker).await;
+        let mut expected: Vec<_> = first_jobs
+            .iter()
+            .map(|job| {
+                let source = downloads.join(&job.source);
+                if source.is_file() {
+                    source
+                } else {
+                    downloads.join(&job.output)
+                }
+            })
+            .collect();
+        let current_jobs = state.scheduler.postprocess.jobs();
+        let old_output_unchanged = std::fs::read(&retained_output).unwrap() == retained_bytes;
+        server.shutdown().await.unwrap();
+        actual.sort();
+        expected.sort();
+        assert_eq!(
+            actual, expected,
+            "scripts must use this recording's TS or newly converted MP4"
+        );
+        assert!(
+            !actual.contains(&retained_output),
+            "historical MP4 must not be processed again"
+        );
+        assert!(old_output_unchanged);
+        assert_eq!(current_jobs.len(), first_jobs.len());
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires explicit STREAMCAP_TEST_FFMPEG and STREAMCAP_TEST_PWSH; conflict uses only a synthetic output"]
+async fn recording_script_preserves_partial_segment_conversion_results() {
+    let root = tempfile::tempdir().unwrap();
+    let state = state(root.path(), true).await;
+    let marker = script_input_marker(&state, root.path(), true).await;
+    let server = Server::start(
+        state.clone(),
+        ServerOptions {
+            port: 0,
+            monitoring: false,
+        },
+    )
+    .await
+    .unwrap();
+    let stream = source(sample_ts("3.2").await).await;
+    add(&state, stream.url.clone(), true).await;
+    state
+        .scheduler
+        .start_recording(
+            "media".into(),
+            &streamcap_core::resolver::StreamInfo {
+                is_live: true,
+                record_url: stream.url.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let pattern = state
+        .engine
+        .process("media")
+        .await
+        .unwrap()
+        .output_path
+        .clone();
+    let first_source = PathBuf::from(pattern.to_string_lossy().replace("%03d", "000"));
+    let second_source = PathBuf::from(pattern.to_string_lossy().replace("%03d", "001"));
+    let conflict = first_source.with_extension("mp4");
+    let retained = b"synthetic existing output; never overwrite or pass to the script";
+    std::fs::write(&conflict, retained).unwrap();
+    let downloads = root.path().join("downloads").canonicalize().unwrap();
+    let mut actual = wait_script_inputs(&state, &downloads, &marker).await;
+    let jobs = state.scheduler.postprocess.jobs();
+    let conflict_unchanged = std::fs::read(&conflict).unwrap() == retained;
+    let first_preserved = first_source.is_file();
+    let second_removed = !second_source.exists();
+    server.shutdown().await.unwrap();
+    let mut expected = vec![first_source, second_source.with_extension("mp4")];
+    actual.sort();
+    expected.sort();
+    assert_eq!(
+        actual, expected,
+        "successful jobs must survive a sibling admission failure"
+    );
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].state, MediaJobState::Complete);
+    assert!(conflict_unchanged && first_preserved && second_removed);
+}

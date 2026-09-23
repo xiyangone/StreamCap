@@ -18,10 +18,59 @@ enum Tab {
     Automation,
 }
 
-fn merged(payload: gateway::SettingsPayload) -> Map<String, Value> {
-    let mut values = payload.default_config;
-    values.extend(payload.user_config);
-    values
+fn acknowledge_saved(pending: &mut Map<String, Value>, saved: &Map<String, Value>) {
+    pending.retain(|key, value| saved.get(key) != Some(value));
+}
+
+fn account_fields(
+    summary: &gateway::AccountSummary,
+    pending: &Map<String, Value>,
+) -> Map<String, Value> {
+    let mut fields = Map::from_iter([
+        ("username".into(), Value::String(summary.username.clone())),
+        (
+            "accountType".into(),
+            Value::String(summary.account_type.clone()),
+        ),
+    ]);
+    fields.extend(pending.clone());
+    fields
+}
+
+#[cfg(test)]
+mod draft_tests {
+    use super::*;
+
+    #[test]
+    fn acknowledging_a_snapshot_keeps_newer_and_unrelated_edits() {
+        let mut pending =
+            json!({"username":"newer","accountType":"personal","password":"new secret"})
+                .as_object()
+                .unwrap()
+                .clone();
+        let saved = json!({"username":"older","accountType":"personal","password":"old secret"});
+        acknowledge_saved(&mut pending, saved.as_object().unwrap());
+        assert_eq!(
+            Value::Object(pending),
+            json!({"username":"newer","password":"new secret"})
+        );
+    }
+
+    #[test]
+    fn account_reads_merge_with_the_current_unsaved_draft() {
+        let summary = gateway::AccountSummary {
+            username: "stored".into(),
+            account_type: "personal".into(),
+            has_password: true,
+            has_access_token: true,
+        };
+        let pending = json!({"username":"typed while loading","accessToken":"new secret"});
+        let fields = account_fields(&summary, pending.as_object().unwrap());
+        assert_eq!(fields["username"], "typed while loading");
+        assert_eq!(fields["accountType"], "personal");
+        assert_eq!(fields["accessToken"], "new secret");
+        assert!(!fields.contains_key("password"));
+    }
 }
 
 #[component]
@@ -30,10 +79,10 @@ pub fn SettingsView() -> impl IntoView {
     let tab = RwSignal::new(Tab::Recording);
     let draft = RwSignal::new(Map::<String, Value>::new());
     let changes = RwSignal::new(Map::<String, Value>::new());
-    let loading = RwSignal::new(true);
+    let loading =
+        Memo::new(move |_| state.settings_loading.get() && state.settings.with(Map::is_empty));
     let busy = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
-    let reload = RwSignal::new(0_u32);
     let cookies = RwSignal::new(Map::<String, Value>::new());
     let cookie_changes = RwSignal::new(Map::<String, Value>::new());
     let cookies_loaded = RwSignal::new(false);
@@ -49,30 +98,20 @@ pub fn SettingsView() -> impl IntoView {
     let desktop = desktop::state();
 
     Effect::new(move |_| {
-        let _ = state.settings_version.get();
-        let _ = reload.get();
-        if !changes.get_untracked().is_empty() {
-            return;
-        }
-        loading.set(true);
+        let mut values = state.settings.get();
+        values.extend(changes.get());
+        draft.set(values);
+    });
+    leptos::task::spawn_local(async move {
+        let _ = gateway::refresh_settings(state, false).await;
+    });
+    let settings_error = move || error.get().or_else(|| state.settings_error.get());
+    let reload_settings = move |_| {
         error.set(None);
         leptos::task::spawn_local(async move {
-            match gateway::fetch_settings().await {
-                Ok(payload) => {
-                    if changes
-                        .try_get_untracked()
-                        .is_some_and(|patch| patch.is_empty())
-                    {
-                        let _ = draft.try_set(merged(payload));
-                    }
-                }
-                Err(message) => {
-                    let _ = error.try_set(Some(message));
-                }
-            }
-            let _ = loading.try_set(false);
+            let _ = gateway::refresh_settings(state, true).await;
         });
-    });
+    };
     Effect::new(move |_| {
         if tab.get() != Tab::Accounts
             || cookies_loaded.get_untracked()
@@ -144,21 +183,13 @@ pub fn SettingsView() -> impl IntoView {
         leptos::task::spawn_local(async move {
             match gateway::save_settings(Value::Object(patch.clone())).await {
                 Ok(()) => {
-                    let _ = changes.try_update(|pending| {
-                        for (key, value) in &patch {
-                            if pending.get(key) == Some(value) {
-                                pending.remove(key);
-                            }
-                        }
-                    });
+                    let _ = changes.try_update(|pending| acknowledge_saved(pending, &patch));
                     state.notify(if interval_changed {
                         t("设置已保存；已按新的检测间隔重新计时")
                     } else {
                         t("偏好设置已保存")
                     });
-                    if let Ok(payload) = gateway::fetch_settings().await {
-                        state.apply_settings(payload);
-                    }
+                    let _ = gateway::refresh_settings(state, true).await;
                 }
                 Err(message) => {
                     let _ = error.try_set(Some(message));
@@ -180,13 +211,7 @@ pub fn SettingsView() -> impl IntoView {
         leptos::task::spawn_local(async move {
             match gateway::save_cookies(Value::Object(patch.clone())).await {
                 Ok(()) => {
-                    let _ = cookie_changes.try_update(|pending| {
-                        for (key, value) in &patch {
-                            if pending.get(key) == Some(value) {
-                                pending.remove(key);
-                            }
-                        }
-                    });
+                    let _ = cookie_changes.try_update(|pending| acknowledge_saved(pending, &patch));
                     state.notify(t("平台登录信息已保存到此设备"));
                 }
                 Err(message) => {
@@ -204,9 +229,7 @@ pub fn SettingsView() -> impl IntoView {
         leptos::task::spawn_local(async move {
             match gateway::save_settings(json!({"close_action":choice})).await {
                 Ok(()) => {
-                    if let Ok(settings) = gateway::fetch_settings().await {
-                        state.apply_settings(settings);
-                    }
+                    let _ = gateway::refresh_settings(state, true).await;
                     state.notify(t("关闭窗口行为已保存"));
                 }
                 Err(error) => state.fail(error),
@@ -287,7 +310,7 @@ pub fn SettingsView() -> impl IntoView {
                     <div class="settings-local-note"><Icon name="shield" size=18 /><p>{t("设置和登录信息仅保存在此设备。")}</p></div>
                 </nav>
                 <div class="settings-content">
-                    <Show when=move || error.get().is_some()><div class="inline-error" role="alert"><Icon name="alert" size=18 /><p>{move || error.get().unwrap_or_default()}</p><Show when=move || changes.get().is_empty()><button class="button secondary small" on:click=move |_| reload.update(|v| *v = v.wrapping_add(1))>{t("重试")}</button></Show></div></Show>
+                    <Show when=move || settings_error().is_some()><div class="inline-error" role="alert"><Icon name="alert" size=18 /><p>{move || settings_error().unwrap_or_default()}</p><Show when=move || changes.get().is_empty()><button class="button secondary small" on:click=reload_settings>{t("重试")}</button></Show></div></Show>
                     <Show when=move || tab.get() == Tab::Recording || tab.get() == Tab::Network || tab.get() == Tab::Automation>
                         <Show when=move || !loading.get() && !draft.get().is_empty() fallback=move || view! { <div class="loading-state glass"><span class="spinner" />{t("正在读取设置…")}</div> }>
                             <fieldset disabled=move || busy.get()>
@@ -341,7 +364,7 @@ pub fn SettingsView() -> impl IntoView {
                                   </SettingsGroup>
                                 </Show>
                             </fieldset>
-                            <Show when=move || !changes.get().is_empty()><div class="settings-savebar glass"><span><i class="unsaved-dot" />{t("有未保存的修改")}</span><button class="button secondary small" disabled=move || busy.get() on:click=move |_| { changes.set(Map::new()); reload.update(|v| *v = v.wrapping_add(1)); }>{t("放弃修改")}</button><button class="button primary small" disabled=move || busy.get() on:click=save>{t("保存修改")}</button></div></Show>
+                            <Show when=move || !changes.get().is_empty()><div class="settings-savebar glass"><span><i class="unsaved-dot" />{t("有未保存的修改")}</span><button class="button secondary small" disabled=move || busy.get() on:click=move |_| { changes.set(Map::new()); error.set(None); }>{t("放弃修改")}</button><button class="button primary small" disabled=move || busy.get() on:click=save>{t("保存修改")}</button></div></Show>
                         </Show>
                     </Show>
                     <Show when=move || tab.get() == Tab::Appearance>
@@ -475,6 +498,23 @@ fn AccountEditor(platform: RwSignal<String>) -> impl IntoView {
     let revision = RwSignal::new(0_u32);
     let has_password = RwSignal::new(false);
     let has_token = RwSignal::new(false);
+    let load_account = Callback::new(move |(key, generation): (String, u32)| {
+        leptos::task::spawn_local(async move {
+            let result = gateway::accounts().await;
+            if revision.try_get_untracked() != Some(generation) {
+                return;
+            }
+            match result {
+                Ok(values) => {
+                    let summary = values.get(&key).cloned().unwrap_or_default();
+                    draft.set(account_fields(&summary, &dirty.get_untracked()));
+                    has_password.set(summary.has_password);
+                    has_token.set(summary.has_access_token);
+                }
+                Err(error) => state.fail(error),
+            }
+        });
+    });
     Effect::new(move |_| {
         let key = platform.get();
         let generation = revision.get_untracked().wrapping_add(1);
@@ -483,37 +523,38 @@ fn AccountEditor(platform: RwSignal<String>) -> impl IntoView {
         dirty.set(Map::new());
         has_password.set(false);
         has_token.set(false);
-        leptos::task::spawn_local(async move {
-            match gateway::accounts().await {
-                Ok(values) => {
-                    if revision.try_get_untracked() != Some(generation) {
-                        return;
-                    }
-                    let value = &values[&key];
-                    let mut fields = Map::new();
-                    fields.insert("username".into(), value["username"].clone());
-                    fields.insert("accountType".into(), value["accountType"].clone());
-                    draft.set(fields);
-                    has_password.set(value["hasPassword"].as_bool().unwrap_or(false));
-                    has_token.set(value["hasAccessToken"].as_bool().unwrap_or(false));
-                }
-                Err(error) => state.fail(error),
-            }
-        });
+        load_account.run((key, generation));
     });
     let save = move |_| {
+        if busy.get_untracked() {
+            return;
+        }
         let key = platform.get_untracked();
-        let generation = revision.get_untracked();
         let patch = dirty.get_untracked();
         if patch.is_empty() {
             return;
         }
+        // A read started before this write must not publish an older account summary.
+        let generation = revision.get_untracked().wrapping_add(1);
+        revision.set(generation);
         busy.set(true);
         leptos::task::spawn_local(async move {
-            match gateway::save_account(&key, Value::Object(patch)).await {
+            match gateway::save_account(&key, Value::Object(patch.clone())).await {
                 Ok(()) => {
                     if revision.try_get_untracked() == Some(generation) {
-                        let _ = dirty.try_set(Map::new());
+                        let _ = dirty.try_update(|pending| acknowledge_saved(pending, &patch));
+                        // Keep newer edits, but never leave an acknowledged secret in the field.
+                        draft.update(|fields| {
+                            for key in ["password", "accessToken"] {
+                                if patch
+                                    .get(key)
+                                    .is_some_and(|value| fields.get(key) == Some(value))
+                                {
+                                    fields.remove(key);
+                                }
+                            }
+                        });
+                        load_account.run((key, generation));
                     }
                     state.notify(t("平台账号配置已保存"));
                 }

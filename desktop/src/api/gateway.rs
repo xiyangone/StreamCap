@@ -3,7 +3,7 @@ use gloo_net::http::{Request, Response};
 use leptos::prelude::*;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, rc::Rc};
 use wasm_bindgen::prelude::*;
 
 /// The native shell supplies the actual bound address before WASM starts.
@@ -332,6 +332,26 @@ pub struct SettingsPayload {
     pub user_config: Map<String, Value>,
     pub default_config: Map<String, Value>,
 }
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct ReleaseInfo {
+    pub tag_name: String,
+    pub html_url: String,
+    pub body: Option<String>,
+}
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateCheck {
+    pub release: ReleaseInfo,
+    pub current_version: String,
+}
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountSummary {
+    pub username: String,
+    pub account_type: String,
+    pub has_password: bool,
+    pub has_access_token: bool,
+}
 #[derive(Debug, Clone, Deserialize)]
 pub struct RecordingFile {
     pub name: String,
@@ -369,7 +389,8 @@ impl QrSnapshot {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub enum NoticeKind {
     Success,
     Error,
@@ -378,6 +399,43 @@ pub enum NoticeKind {
 pub struct Notice {
     pub message: String,
     pub kind: NoticeKind,
+}
+#[derive(Debug, Deserialize)]
+struct BackendNotice {
+    text: String,
+    kind: NoticeKind,
+}
+
+#[cfg(test)]
+mod response_contract_tests {
+    use super::*;
+
+    #[test]
+    fn native_update_accounts_and_notices_use_the_shared_contract() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../tests/api-contracts.json")).unwrap();
+        let update: UpdateCheck = serde_json::from_value(fixture["updateCheck"].clone()).unwrap();
+        assert_eq!(update.release.tag_name, "v0.1.1-fixture");
+        assert_eq!(update.current_version, "0.1.0");
+        assert!(
+            serde_json::from_value::<UpdateCheck>(fixture["updateCheck"]["release"].clone())
+                .is_err()
+        );
+        let accounts: HashMap<String, AccountSummary> =
+            serde_json::from_value(fixture["accounts"].clone()).unwrap();
+        assert_eq!(accounts["douyin"].username, "fixture-account");
+        assert!(accounts["douyin"].has_password && accounts["douyin"].has_access_token);
+        assert!(serde_json::from_value::<HashMap<String, AccountSummary>>(
+            json!({"accounts":fixture["accounts"]})
+        )
+        .is_err());
+        let error: BackendNotice =
+            serde_json::from_value(fixture["backgroundError"].clone()).unwrap();
+        let success: BackendNotice =
+            serde_json::from_value(fixture["backgroundSuccess"].clone()).unwrap();
+        assert_eq!(error.kind, NoticeKind::Error);
+        assert_eq!(success.kind, NoticeKind::Success);
+    }
 }
 
 /// Keep only the latest delta for each entity while a snapshot is in flight.
@@ -575,11 +633,17 @@ mod snapshot_tests {
 pub struct AppState {
     pub status: RwSignal<GatewayStatus>,
     pub recordings: RwSignal<Vec<Recording>>,
+    pub recording_list: Memo<Vec<RecordingListEntry>>,
+    recordings_index: Memo<HashMap<String, usize>>,
     pub media_jobs: RwSignal<Vec<MediaJob>>,
     recordings_snapshot: StoredValue<SnapshotMerge<Recording>>,
     jobs_snapshot: StoredValue<SnapshotMerge<MediaJob>>,
     pub settings: RwSignal<Map<String, Value>>,
     pub settings_version: RwSignal<u32>,
+    pub settings_loading: RwSignal<bool>,
+    pub settings_error: RwSignal<Option<String>>,
+    settings_sync: StoredValue<SettingsSync>,
+    appearance_writes: StoredValue<AppearanceWrites>,
     pub notice: RwSignal<Option<Notice>>,
     pub loading: RwSignal<bool>,
     pub error: RwSignal<Option<String>>,
@@ -591,6 +655,18 @@ pub struct AppState {
     pub grid_view: RwSignal<bool>,
 }
 impl AppState {
+    pub fn recording(self, id: &str) -> Option<Recording> {
+        let index = self.recordings_index.with(|index| index.get(id).copied())?;
+        self.recordings
+            .with(|items| items.get(index).filter(|r| r.rec_id == id).cloned())
+    }
+    pub fn recording_untracked(self, id: &str) -> Option<Recording> {
+        let index = self
+            .recordings_index
+            .with_untracked(|index| index.get(id).copied())?;
+        self.recordings
+            .with_untracked(|items| items.get(index).filter(|r| r.rec_id == id).cloned())
+    }
     fn snapshots_need_refresh(self) -> bool {
         self.recordings_snapshot
             .with_value(SnapshotMerge::needs_refresh)
@@ -618,11 +694,20 @@ impl AppState {
         }
     }
     fn recount_recordings(self) {
-        let list = self.recordings.get_untracked();
-        self.status.update(|status| {
-            status.total_recordings = list.len();
-            status.active_recordings = list.iter().filter(|record| record.is_recording).count();
+        let (total, active) = self.recordings.with_untracked(|list| {
+            (
+                list.len(),
+                list.iter().filter(|record| record.is_recording).count(),
+            )
         });
+        if self.status.with_untracked(|status| {
+            status.total_recordings != total || status.active_recordings != active
+        }) {
+            self.status.update(|status| {
+                status.total_recordings = total;
+                status.active_recordings = active;
+            });
+        }
     }
     pub fn is_dark(self) -> bool {
         match self.theme.get().as_str() {
@@ -632,16 +717,40 @@ impl AppState {
         }
     }
     pub fn notify(self, message: impl Into<String>) {
-        self.notice.set(Some(Notice {
+        self.publish_notice(Notice {
             message: message.into(),
             kind: NoticeKind::Success,
-        }));
+        });
     }
     pub fn fail(self, message: impl Into<String>) {
-        self.notice.set(Some(Notice {
+        self.publish_notice(Notice {
             message: message.into(),
             kind: NoticeKind::Error,
-        }));
+        });
+    }
+    fn publish_notice(self, notice: Notice) {
+        if !notice.message.trim().is_empty()
+            && self
+                .notice
+                .with_untracked(|current| current.as_ref() != Some(&notice))
+        {
+            self.notice.set(Some(notice));
+        }
+    }
+    fn background_notice(self, notice: BackendNotice) {
+        if notice.kind == NoticeKind::Success
+            && self.notice.with_untracked(|current| {
+                current
+                    .as_ref()
+                    .is_some_and(|n| n.kind == NoticeKind::Error)
+            })
+        {
+            return;
+        }
+        self.publish_notice(Notice {
+            message: crate::app::i18n::message(notice.text),
+            kind: notice.kind,
+        });
     }
     pub fn setting(self, key: &str, fallback: &str) -> String {
         self.settings.with(|map| {
@@ -651,14 +760,22 @@ impl AppState {
                 .to_string()
         })
     }
-    pub fn apply_settings(self, payload: SettingsPayload) {
+    fn apply_settings(self, payload: SettingsPayload) {
         let mut settings = payload.default_config;
         settings.extend(payload.user_config);
-        if let Some(theme) = settings.get("theme_mode").and_then(Value::as_str) {
-            self.theme.set(normalize_theme(theme));
-        }
-        if let Some(accent) = settings.get("theme_color").and_then(Value::as_str) {
-            self.accent.set(normalize_accent(accent));
+        let desired = self
+            .appearance_writes
+            .with_value(|writes| writes.desired.clone());
+        if let Some(desired) = desired {
+            self.theme.set(desired.theme);
+            self.accent.set(desired.accent);
+        } else {
+            if let Some(theme) = settings.get("theme_mode").and_then(Value::as_str) {
+                self.theme.set(normalize_theme(theme));
+            }
+            if let Some(accent) = settings.get("theme_color").and_then(Value::as_str) {
+                self.accent.set(normalize_accent(accent));
+            }
         }
         if let Some(grid) = settings.get("is_grid_view").and_then(Value::as_bool) {
             self.grid_view.set(grid);
@@ -672,7 +789,195 @@ impl AppState {
                 crate::app::i18n::set_language(language);
             }
         }
-        self.settings.set(settings);
+        if self.settings.with_untracked(|current| current != &settings) {
+            self.settings.set(settings);
+            self.settings_version
+                .update(|version| *version = version.wrapping_add(1));
+        }
+    }
+}
+
+/// List identity, ordering and filters exclude high-frequency recording progress.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordingListEntry {
+    pub rec_id: String,
+    pub name: String,
+    pub platform_key: String,
+    pub search_text: String,
+    pub phase: TaskPhase,
+    pub priority: u8,
+}
+impl From<&Recording> for RecordingListEntry {
+    fn from(record: &Recording) -> Self {
+        Self {
+            rec_id: record.rec_id.clone(),
+            name: record.name().to_lowercase(),
+            platform_key: record.platform_key.as_deref().unwrap_or("custom").into(),
+            search_text: format!(
+                "{}\n{}\n{}",
+                record.name(),
+                record.url,
+                record.live_title.as_deref().unwrap_or("")
+            )
+            .to_lowercase(),
+            phase: record.task_phase(),
+            priority: crate::app::labels::recording_priority(record),
+        }
+    }
+}
+
+#[derive(Default)]
+struct SettingsSync {
+    generation: u64,
+    pending: usize,
+    loaded: bool,
+}
+impl SettingsSync {
+    fn begin(&mut self, force: bool) -> Option<u64> {
+        if !force && (self.loaded || self.pending > 0) {
+            return None;
+        }
+        self.generation = self.generation.wrapping_add(1);
+        self.pending += 1;
+        Some(self.generation)
+    }
+    fn finish(&mut self, generation: u64, success: bool) -> bool {
+        self.pending = self.pending.saturating_sub(1);
+        if self.generation != generation {
+            return false;
+        }
+        self.loaded = success;
+        true
+    }
+}
+#[derive(Debug, Clone, PartialEq)]
+struct Appearance {
+    theme: String,
+    accent: String,
+}
+#[derive(Default)]
+struct AppearanceWrites {
+    pending: Option<Appearance>,
+    desired: Option<Appearance>,
+    running: bool,
+}
+impl AppearanceWrites {
+    fn push(&mut self, value: Appearance) -> bool {
+        self.desired = Some(value.clone());
+        self.pending = Some(value);
+        !std::mem::replace(&mut self.running, true)
+    }
+    fn next(&mut self) -> Option<Appearance> {
+        let next = self.pending.take();
+        if next.is_none() {
+            self.running = false;
+        }
+        next
+    }
+    fn saved(&mut self, value: &Appearance) {
+        if self.desired.as_ref() == Some(value) && self.pending.is_none() {
+            self.desired = None;
+        }
+    }
+}
+
+#[cfg(test)]
+mod settings_sync_tests {
+    use super::*;
+
+    #[test]
+    fn only_the_latest_settings_response_can_publish_success_or_failure() {
+        let mut sync = SettingsSync::default();
+        let old = sync.begin(false).unwrap();
+        assert_eq!(sync.begin(false), None, "startup readers share one request");
+        let latest = sync.begin(true).unwrap();
+        assert!(sync.finish(latest, true));
+        assert!(!sync.finish(old, false));
+        assert!(sync.loaded);
+        assert_eq!(sync.pending, 0);
+        assert_eq!(sync.begin(false), None);
+
+        let failed = sync.begin(true).unwrap();
+        assert!(sync.finish(failed, false));
+        assert!(!sync.loaded);
+        let retry = sync.begin(false).unwrap();
+        assert!(sync.finish(retry, true));
+    }
+
+    #[test]
+    fn a_local_appearance_change_invalidates_an_inflight_settings_read() {
+        let mut sync = SettingsSync::default();
+        let old = sync.begin(false).unwrap();
+        sync.generation = sync.generation.wrapping_add(1);
+        assert!(!sync.finish(old, true));
+        assert!(!sync.loaded);
+        let latest = sync.begin(true).unwrap();
+        assert!(sync.finish(latest, true));
+        assert_eq!(sync.pending, 0);
+    }
+
+    #[test]
+    fn appearance_writes_are_serial_and_coalesce_to_the_latest_choice() {
+        let dark = Appearance {
+            theme: "dark".into(),
+            accent: "blue".into(),
+        };
+        let purple = Appearance {
+            theme: "dark".into(),
+            accent: "purple".into(),
+        };
+        let light = Appearance {
+            theme: "light".into(),
+            accent: "purple".into(),
+        };
+        let mut writes = AppearanceWrites::default();
+        assert!(writes.push(dark.clone()));
+        assert_eq!(writes.next(), Some(dark.clone()));
+        assert!(!writes.push(purple));
+        assert!(!writes.push(light.clone()));
+        writes.saved(&dark);
+        assert_eq!(writes.desired, Some(light.clone()));
+        assert_eq!(writes.next(), Some(light.clone()));
+        writes.saved(&light);
+        assert_eq!(writes.desired, None);
+        assert_eq!(writes.next(), None);
+        assert!(writes.push(dark));
+    }
+
+    #[test]
+    fn a_failed_appearance_write_keeps_the_local_choice() {
+        let local = Appearance {
+            theme: "dark".into(),
+            accent: "red".into(),
+        };
+        let mut writes = AppearanceWrites::default();
+        assert!(writes.push(local.clone()));
+        assert_eq!(writes.next(), Some(local.clone()));
+        assert_eq!(writes.next(), None);
+        assert_eq!(writes.desired, Some(local));
+        assert!(!writes.running);
+    }
+
+    #[test]
+    fn list_projection_changes_for_order_and_filters_but_not_progress() {
+        let mut record = Recording {
+            rec_id: "room".into(),
+            streamer_name: "Room".into(),
+            is_recording: true,
+            ..Default::default()
+        };
+        let original = RecordingListEntry::from(&record);
+        record.recorded_seconds = 123.0;
+        record.speed = Some("2 MB/s".into());
+        assert_eq!(RecordingListEntry::from(&record), original);
+        record.is_recording = false;
+        assert_ne!(RecordingListEntry::from(&record), original);
+        record.is_recording = true;
+        record.live_title = Some("new searchable title".into());
+        assert_ne!(RecordingListEntry::from(&record), original);
+        record.live_title = None;
+        record.streamer_name = "Renamed".into();
+        assert_ne!(RecordingListEntry::from(&record), original);
     }
 }
 
@@ -701,14 +1006,38 @@ pub fn provide_app_state() -> AppState {
         .and_then(|storage| storage.get_item("streamcap.appearance").ok().flatten())
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
         .unwrap_or(Value::Null);
+    let recordings = RwSignal::new(Vec::<Recording>::new());
+    let recording_list = Memo::new(move |_| {
+        recordings.with(|items| {
+            items
+                .iter()
+                .map(RecordingListEntry::from)
+                .collect::<Vec<_>>()
+        })
+    });
+    let recordings_index = Memo::new(move |_| {
+        recording_list.with(|items| {
+            items
+                .iter()
+                .enumerate()
+                .map(|(index, record)| (record.rec_id.clone(), index))
+                .collect()
+        })
+    });
     let state = AppState {
         status: RwSignal::new(GatewayStatus::default()),
-        recordings: RwSignal::new(Vec::new()),
+        recordings,
+        recording_list,
+        recordings_index,
         media_jobs: RwSignal::new(Vec::new()),
         recordings_snapshot: StoredValue::new(SnapshotMerge::default()),
         jobs_snapshot: StoredValue::new(SnapshotMerge::default()),
         settings: RwSignal::new(Map::new()),
         settings_version: RwSignal::new(0),
+        settings_loading: RwSignal::new(true),
+        settings_error: RwSignal::new(None),
+        settings_sync: StoredValue::new(SettingsSync::default()),
+        appearance_writes: StoredValue::new(AppearanceWrites::default()),
         notice: RwSignal::new(None),
         loading: RwSignal::new(true),
         error: RwSignal::new(None),
@@ -807,8 +1136,37 @@ pub async fn fetch_status() -> Result<GatewayStatus, String> {
 pub async fn fetch_recordings() -> Result<Vec<Recording>, String> {
     call("GET", "/api/recordings", None).await
 }
-pub async fn fetch_settings() -> Result<SettingsPayload, String> {
+async fn fetch_settings() -> Result<SettingsPayload, String> {
     call("GET", "/api/settings", None).await
+}
+pub async fn refresh_settings(state: AppState, force: bool) -> Result<(), String> {
+    let Some(Some(generation)) = state
+        .settings_sync
+        .try_update_value(|sync| sync.begin(force))
+    else {
+        return Ok(());
+    };
+    state.settings_loading.set(true);
+    let result = fetch_settings().await;
+    if state
+        .settings_sync
+        .try_update_value(|sync| sync.finish(generation, result.is_ok()))
+        != Some(true)
+    {
+        return Ok(());
+    }
+    state.settings_loading.set(false);
+    match result {
+        Ok(payload) => {
+            state.settings_error.set(None);
+            state.apply_settings(payload);
+            Ok(())
+        }
+        Err(error) => {
+            state.settings_error.set(Some(error.clone()));
+            Err(error)
+        }
+    }
 }
 pub async fn refresh_recordings(state: AppState) -> Result<(), String> {
     let Some(generation) = state
@@ -838,7 +1196,9 @@ pub async fn refresh_recordings(state: AppState) -> Result<(), String> {
     else {
         return Ok(());
     };
-    state.recordings.set(list);
+    if state.recordings.with_untracked(|current| current != &list) {
+        state.recordings.set(list);
+    }
     state.recount_recordings();
     state.publish_snapshot_result();
     let Some(generation) = state.jobs_snapshot.try_update_value(SnapshotMerge::begin) else {
@@ -873,7 +1233,6 @@ pub async fn refresh_recordings(state: AppState) -> Result<(), String> {
 }
 
 pub async fn poll_connection(state: AppState) {
-    let mut settings_loaded = false;
     loop {
         match fetch_status().await {
             Ok(status) => {
@@ -887,11 +1246,8 @@ pub async fn poll_connection(state: AppState) {
                 if refresh && !state.snapshot_pending() {
                     let _ = refresh_recordings(state).await;
                 }
-                if !settings_loaded || refresh {
-                    if let Ok(settings) = fetch_settings().await {
-                        state.apply_settings(settings);
-                        settings_loaded = true;
-                    }
+                if !state.settings_sync.with_value(|sync| sync.loaded) || refresh {
+                    let _ = refresh_settings(state, refresh).await;
                 }
             }
             Err(error) => {
@@ -1082,23 +1438,38 @@ fn encode(value: &str) -> String {
 }
 
 pub fn save_appearance(state: AppState) {
-    let theme = state.theme.get_untracked();
-    let accent = state.accent.get_untracked();
-    if let Ok(Some(storage)) = window().local_storage() {
-        let _ = storage.set_item(
-            "streamcap.appearance",
-            &json!({"theme":theme,"accent":accent}).to_string(),
-        );
+    let value = Appearance {
+        theme: state.theme.get_untracked(),
+        accent: state.accent.get_untracked(),
+    };
+    state
+        .settings_sync
+        .update_value(|sync| sync.generation = sync.generation.wrapping_add(1));
+    if state
+        .appearance_writes
+        .try_update_value(|writes| writes.push(value))
+        != Some(true)
+    {
+        return;
     }
     leptos::task::spawn_local(async move {
-        match save_settings(json!({"theme_mode":theme,"theme_color":accent})).await {
-            Ok(()) => {
-                if let Ok(settings) = fetch_settings().await {
-                    state.apply_settings(settings);
+        while let Some(Some(value)) = state
+            .appearance_writes
+            .try_update_value(AppearanceWrites::next)
+        {
+            match save_settings(json!({"theme_mode":value.theme,"theme_color":value.accent})).await
+            {
+                Ok(()) => {
+                    let _ = state
+                        .appearance_writes
+                        .try_update_value(|writes| writes.saved(&value));
+                }
+                Err(error) => {
+                    state.fail(crate::tr_format!("外观已本地应用，配置同步失败：{error}"))
                 }
             }
-            Err(error) => state.fail(crate::tr_format!("外观已本地应用，配置同步失败：{error}")),
         }
+        let _ = refresh_settings(state, true).await;
     });
 }
 
@@ -1168,6 +1539,8 @@ pub fn subscribe_events(state: AppState) -> Option<EventConnection> {
         state.events_connected.set(true);
         leptos::task::spawn_local(async move {
             let _ = refresh_recordings(state).await;
+            let _ =
+                refresh_settings(state, state.settings_sync.with_value(|sync| sync.loaded)).await;
         });
     });
     let failed_timer = retry_timer.clone();
@@ -1185,16 +1558,24 @@ pub fn subscribe_events(state: AppState) -> Option<EventConnection> {
     source.set_onopen(Some(on_open.as_ref().unchecked_ref()));
     source.set_onerror(Some(on_error.as_ref().unchecked_ref()));
     let mut messages = Vec::new();
-    for event_name in ["update", "delete", "settings", "mediaJob", "resync"] {
+    for event_name in [
+        "update", "delete", "settings", "mediaJob", "resync", "snack",
+    ] {
         let handler = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(
             move |event: web_sys::MessageEvent| {
                 let Some(text) = event.data().as_string() else {
                     return;
                 };
                 match event_name {
+                    "snack" => {
+                        if let Ok(notice) = serde_json::from_str::<BackendNotice>(&text) {
+                            state.background_notice(notice);
+                        }
+                    }
                     "resync" => {
                         leptos::task::spawn_local(async move {
                             let _ = refresh_recordings(state).await;
+                            let _ = refresh_settings(state, true).await;
                         });
                     }
                     "update" => {
@@ -1202,16 +1583,18 @@ pub fn subscribe_events(state: AppState) -> Option<EventConnection> {
                             state.recordings_snapshot.update_value(|sync| {
                                 sync.observe(rec.rec_id.clone(), Some(rec.clone()))
                             });
-                            state.recordings.update(|list| {
-                                if let Some(existing) =
-                                    list.iter_mut().find(|r| r.rec_id == rec.rec_id)
-                                {
-                                    *existing = rec;
-                                } else {
-                                    list.push(rec);
-                                }
-                            });
-                            state.recount_recordings();
+                            if state.recording_untracked(&rec.rec_id).as_ref() != Some(&rec) {
+                                state.recordings.update(|list| {
+                                    if let Some(existing) =
+                                        list.iter_mut().find(|r| r.rec_id == rec.rec_id)
+                                    {
+                                        *existing = rec;
+                                    } else {
+                                        list.push(rec);
+                                    }
+                                });
+                                state.recount_recordings();
+                            }
                         }
                     }
                     "delete" => {
@@ -1247,11 +1630,8 @@ pub fn subscribe_events(state: AppState) -> Option<EventConnection> {
                         }
                     }
                     "settings" => {
-                        state.settings_version.update(|v| *v += 1);
                         leptos::task::spawn_local(async move {
-                            if let Ok(settings) = fetch_settings().await {
-                                state.apply_settings(settings);
-                            }
+                            let _ = refresh_settings(state, true).await;
                         });
                     }
                     _ => {}
@@ -1279,10 +1659,10 @@ pub async fn install_tools() -> Result<(), String> {
         .await
         .map(|_| ())
 }
-pub async fn check_update() -> Result<Value, String> {
+pub async fn check_update() -> Result<UpdateCheck, String> {
     call("GET", "/api/tools/update", None).await
 }
-pub async fn accounts() -> Result<Value, String> {
+pub async fn accounts() -> Result<HashMap<String, AccountSummary>, String> {
     call("GET", "/api/accounts", None).await
 }
 pub async fn save_account(platform: &str, changes: Value) -> Result<(), String> {

@@ -1,0 +1,26 @@
+{
+  "updateCheck": {
+    "release": {
+      "tag_name": "v0.1.1-fixture",
+      "html_url": "https://github.com/xiyangone/StreamCap/releases/tag/v0.1.1-fixture",
+      "body": "isolated release fixture"
+    },
+    "currentVersion": "0.1.0"
+  },
+  "accounts": {
+    "douyin": {
+      "username": "fixture-account",
+      "accountType": "personal",
+      "hasPassword": true,
+      "hasAccessToken": true
+    }
+  },
+  "backgroundError": {
+    "text": "录后脚本退出失败",
+    "kind": "error"
+  },
+  "backgroundSuccess": {
+    "text": "MP4 转封装完成",
+    "kind": "success"
+  }
+}

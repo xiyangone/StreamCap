@@ -40,6 +40,10 @@ pub fn read_json_object(path: &Path) -> io::Result<Map<String, Value>> {
     }
 }
 fn write_json(path: &Path, value: &Value) -> io::Result<()> {
+    write_atomic(path, &serde_json::to_vec_pretty(value)?)
+}
+
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write;
     let parent = path
         .parent()
@@ -51,7 +55,7 @@ fn write_json(path: &Path, value: &Value) -> io::Result<()> {
             .create_new(true)
             .write(true)
             .open(&temporary)?;
-        file.write_all(serde_json::to_string_pretty(value)?.as_bytes())?;
+        file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
         std::fs::rename(&temporary, path)
@@ -238,7 +242,14 @@ impl ConfigStore {
     /// 合并写入用户设置并落盘。
     pub fn update_user_config(&mut self, patch: Map<String, Value>) -> io::Result<Vec<String>> {
         validate_settings(&patch)?;
-        let changed: Vec<String> = patch.keys().cloned().collect();
+        let changed: Vec<String> = patch
+            .iter()
+            .filter(|(key, value)| self.user_config.get(*key) != Some(*value))
+            .map(|(key, _)| key.clone())
+            .collect();
+        if changed.is_empty() {
+            return Ok(changed);
+        }
         let mut updated = self.user_config.clone();
         updated.extend(patch);
         write_json(
@@ -329,6 +340,21 @@ impl ConfigStore {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn atomic_write_preserves_existing_target_and_removes_failed_temporary() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("settings.json");
+        write_atomic(&target, b"first").unwrap();
+        write_atomic(&target, b"second").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"second");
+        let occupied = dir.path().join("occupied");
+        fs::create_dir(&occupied).unwrap();
+        fs::write(occupied.join("kept"), b"preserved").unwrap();
+        assert!(write_atomic(&occupied, b"not published").is_err());
+        assert_eq!(fs::read(occupied.join("kept")).unwrap(), b"preserved");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
 
     fn temp_workspace() -> (Workspace, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();

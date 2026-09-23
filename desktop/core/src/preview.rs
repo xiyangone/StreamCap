@@ -389,7 +389,7 @@ impl Preview {
             "-rw_timeout",
             "15000000",
             "-protocol_whitelist",
-            "http,https,tcp,tls,crypto,rtmp,rtmps",
+            crate::engine::input_protocols(&input.url),
         ]);
         if let Some(proxy) = input.proxy {
             command.args(["-http_proxy", &proxy]);

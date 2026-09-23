@@ -1,6 +1,7 @@
 use super::Icon;
 use crate::app::i18n::t;
 use leptos::{html, prelude::*};
+use wasm_bindgen::JsCast;
 
 /// Native dialogs provide focus containment, Escape handling and focus restoration.
 #[component]
@@ -36,6 +37,9 @@ pub fn Dialog(
             on:cancel=move |event: leptos::ev::Event| { event.prevent_default(); close(); }
             on:click=move |event: leptos::ev::MouseEvent| {
                 if let Some(dialog) = element.get() {
+                    if event.target().as_ref() != Some(dialog.unchecked_ref::<web_sys::EventTarget>()) {
+                        return;
+                    }
                     let rect = dialog.get_bounding_client_rect();
                     let x = f64::from(event.client_x()); let y = f64::from(event.client_y());
                     if x < rect.left() || x > rect.right() || y < rect.top() || y > rect.bottom() { close(); }

@@ -33,6 +33,16 @@ pub const FFMPEG_USER_AGENT: &str = "Mozilla/5.0 (Linux; Android 11; SAMSUNG SM-
 /// HLS 媒体分片扩展名与容器不一致时需要放宽检查的平台。
 pub const RELAXED_HLS_EXTENSION_CHECK_PLATFORMS: &[&str] = &["chzzk"];
 
+pub(crate) fn input_protocols(url: &str) -> &'static str {
+    if url.starts_with("http://") || url.starts_with("https://") {
+        "http,https,tcp,tls,crypto,httpproxy"
+    } else if url.starts_with("rtmp://") || url.starts_with("rtmps://") {
+        "rtmp,rtmps,tcp,tls"
+    } else {
+        "file,crypto"
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecordOptions {
@@ -78,15 +88,7 @@ pub fn build_command(options: &RecordOptions) -> Vec<String> {
 
     let http_input =
         options.record_url.starts_with("http://") || options.record_url.starts_with("https://");
-    let rtmp_input =
-        options.record_url.starts_with("rtmp://") || options.record_url.starts_with("rtmps://");
-    let protocols = if http_input {
-        "http,https,tcp,tls,crypto,httpproxy"
-    } else if rtmp_input {
-        "rtmp,rtmps,tcp,tls"
-    } else {
-        "file,crypto"
-    };
+    let protocols = input_protocols(&options.record_url);
     let mut command: Vec<String> = vec![
         "-n",
         "-v",
@@ -1089,8 +1091,9 @@ fn recording_failure_summary(message: &str) -> Option<&'static str> {
 }
 
 fn redact_stream_url(message: &str) -> String {
-    static URL: std::sync::LazyLock<regex::Regex> =
-        std::sync::LazyLock::new(|| regex::Regex::new(r"https?://\S+").expect("static regex"));
+    static URL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?i)\b(?:https?|rtmps?)://\S+").expect("static regex")
+    });
     URL.replace_all(message, "[stream-url]").into_owned()
 }
 
@@ -1193,6 +1196,26 @@ mod tests {
         assert_eq!(
             recording_failure_summary("Unrecognized arbitrary server error"),
             None
+        );
+    }
+
+    #[test]
+    fn logs_redact_every_supported_network_stream_protocol() {
+        for scheme in ["http", "https", "rtmp", "rtmps", "HTTPS", "RTMPS"] {
+            let line = format!(
+                "Error opening input {scheme}://media.invalid/app/private?token=fixture-secret"
+            );
+            assert_eq!(redact_stream_url(&line), "Error opening input [stream-url]");
+        }
+        assert_eq!(
+            redact_stream_url("frame=12 bitrate=1000k"),
+            "frame=12 bitrate=1000k"
+        );
+        assert_eq!(
+            redact_stream_url(
+                "rtmp://media.invalid/first?key=one https://media.invalid/second?key=two"
+            ),
+            "[stream-url] [stream-url]"
         );
     }
 

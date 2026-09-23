@@ -29,7 +29,7 @@ TS and compatibility previews support time-based seeking, including already-reco
 
 Shutdown waits up to 30 seconds for remux work. Interrupted jobs are persisted in media_jobs.json and may resume only in the same recordings root with unchanged file identities and no existing destination, retaining the original cleanup preference. Historical recordings are never scanned or converted automatically. A 4500-second setting is a platform-check interval, not a recording duration.
 
-Schedules support multiple start times, fractional hours and overnight windows. Post-recording scripts must be JSON argv arrays beginning with an absolute executable path. {file} and {room} are argument substitutions, never shell fragments. Windows Job Objects own script descendants. Shutdown timers work while the app is running, with a 60-second cancellable warning before stopping and finalizing recordings; failures prevent a power action.
+Schedules support multiple start times, fractional hours and overnight windows. Post-recording scripts must be JSON argv arrays beginning with an absolute executable path. {file} and {room} are argument substitutions, never shell fragments. Scripts receive only this recording's source files or newly converted MP4s, never historical conversions with the same filename. Media remains protected until scripts finish, and Windows Job Objects own script descendants. Shutdown timers work while the app is running, with a 60-second cancellable warning before stopping and finalizing recordings; failures prevent a power action.
 
 FFmpeg recording requires an http:// proxy; SOCKS is available for resolution and native FLV downloading. Unsupported combinations fail instead of silently connecting directly. Ctrl+1 through Ctrl+5 navigate, and Ctrl+, opens Preferences. Language changes reload only the UI.
 
@@ -42,6 +42,7 @@ rustup target add wasm32-unknown-unknown
 npm ci --cache .\build\npm-cache
 cargo install trunk --version 0.21.14 --locked --root .\target\tools
 cargo install wasm-bindgen-cli --version 0.2.128 --locked --root .\target\tools
+cargo install cargo-audit --version 0.22.2 --locked --root .\target\tools
 cargo fetch --manifest-path Cargo.toml --locked
 cargo fetch --manifest-path core/Cargo.toml --locked
 cargo fetch --manifest-path src-tauri/Cargo.toml --locked
@@ -50,6 +51,8 @@ npm run tauri:dev
 
 The frontend helper verifies the project-local wasm-bindgen CLI against Cargo.lock. A missing or mismatched tool is an error, not an interpreter fallback.
 
-Run npm run verify for the complete native verification/build pipeline (install Playwright Chromium first), or pwsh -NoProfile -File scripts/build-release.ps1 to build only. Output is a fresh desktop/src-tauri/target/native-noFF-* directory containing StreamCap.exe and its SHA256 file, not an installer.
+Before UI verification, set $env:PLAYWRIGHT_BROWSERS_PATH = Join-Path (Get-Location) 'build/playwright' and run npx playwright install chromium. Run npm run verify for the complete native verification/build pipeline, or pwsh -NoProfile -File scripts/build-release.ps1 to build only. Output is a fresh desktop/src-tauri/target/native-noFF-* directory containing StreamCap.exe and its SHA256 file, not an installer.
+
+Verification requires online dependency audits for all three Cargo.lock files and npm; audit failures block the build. Reports retain vulnerability findings and maintenance warnings separately. One Native validation CI workflow handles pushes, PRs and manual runs; only a successful manual run uploads the verified EXE.
 
 See [packaging and verification](docs/packaging_en.md), [LICENSE](LICENSE) and [third-party notices](desktop/THIRD_PARTY_NOTICES.md).
