@@ -1,4 +1,4 @@
-// One control surface for native files and bounded, time-addressed compatibility segments.
+// One control surface for native files and backpressured, time-addressed compatibility streams.
 // Seeking within a buffered segment never starts another FFmpeg process.
 let activePlayers = 0;
 let nextPlayerId = 0;
@@ -30,11 +30,20 @@ export function attachMedia(video, apiOrigin, relativePath, onState, onCapture) 
   const abort = new AbortController();
   const removers = [];
   let disposed = false, player = null, generation = 0, mode = 'native', info = null;
-  let total = 0, offset = 0, wantedPlay = true, scrubbing = false, changing = false, probing = false;
+  let total = 0, offset = 0, nativeStart = 0, wantedPlay = true, scrubbing = false, changing = false, probing = false;
   let dragTarget = 0, pendingTarget = null, lastDispatch = 0, seekStarted = 0, acceptedTarget = null;
   let poll = null, continuation = null, seekTimer = null, loadTimeout = null, animation = null;
   let controls, range, time, play, mute, latest, buffered, transport, hint, rate, volume, fullscreen, freeze;
-  const update = (phase, message = '') => { if (!disposed) onState(phase, message); };
+  let terminalError = false, compatibilityAttempted = false;
+  let frameRequest = null, frameTicket = 0, frameReady = false, loadKind = 'initial';
+  const frameCallbacks = typeof video.requestVideoFrameCallback === 'function';
+  const startupBufferSeconds = 3, seekBufferSeconds = 1;
+  const update = (phase, message = '') => {
+    if (disposed || (terminalError && phase !== 'loading' && phase !== 'error')) return;
+    if (phase === 'loading') terminalError = false;
+    if (phase === 'error') terminalError = true;
+    onState(phase, message);
+  };
   const listen = (element, event, handler) => {
     element.addEventListener(event, handler);
     removers.push(() => element.removeEventListener(event, handler));
@@ -46,7 +55,7 @@ export function attachMedia(video, apiOrigin, relativePath, onState, onCapture) 
     return node;
   };
   const position = () => offset + (Number.isFinite(video.currentTime) ? video.currentTime : 0);
-  const clamp = value => Math.max(0, Math.min(Number.isFinite(value) ? value : 0, Math.max(0, total - 0.12)));
+  const clamp = value => Math.max(mode === 'native' ? nativeStart : 0, Math.min(Number.isFinite(value) ? value : 0, Math.max(0, total - 0.12)));
   const release = () => {
     if (!player) return;
     const old = player; player = null;
@@ -107,9 +116,12 @@ export function attachMedia(video, apiOrigin, relativePath, onState, onCapture) 
   };
   const startAnimation = () => { if (animation == null) animation = requestAnimationFrame(animate); };
   const playSafely = () => {
+    if (disposed || !wantedPlay || scrubbing) return;
+    if (changing) { settle(); return; }
     const version = generation;
     video.play().catch(error => {
       if (!disposed && version === generation && error.name !== 'AbortError' && !scrubbing) {
+        if (error.name !== 'NotAllowedError') { playbackFailure(); return; }
         wantedPlay = false; render(); update('ready', label('点击播放继续', 'Click Play to continue'));
       }
     });
@@ -119,7 +131,7 @@ export function attachMedia(video, apiOrigin, relativePath, onState, onCapture) 
     clearLoadTimeout();
     loadTimeout = setTimeout(() => {
       if (disposed || !changing) return;
-      changing = false; render();
+      changing = false; cancelFrameWatch(); render();
       update('error', label('预览加载超时，请重新选择播放位置。', 'Preview timed out. Select a playback position again.'));
       if (pendingTarget != null) flushSeek(true);
     }, 15000);
@@ -131,18 +143,76 @@ export function attachMedia(video, apiOrigin, relativePath, onState, onCapture) 
     freeze.style.height = video.getBoundingClientRect().height + 'px';
     try { freeze.getContext('2d').drawImage(video, 0, 0, freeze.width, freeze.height); freeze.hidden = false; } catch { freeze.hidden = true; }
   };
+  const cancelFrameWatch = () => {
+    frameTicket++;
+    if (frameRequest != null) video.cancelVideoFrameCallback(frameRequest);
+    frameRequest = null;
+  };
+  const watchTargetFrame = () => {
+    cancelFrameWatch(); frameReady = false;
+    video.dataset.presentationEvidence = frameCallbacks ? 'video-frame-callback' : 'media-events';
+    if (!frameCallbacks) { frameReady = true; return; }
+    const ticket = frameTicket;
+    const presented = (now, metadata) => {
+      frameRequest = null;
+      if (disposed || ticket !== frameTicket) return;
+      const at = offset + metadata.mediaTime;
+      if (acceptedTarget == null || Math.abs(at - acceptedTarget) <= 0.15) {
+        frameReady = true;
+        video.dataset.framePosition = String(at);
+        if (seekStarted) video.dataset.seekLatencyMs = String(Math.max(0, now - seekStarted));
+        settle();
+      } else frameRequest = video.requestVideoFrameCallback(presented);
+    };
+    frameRequest = video.requestVideoFrameCallback(presented);
+  };
+  const bufferedAhead = () => {
+    for (let i = 0; i < video.buffered.length; i++) {
+      if (video.currentTime >= video.buffered.start(i) - 0.15 && video.currentTime <= video.buffered.end(i)) {
+        return Math.max(0, video.buffered.end(i) - Math.max(video.currentTime, video.buffered.start(i)));
+      }
+    }
+    return 0;
+  };
+  const enoughToPlay = () => {
+    const ahead = bufferedAhead();
+    const localEnd = Number.isFinite(video.duration) && video.duration > 0 ? offset + video.duration : Infinity;
+    const end = Math.min(total > 0 ? total : Infinity, localEnd);
+    const remaining = Math.max(0, end - position());
+    // Native preload is a hint: WebView2 may suspend at less than our target.
+    // Require a presented frame and real media, then honor its enough-data state.
+    const nativePreloadReady = mode === 'native' && video.readyState === 4 && video.networkState === 1;
+    const required = Math.min(loadKind === 'initial' || loadKind === 'buffer' ? startupBufferSeconds : seekBufferSeconds,
+      nativePreloadReady ? seekBufferSeconds : Infinity, Math.max(0, remaining - 0.25));
+    video.dataset.bufferAheadSeconds = ahead.toFixed(3);
+    video.dataset.requiredBufferSeconds = required.toFixed(3);
+    return ahead + 0.03 >= required;
+  };
   const settle = () => {
     if (disposed || video.readyState < 2 || video.seeking) return;
     if (changing) {
+      if (mode === 'native' && loadKind === 'initial' && video.buffered.length) nativeStart = video.buffered.start(0);
+      // MP4 edit lists and B-frames can leave zero outside the playable range.
+      // At initial native load use the real first timestamp, not a guessed tolerance.
+      // Explicit seeks still must not skip arbitrary discontinuities.
+      if (video.buffered.length && video.currentTime < video.buffered.start(0)
+          && ((mode === 'native' && loadKind === 'initial' && acceptedTarget == null)
+            || (mode === 'timeline' && video.buffered.start(0) - video.currentTime <= 0.15))) {
+        watchTargetFrame(); video.currentTime = video.buffered.start(0); return;
+      }
       if (mode === 'timeline' && acceptedTarget != null && position() < acceptedTarget - 0.08) {
         const target = acceptedTarget - offset;
         if (!hasBuffered(acceptedTarget)) return;
-        video.currentTime = Math.max(0, target);
+        watchTargetFrame(); video.currentTime = Math.max(0, target);
         return;
       }
+      // Audio-only compatibility media has no video presentation callback.
+      if (!video.videoWidth) { frameReady = true; video.dataset.presentationEvidence = 'audio-data'; }
+      if (!frameReady) return;
+      if (wantedPlay && !scrubbing && pendingTarget == null && !enoughToPlay()) return;
       changing = false; clearLoadTimeout(); freeze.hidden = true;
-      if (seekStarted) video.dataset.seekLatencyMs = String(performance.now() - seekStarted);
-      video.dataset.framePosition = String(position());
+      if (seekStarted) video.dataset.seekReadyLatencyMs = String(performance.now() - seekStarted);
+      if (!frameCallbacks || !video.videoWidth) video.dataset.framePosition = String(position());
       if (wantedPlay && !scrubbing) playSafely();
       update(video.paused ? 'ready' : 'playing');
     }
@@ -159,7 +229,7 @@ export function attachMedia(video, apiOrigin, relativePath, onState, onCapture) 
       const response = await fetch(apiOrigin + '/api/media/info?path=' + encodeURIComponent(relativePath), { signal: abort.signal });
       if (!response.ok) throw Error(label('无法读取媒体文件信息', 'Unable to read media information'));
       const fresh = await response.json(); if (disposed) return false; info = fresh;
-      if (!timelineFormats.has(fresh.format)) return true;
+      if (!timelineFormats.has(fresh.format) && fresh.nativeCompatible !== false && !(fresh.durationSeconds > 0)) return true;
       if (Number.isFinite(fresh.durationSeconds) && fresh.durationSeconds > 0) { total = fresh.durationSeconds; render(); return true; }
       update('ready', fresh.seekError || label('正在等待可播放的录制片段…', 'Waiting for recorded media…')); return false;
     } finally { probing = false; }
@@ -193,10 +263,22 @@ export function attachMedia(video, apiOrigin, relativePath, onState, onCapture) 
             this._status = mpegts.LoaderStatus.kBuffering;
             reader = response.body.getReader(); let received = 0;
             while (!controller.signal.aborted && !disposed && version === generation) {
+              // Keep the decoder/FFmpeg across the former 120-second boundary.
+              // Pausing reads propagates backpressure; never cache the entire file.
+              while (!live && bufferedAhead() > 30 && !controller.signal.aborted && !disposed && version === generation) {
+                await new Promise(resolve => {
+                  const finish = () => { clearTimeout(timer); controller.signal.removeEventListener('abort', finish); resolve(); };
+                  const timer = setTimeout(finish, 100);
+                  controller.signal.addEventListener('abort', finish, { once: true });
+                });
+              }
+              if (controller.signal.aborted || disposed || version !== generation) break;
               const { done, value } = await reader.read();
               if (done) { this._status = mpegts.LoaderStatus.kComplete; this._onComplete?.(range.from, range.from + received - 1); return; }
               const start = received; received += value.byteLength;
               this._onDataArrival?.(value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength), start, received);
+              // Give SourceBuffer.updateend a turn before measuring read-ahead.
+              await new Promise(resolve => setTimeout(resolve, 0));
             }
           } catch (error) {
             if (!controller.signal.aborted && !disposed && version === generation) {
@@ -209,8 +291,8 @@ export function attachMedia(video, apiOrigin, relativePath, onState, onCapture) 
     }
     const next = mpegts.createPlayer({ type: 'mpegts', isLive: live, url }, {
       enableWorker: false, enableWorkerForMSE: false, enableStashBuffer: false,
-      lazyLoad: false, accurateSeek: true, autoCleanupSourceBuffer: live,
-      autoCleanupMaxBackwardDuration: 30, autoCleanupMinBackwardDuration: 15,
+      lazyLoad: false, accurateSeek: true, autoCleanupSourceBuffer: true,
+      autoCleanupMaxBackwardDuration: 60, autoCleanupMinBackwardDuration: 30,
       ...(live ? {} : { customLoader: TimelineLoader }),
     });
     next.on(mpegts.Events.ERROR, (type) => {
@@ -221,11 +303,12 @@ export function attachMedia(video, apiOrigin, relativePath, onState, onCapture) 
     });
     player = next; next.attachMediaElement(video); next.load(); return next;
   };
-  const loadAt = seconds => {
+  const loadAt = (seconds, kind = 'seek') => {
     if (disposed || !(total > 0)) return;
     clearTimeout(continuation); continuation = null;
-    retainFrame(); changing = true; const version = ++generation; release();
-    offset = clamp(seconds); acceptedTarget = offset; seekStarted = performance.now();
+    retainFrame(); changing = true; const version = ++generation; release(); video.pause();
+    offset = clamp(seconds); acceptedTarget = offset; seekStarted = performance.now(); loadKind = kind;
+    watchTargetFrame();
     video.dataset.seekOffset = String(offset);
     video.dataset.segmentLoads = String(Number(video.dataset.segmentLoads || 0) + 1);
     render(); update('loading', label('正在定位画面…', 'Seeking…')); watchLoad();
@@ -245,10 +328,13 @@ export function attachMedia(video, apiOrigin, relativePath, onState, onCapture) 
     clearTimeout(seekTimer); seekTimer = null;
     if (disposed || pendingTarget == null || !(total > 0)) return;
     if (changing && acceptedTarget != null && Math.abs(pendingTarget - acceptedTarget) < 0.07) { pendingTarget = null; return; }
+    if (changing && !force) return;
     const target = clamp(pendingTarget); pendingTarget = null; lastDispatch = performance.now();
     const bufferedTarget = mode === 'timeline' && hasBuffered(target);
     if (mode === 'native' || bufferedTarget) {
-      acceptedTarget = target; seekStarted = performance.now(); changing = true; watchLoad();
+      acceptedTarget = target; seekStarted = performance.now(); changing = true; loadKind = 'seek';
+      video.pause(); watchTargetFrame(); watchLoad();
+      update('loading', label('正在定位画面…', 'Seeking…'));
       video.dataset.seekKind = bufferedTarget ? 'buffered' : 'native';
       video.currentTime = mode === 'native' ? target : target - offset;
       if (!video.seeking) settle();
@@ -256,10 +342,10 @@ export function attachMedia(video, apiOrigin, relativePath, onState, onCapture) 
     render();
   }
   function scheduleFlush() {
-    if (disposed) return;
-    clearTimeout(seekTimer);
-    const interval = mode === 'native' || (pendingTarget != null && hasBuffered(pendingTarget)) ? 40 : 120;
-    seekTimer = setTimeout(() => flushSeek(), scrubbing ? interval : Math.max(0, interval - (performance.now() - lastDispatch)));
+    if (disposed || seekTimer != null || changing) return;
+    const interval = mode === 'native' || (pendingTarget != null && hasBuffered(pendingTarget)) ? 40 : 250;
+    // A pending tick is a throttle, not a trailing debounce: motion must not postpone it.
+    seekTimer = setTimeout(() => flushSeek(), Math.max(0, interval - (performance.now() - lastDispatch)));
   }
   const requestSeek = (target, force = false) => {
     if (!(total > 0) || mode === 'live') return;
@@ -281,7 +367,7 @@ export function attachMedia(video, apiOrigin, relativePath, onState, onCapture) 
   const togglePlay = () => {
     wantedPlay = !wantedPlay;
     if (wantedPlay) { if (video.ended && total > 0) requestSeek(0, true); else playSafely(); }
-    else video.pause();
+    else { video.pause(); settle(); }
     render();
   };
   const continueAtEnd = async () => {
@@ -360,18 +446,36 @@ export function attachMedia(video, apiOrigin, relativePath, onState, onCapture) 
     listen(document, 'fullscreenchange', render);
   };
 
-  activePlayers++; video.muted = true; video.crossOrigin = 'anonymous';
+  activePlayers++; video.muted = true; video.crossOrigin = 'anonymous'; video.preload = 'auto';
   video.dataset.segmentLoads = '0'; video.dataset.seekOffset = '0';
   buildControls();
   listen(video, 'loadedmetadata', () => { video.playbackRate = Number(rate.value); render(); renderBuffer(); });
   listen(video, 'durationchange', () => { render(); renderBuffer(); });
   listen(video, 'progress', () => { renderBuffer(); settle(); });
   listen(video, 'loadeddata', settle); listen(video, 'seeked', settle); listen(video, 'canplay', settle);
+  listen(video, 'canplaythrough', settle); listen(video, 'suspend', settle);
   listen(video, 'play', () => { if (!changing && !scrubbing) wantedPlay = true; startAnimation(); render(); });
   listen(video, 'pause', () => { if (!changing && !scrubbing && !video.ended) wantedPlay = false; render(); });
-  listen(video, 'playing', () => { settle(); update('playing'); startAnimation(); });
+  listen(video, 'playing', () => { settle(); if (!changing) update('playing'); startAnimation(); });
+  listen(video, 'waiting', () => {
+    if (disposed || changing || scrubbing || !wantedPlay || video.ended || mode === 'live') return;
+    changing = true; loadKind = 'buffer'; acceptedTarget = null; seekStarted = 0;
+    cancelFrameWatch(); frameReady = video.readyState >= 2; video.pause();
+    if (!frameReady) watchTargetFrame();
+    update('loading', label('正在缓冲…', 'Buffering…')); watchLoad(); settle();
+  });
   listen(video, 'timeupdate', render); listen(video, 'volumechange', render); listen(video, 'ended', continueAtEnd);
-  listen(video, 'error', () => { if (!disposed) { changing = false; clearLoadTimeout(); render(); update('error', label('无法解码此文件，原始文件未改动。', 'Cannot decode this file. The original is unchanged.')); } });
+  function playbackFailure() {
+    if (disposed) return;
+    if (mode === 'native' && !compatibilityAttempted && info?.compatibilityAvailable && total > 0) {
+      compatibilityAttempted = true; const at = position();
+      mode = 'timeline'; video.dataset.playerMode = mode;
+      loadAt(at); return;
+    }
+    changing = false; clearLoadTimeout(); render();
+    update('error', label('无法解码此文件，原始文件未改动。', 'Cannot decode this file. The original is unchanged.'));
+  }
+  listen(video, 'error', playbackFailure);
   render();
   (async () => {
     try {
@@ -381,9 +485,11 @@ export function attachMedia(video, apiOrigin, relativePath, onState, onCapture) 
         makePlayer(apiOrigin + '/api/recordings/' + encodeURIComponent(relativePath.slice(5)) + '/preview', true, generation); playSafely(); render(); return;
       }
       await refreshInfo(); if (disposed) return;
-      mode = timelineFormats.has(info.format) ? 'timeline' : 'native'; video.dataset.playerMode = mode;
+      mode = timelineFormats.has(info.format) || info.nativeCompatible === false ? 'timeline' : 'native'; video.dataset.playerMode = mode;
+      if (mode === 'timeline' && info.compatibilityAvailable === false) throw Error(label('兼容预览需要 FFmpeg 和 ffprobe。', 'Compatibility preview requires FFmpeg and ffprobe.'));
+      if (mode === 'timeline' && !(total > 0) && !info.isRecording) throw Error(info.seekError || label('无法读取可播放的媒体时长。', 'Unable to read playable media duration.'));
       if (mode === 'timeline') {
-        if (total > 0) loadAt(info.isRecording ? Math.max(0, total - 3) : 0);
+        if (total > 0) loadAt(info.isRecording ? Math.max(0, total - 3) : 0, 'initial');
         poll = setInterval(async () => {
           if (!disposed && (info?.isRecording || !(total > 0))) {
             try { const before = total; const ready = await refreshInfo(); if (ready && before === 0) loadAt(info.isRecording ? Math.max(0, total - 3) : 0); }
@@ -392,7 +498,10 @@ export function attachMedia(video, apiOrigin, relativePath, onState, onCapture) 
         }, 1000);
       } else {
         if (info.isRecording && ['mp4', 'm4v'].includes(info.format)) throw Error(label('该 MP4 尚在录制，完成封装后可预览。', 'MP4 preview is available after recording finalizes.'));
-        video.src = apiOrigin + '/api/videos?path=' + encodeURIComponent(relativePath); video.load(); playSafely();
+        changing = true; loadKind = 'initial'; acceptedTarget = null; seekStarted = performance.now();
+        video.dataset.seekKind = 'initial'; watchTargetFrame(); watchLoad();
+        update('loading', label('正在准备播放…', 'Preparing playback…'));
+        video.src = apiOrigin + '/api/videos?path=' + encodeURIComponent(relativePath); video.load();
       }
       render();
     } catch (error) { if (!disposed && error.name !== 'AbortError') update('error', error.message); }
@@ -400,7 +509,7 @@ export function attachMedia(video, apiOrigin, relativePath, onState, onCapture) 
   return () => {
     if (disposed) return;
     disposed = true; generation++; abort.abort(); clearInterval(poll); clearTimeout(continuation); clearTimeout(seekTimer); clearLoadTimeout(); cancelAnimationFrame(animation);
-    removers.forEach(remove => remove()); release(); controls.remove(); freeze.remove();
+    cancelFrameWatch(); removers.forEach(remove => remove()); release(); controls.remove(); freeze.remove();
     host?.classList.remove('enhanced-preview', 'is-scrubbing', 'is-seeking');
     video.pause(); video.removeAttribute('src'); video.load(); video.controls = true; activePlayers--;
   };

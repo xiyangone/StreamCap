@@ -108,11 +108,13 @@ pub fn RecordingCard(
             </div>
             <div class="card-main">
                 <button class="card-name" title=t("查看录制信息") on:click=move |_| on_info.run(record.get_untracked())>{move || record.get().name()}</button>
-                <p class="card-subtitle" title=move || record.get().live_title.unwrap_or_default()>{move || crate::app::labels::recording_subtitle(&record.get())}</p>
+                <Show when=move || record.with(|r| r.live_title.as_ref().is_some_and(|title| !title.trim().is_empty()) || r.check_state == "rechecking" || (!r.is_recording && r.check_error.as_ref().is_some_and(|error| !error.is_empty())))>
+                    <p class="card-subtitle" title=move || record.get().live_title.unwrap_or_default()>{move || crate::app::labels::recording_subtitle(&record.get())}</p>
+                </Show>
                 <Show when=move || record.get().check_error.is_some() && record.get().check_state != "rechecking">
                     <div class="card-check-error" role="status" title=move || record.get().check_error.unwrap_or_default()>
                         <span><Icon name="alert" size=14 />{move || if record.get().verification_required { t("请在快手窗口完成验证").to_string() } else { crate::tr_format!("检测失败：{}",record.get().check_error.unwrap_or_default()) }}</span>
-                        <Show when=move || record.get().verification_required || matches!(record.get().access_state.as_str(), "pageCheck" | "unavailable" | "loginPrompt")>
+                        <Show when=move || record.get().platform_key.as_deref() == Some("kuaishou") && (record.get().verification_required || matches!(record.get().access_state.as_str(), "pageCheck" | "unavailable" | "loginPrompt" | "loginRequired" | "cooldown"))>
                             <button class="button secondary small card-verify" type="button" disabled=move || busy.get() || !state.status.get().ok || !crate::api::desktop::state().available on:click=move |_|perform.run(Action::Verify)>{move || if record.get().verification_required { t("重新验证") } else { t("检查页面") }}</button>
                         </Show>
                     </div>
@@ -120,12 +122,24 @@ pub fn RecordingCard(
                 <Show when=move || record.get().recording_error.as_ref().is_some_and(|error| !error.is_empty())>
                     <p class="card-recording-error" role="status"><Icon name="alert" size=14 /><span>{move || crate::tr_format!("录制失败：{}", record.get().recording_error.unwrap_or_default())}</span></p>
                 </Show>
-                {move || state.media_jobs.with(|jobs| jobs.iter().rev().find(|j| j.task_id.as_deref() == Some(record.get().rec_id.as_str())).map(|j| view! { <p class="media-job-status" role="status">{j.message.clone()}</p> }))}
+                {move || state.media_jobs.with(|jobs| jobs.iter().rev().find(|j| j.task_id.as_deref() == Some(record.get().rec_id.as_str())).map(|j| view! { <p class="media-job-status" role="status">{crate::app::i18n::message(j.message.clone())}<span class="media-job-detail">{crate::app::labels::media_progress(j, state.now.get())}</span></p> }))}
             </div>
-            <div class="card-monitor-row"><span class:monitor-on=move || record.get().monitor_status><Icon name="eye" size=14 />{move || monitoring_label(&record.get())}</span></div>
-            <div class="card-meta"><div class="card-tags"><span>{move || quality_label(record.get().quality.as_deref())}</span><span>{move || format_label(record.get().record_format.as_deref())}</span>{move || record.get().segment_record.unwrap_or(false).then(|| view! { <span>{t("分段")}</span> })}</div>
-                <span class="card-speed"><Show when=move || record.get().is_recording><span class="card-duration">{move || duration(record.get().recorded_seconds)}</span></Show><Show when=move || record.get().is_recording><Icon name="signal" size=13 /></Show>{move || record.get().speed.unwrap_or_else(|| "—".into())}</span>
+            <div class="card-summary">
+                <div class="card-monitor-row"><span class:monitor-on=move || record.get().monitor_status><Icon name="eye" size=14 />{move || monitoring_label(&record.get())}</span></div>
+                <div class="card-meta"><div class="card-tags"><span>{move || quality_label(record.get().quality.as_deref())}</span><span>{move || format_label(record.get().record_format.as_deref())}</span>{move || record.get().segment_record.unwrap_or(false).then(|| view! { <span>{t("分段")}</span> })}</div>
+                    <Show when=move || record.get().is_recording>
+                        <span class="card-speed"><span class="card-duration">{move || duration(record.get().recorded_seconds)}</span><Icon name="signal" size=13 />{move || record.get().speed.unwrap_or_else(|| "—".into())}</span>
+                    </Show>
+                </div>
             </div>
+            <Show when=move || !record.get().is_recording && record.get().monitor_status>
+                <div class="card-schedule" aria-label=t("检测安排") data-wait-reason=move || record.get().check_wait_reason>
+                    <Show when=move || record.with(|r| !matches!(r.check_wait_reason.as_str(), "interval" | "") || r.next_check_at.is_none())>
+                        <span class="card-queue-label">{move || crate::app::labels::queue_label(&record.get())}</span>
+                    </Show>
+                    <span class="card-queue-time">{move || if state.status.get().ok { crate::app::labels::queue_time(&record.get(), state.now.get()) } else { t("本地服务断开，时间待同步").into() }}</span>
+                </div>
+            </Show>
             <div class="card-actions">
                 <div class="card-primary-actions">
                     <button class="button secondary small card-monitor" type="button" aria-label=move || if record.get().monitor_status { t("暂停监控") } else { t("开启监控") } title=move || if record.get().monitor_status {t("暂停监控并停止录制")} else {t("开启监控并安排首次检测")} disabled=move || busy.get() || !state.status.get().ok on:click=move |_| perform.run(Action::Monitor)>{move || if record.get().monitor_status {t("暂停监控")} else {t("开启监控")}}</button>

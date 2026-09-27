@@ -253,6 +253,13 @@ pub async fn resolve(request: &ResolveRequest) -> Result<StreamInfo, String> {
             },
             Err(_) => "抖音接口未返回 JSON".into(),
         },
+        Err(e)
+            if ["HTTP 401", "HTTP 403", "HTTP 429"]
+                .iter()
+                .any(|code| e.contains(code)) =>
+        {
+            return Err(e)
+        }
         Err(e) => e,
     };
     let page = http.get(url, "https://live.douyin.com/").await?;

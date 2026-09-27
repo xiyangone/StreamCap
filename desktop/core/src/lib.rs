@@ -10,6 +10,7 @@ pub mod direct;
 pub mod engine;
 pub mod media_safety;
 pub mod model;
+pub mod network;
 pub mod notifications;
 pub(crate) mod owned_process;
 pub mod pacing;

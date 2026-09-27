@@ -30,3 +30,5 @@ backup_config/
 .DS_Store
 Thumbs.db
 *.log
+/StreamCap.exe
+/StreamCap.exe.sha256

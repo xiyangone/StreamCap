@@ -11,13 +11,17 @@ pub struct Storage {
     stop: CancellationToken,
     tasks: TaskTracker,
     registration: Arc<Mutex<()>>,
+    slots: Arc<tokio::sync::Semaphore>,
+    sizes: Arc<Mutex<std::collections::HashMap<PathBuf, (std::time::Instant, u64)>>>,
 }
 impl Storage {
     pub fn new(stop: CancellationToken) -> Self {
         Self {
-            stop,
+            stop: stop.child_token(),
             tasks: TaskTracker::new(),
             registration: Arc::default(),
+            slots: Arc::new(tokio::sync::Semaphore::new(4)),
+            sizes: Arc::default(),
         }
     }
     pub async fn blocking<T, F>(&self, operation: F) -> io::Result<T>
@@ -25,6 +29,12 @@ impl Storage {
         T: Send + 'static,
         F: FnOnce(CancellationToken) -> io::Result<T> + Send + 'static,
     {
+        let cancel = self.stop.child_token();
+        let _cancel_on_drop = cancel.clone().drop_guard();
+        let permit = tokio::select! { biased;
+            _ = cancel.cancelled() => return Err(io::Error::new(io::ErrorKind::Interrupted, "文件操作已取消")),
+            permit = self.slots.clone().acquire_owned() => permit.map_err(|_| io::Error::other("文件服务已关闭"))?,
+        };
         let task = {
             let _guard = self
                 .registration
@@ -34,21 +44,52 @@ impl Storage {
             if self.tasks.is_closed() {
                 return Err(io::Error::new(io::ErrorKind::Interrupted, "文件服务已关闭"));
             }
-            let stop = self.stop.clone();
-            self.tasks.spawn_blocking(move || operation(stop))
+            self.tasks.spawn_blocking(move || {
+                let _permit = permit;
+                operation(cancel)
+            })
         };
         task.await.map_err(io::Error::other)?
     }
     pub async fn shutdown(&self) {
         {
             let _guard = self.registration.lock().unwrap_or_else(|e| e.into_inner());
+            self.stop.cancel();
             self.tasks.close();
         }
         self.tasks.wait().await;
     }
     pub async fn size(&self, path: PathBuf) -> io::Result<u64> {
-        self.blocking(move |stop| directory_size(&path, &stop))
-            .await
+        check_cancel(&self.stop)?;
+        let key = path.clone();
+        if let Some((when, size)) = self
+            .sizes
+            .lock()
+            .map_err(|_| io::Error::other("体积缓存不可用"))?
+            .get(&key)
+        {
+            if when.elapsed() < std::time::Duration::from_secs(30) {
+                return Ok(*size);
+            }
+        }
+        let size = self
+            .blocking(move |stop| directory_size(&path, &stop))
+            .await?;
+        let mut cache = self
+            .sizes
+            .lock()
+            .map_err(|_| io::Error::other("体积缓存不可用"))?;
+        cache.retain(|_, (when, _)| when.elapsed() < std::time::Duration::from_secs(30));
+        if cache.len() >= 64 {
+            cache.clear();
+        }
+        cache.insert(key, (std::time::Instant::now(), size));
+        Ok(size)
+    }
+    pub fn invalidate_sizes(&self) {
+        if let Ok(mut cache) = self.sizes.lock() {
+            cache.clear();
+        }
     }
 }
 pub fn check_cancel(stop: &CancellationToken) -> io::Result<()> {
@@ -194,6 +235,7 @@ pub struct Item {
     pub name: String,
     pub is_dir: bool,
     pub size: u64,
+    pub size_known: bool,
     pub path: String,
     pub modified: Option<f64>,
 }
@@ -203,6 +245,7 @@ pub struct Listing {
     pub root: String,
     pub items: Vec<Item>,
     pub total_size: u64,
+    pub total_size_known: bool,
 }
 pub fn list(root: &Path, relative: &str, stop: &CancellationToken) -> io::Result<Listing> {
     relative_path(relative)?;
@@ -210,6 +253,7 @@ pub fn list(root: &Path, relative: &str, stop: &CancellationToken) -> io::Result
         root: root.to_string_lossy().into_owned(),
         items: vec![],
         total_size: 0,
+        total_size_known: true,
     };
     let target = match checked_target(root, relative, true) {
         Ok(p) => p,
@@ -248,7 +292,8 @@ pub fn list(root: &Path, relative: &str, stop: &CancellationToken) -> io::Result
             continue;
         }
         let size = if metadata.is_dir() {
-            directory_size(&entry.path(), stop)?
+            result.total_size_known = false;
+            0
         } else {
             metadata.len()
         };
@@ -257,6 +302,7 @@ pub fn list(root: &Path, relative: &str, stop: &CancellationToken) -> io::Result
             name: entry.file_name().to_string_lossy().into_owned(),
             is_dir: metadata.is_dir(),
             size,
+            size_known: metadata.is_file(),
             path: entry
                 .path()
                 .strip_prefix(&canonical_root)

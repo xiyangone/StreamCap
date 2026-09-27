@@ -28,14 +28,20 @@ impl Download {
             client = client.proxy(reqwest::Proxy::all(proxy).map_err(|_| "录制代理无效")?);
         }
         let client = client.build().map_err(|_| "FLV 下载器初始化失败")?;
-        let mut request = client.get(url);
+        let mut request_headers = reqwest::header::HeaderMap::new();
+        let mut target = reqwest::Url::parse(url).map_err(|_| "FLV 播放地址无效")?;
         for line in headers
             .unwrap_or("")
             .split("\r\n")
             .filter(|s| !s.is_empty())
         {
             let (key, value) = line.split_once(':').ok_or("录制请求头无效")?;
-            request = request.header(key.trim(), value.trim());
+            request_headers.insert(
+                reqwest::header::HeaderName::from_bytes(key.trim().as_bytes())
+                    .map_err(|_| "录制请求头无效")?,
+                reqwest::header::HeaderValue::from_str(value.trim())
+                    .map_err(|_| "录制请求头无效")?,
+            );
         }
         let download = Self {
             stop: CancellationToken::new(),
@@ -47,7 +53,41 @@ impl Download {
             use tokio::io::AsyncWriteExt;
             let mut file: Option<tokio::fs::File> = None;
             let work = async {
-                let mut response = request.send().await.map_err(|_| "FLV 拉流连接失败")?;
+                let mut visited = std::collections::HashSet::new();
+                let mut response = loop {
+                    if !visited.insert(target.clone()) || visited.len() > 6 {
+                        return Err("FLV 重定向循环或超过 5 次".into());
+                    }
+                    let response = client
+                        .get(target.clone())
+                        .headers(request_headers.clone())
+                        .send()
+                        .await
+                        .map_err(|_| "FLV 拉流连接失败")?;
+                    if !response.status().is_redirection() {
+                        break response;
+                    }
+                    let location = response
+                        .headers()
+                        .get(reqwest::header::LOCATION)
+                        .and_then(|v| v.to_str().ok())
+                        .ok_or("FLV 跳转缺少地址")?;
+                    let next = target.join(location).map_err(|_| "FLV 跳转地址无效")?;
+                    validate_redirect(&target, &next)?;
+                    if target.origin() != next.origin() {
+                        let remove = request_headers
+                            .keys()
+                            .filter(|name| {
+                                !matches!(name.as_str(), "accept" | "range" | "user-agent")
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        for name in remove {
+                            request_headers.remove(name);
+                        }
+                    }
+                    target = next;
+                };
                 if !response.status().is_success() {
                     return Err(format!(
                         "FLV 播放地址返回 HTTP {}",
@@ -123,9 +163,46 @@ impl Download {
     }
 }
 
+fn validate_redirect(from: &reqwest::Url, to: &reqwest::Url) -> Result<(), String> {
+    crate::platforms::http::validate_url(to.as_str())?;
+    if from.scheme() == "https" && to.scheme() != "https" {
+        return Err("FLV 跳转不能降低 HTTPS 安全性".into());
+    }
+    let local = |url: &reqwest::Url| {
+        url.host_str().is_some_and(|host| {
+            host == "localhost"
+                || host
+                    .trim_matches(['[', ']'])
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified())
+        })
+    };
+    if !local(from) && local(to) {
+        return Err("FLV 跳转到本机地址被拒绝".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn redirects_reject_downgrade_credentials_and_local_pivots() {
+        let from = reqwest::Url::parse("https://cdn.example/live.flv").unwrap();
+        for target in [
+            "http://cdn.example/live.flv",
+            "https://user:pass@cdn.example/live.flv",
+            "https://127.0.0.1/live.flv",
+            "file:///secret",
+        ] {
+            assert!(validate_redirect(&from, &reqwest::Url::parse(target).unwrap()).is_err());
+        }
+        assert!(validate_redirect(
+            &from,
+            &reqwest::Url::parse("https://other-cdn.example/live.flv").unwrap()
+        )
+        .is_ok());
+    }
     #[tokio::test]
     async fn invalid_responses_create_no_recording_and_existing_files_are_never_replaced() {
         use axum::{routing::get, Router};

@@ -123,7 +123,21 @@ impl Postprocessor {
             .lock()
             .expect("media jobs lock")
             .iter()
-            .map(|(_, job)| job.clone())
+            .scan(0usize, |position, (_, job)| {
+                let mut job = job.clone();
+                if job.state == MediaJobState::Waiting {
+                    *position += 1;
+                    job.queue_position = Some(*position);
+                }
+                if let Some(started) = job.started_at {
+                    job.elapsed_seconds = job
+                        .finished_at
+                        .unwrap_or_else(|| chrono::Utc::now().timestamp())
+                        .saturating_sub(started)
+                        .max(0) as u64;
+                }
+                Some(job)
+            })
             .collect()
     }
     pub fn pending(&self) -> usize {
@@ -241,6 +255,12 @@ impl Postprocessor {
             source: relative.replace('\\', "/"),
             output: output_relative,
             state: MediaJobState::Waiting,
+            stage_percent: None,
+            stage_eta_seconds: None,
+            started_at: None,
+            finished_at: None,
+            elapsed_seconds: 0,
+            queue_position: None,
             delete_original: options.delete_original,
             source_removed: false,
             message: if options.delete_original {
@@ -430,6 +450,53 @@ impl Postprocessor {
         Ok(count)
     }
 
+    fn progress_reporter(
+        &self,
+        id: &str,
+        duration: Option<f64>,
+    ) -> Option<Arc<dyn Fn(u64) + Send + Sync>> {
+        let duration = duration.filter(|n| n.is_finite() && *n > 0.0)?;
+        let owner = self.clone();
+        let id = id.to_owned();
+        let began = std::time::Instant::now();
+        Some(Arc::new(move |micros| {
+            let seconds = micros as f64 / 1_000_000.0;
+            let elapsed = began.elapsed().as_secs_f64();
+            let percent = ((seconds / duration * 100.0).clamp(0.0, 99.0)) as u8;
+            let changed = owner
+                .inner
+                .jobs
+                .lock()
+                .expect("media jobs lock")
+                .iter_mut()
+                .find(|(_, job)| job.id == id)
+                .and_then(|(_, job)| {
+                    if !job.state.pending() || job.stage_percent == Some(percent) {
+                        return None;
+                    }
+                    job.stage_percent = Some(percent);
+                    job.stage_eta_seconds = if elapsed >= 1.0 && seconds > 0.0 && percent >= 5 {
+                        Some(
+                            ((duration - seconds).max(0.0) * elapsed / seconds)
+                                .ceil()
+                                .min(86400.0) as u64,
+                        )
+                    } else {
+                        None
+                    };
+                    job.elapsed_seconds = job
+                        .started_at
+                        .map(|start| {
+                            chrono::Utc::now().timestamp().saturating_sub(start).max(0) as u64
+                        })
+                        .unwrap_or(0);
+                    Some(job.clone())
+                });
+            if let Some(job) = changed {
+                owner.publish(&job);
+            }
+        }))
+    }
     fn publish(&self, job: &MediaJob) {
         self.inner.store.emit(
             "mediaJob",
@@ -442,6 +509,24 @@ impl Postprocessor {
             jobs.iter_mut()
                 .find(|(_, job)| job.id == id)
                 .map(|(_, job)| {
+                    let now = chrono::Utc::now().timestamp();
+                    if state != MediaJobState::Waiting && job.started_at.is_none() {
+                        job.started_at = Some(now);
+                    }
+                    if !state.pending() {
+                        job.finished_at = Some(now);
+                    }
+                    job.elapsed_seconds = job
+                        .started_at
+                        .map(|start| now.saturating_sub(start).max(0) as u64)
+                        .unwrap_or(0);
+                    job.stage_percent = if state == MediaJobState::Complete {
+                        Some(100)
+                    } else {
+                        None
+                    };
+                    job.stage_eta_seconds = None;
+                    job.queue_position = None;
                     job.state = state;
                     job.message = message.into();
                     job.clone()
@@ -467,7 +552,7 @@ impl Postprocessor {
             );
             return;
         };
-        self.transition(&id, MediaJobState::Running, "正在无损转封装为 MP4");
+        self.transition(&id, MediaJobState::Running, "正在读取源文件音视频与时长");
         let result = self.convert(&id, &input).await;
         if result.is_err()
             && std::fs::symlink_metadata(&input.temporary)
@@ -610,6 +695,7 @@ impl Postprocessor {
             &self.inner.stop,
             true,
             media_idle_budget(before.len()),
+            self.progress_reporter(id, source_info.1),
         )
         .await
         .map_err(|error| io::Error::other(format!("FFmpeg 转封装未完成: {error}")))?;
@@ -687,6 +773,7 @@ impl Postprocessor {
                 &self.inner.stop,
                 true,
                 media_idle_budget(before.len()),
+                self.progress_reporter(id, source_info.1),
             )
             .await
             .map_err(|_| invalid("MP4 完整解码校验失败，源 TS 保留"))?;
@@ -724,6 +811,7 @@ impl Postprocessor {
 }
 pub(crate) fn command(program: &Path) -> Command {
     let mut command = Command::new(program);
+    crate::network::isolate_media_proxy(&mut command);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -765,13 +853,14 @@ async fn wait_for_stall(advanced: Arc<Mutex<tokio::time::Instant>>, budget: Dura
     }
 }
 pub(crate) async fn run(command: Command, stop: &CancellationToken) -> io::Result<Vec<u8>> {
-    run_tool(command, stop, false, Duration::from_secs(600)).await
+    run_tool(command, stop, false, Duration::from_secs(600), None).await
 }
 async fn run_tool(
     mut command: Command,
     stop: &CancellationToken,
     progress: bool,
     budget: Duration,
+    observer: Option<Arc<dyn Fn(u64) + Send + Sync>>,
 ) -> io::Result<Vec<u8>> {
     let mut child = command.spawn()?;
     let stdout = child
@@ -798,6 +887,9 @@ async fn run_tool(
             {
                 if value > previous {
                     previous = value;
+                    if let Some(observer) = &observer {
+                        observer(value);
+                    }
                     *reader_progress.lock().expect("media progress") = tokio::time::Instant::now();
                 }
             }
@@ -853,6 +945,7 @@ async fn probe(
         stop,
         false,
         probe_budget(std::fs::metadata(file)?.len()),
+        None,
     )
     .await?;
     let value: Value = serde_json::from_slice(&raw).map_err(io::Error::other)?;

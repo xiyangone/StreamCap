@@ -9,11 +9,13 @@ use crate::engine::{
 use crate::postprocess::RemuxOptions;
 use crate::resolver::{ResolveRequest, Resolver};
 use crate::store::Store;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
+use tokio::time::Instant;
 
 /// 检测结果，供 API 直接回显。
 #[derive(Debug, Clone, PartialEq)]
@@ -51,10 +53,88 @@ impl CheckOutcome {
 type LiveSourceCache =
     std::collections::HashMap<String, (String, std::time::Instant, crate::resolver::StreamInfo)>;
 const LIVE_SOURCE_TTL: Duration = Duration::from_secs(300);
+const AUTOMATIC_LIMIT: usize = 3;
+const RECOVERY_DELAYS: [u64; 3] = [5, 15, 45];
+const RECOVERY_HEALTHY_SECONDS: f64 = 60.0;
+
+#[derive(Clone, Copy)]
+struct CheckDeadline {
+    instant: Instant,
+    timestamp: i64,
+}
+impl CheckDeadline {
+    fn after(delay: Duration) -> Self {
+        Self {
+            instant: Instant::now() + delay,
+            timestamp: chrono::Utc::now().timestamp() + delay.as_secs() as i64,
+        }
+    }
+}
+#[derive(Clone, Copy)]
+struct RecoveryRequest {
+    revision: u64,
+    due: CheckDeadline,
+}
+type RecoveryRequests = Arc<std::sync::Mutex<HashMap<String, RecoveryRequest>>>;
+
+struct CheckCompletion {
+    expected: crate::model::Recording,
+    recovering: bool,
+    result: Result<CheckOutcome, String>,
+}
+
+fn retryable_recording_error(error: &str) -> bool {
+    !crate::pacing::restricted(error)
+        && (transient_finished_check(error)
+            || [
+                "HTTP 404",
+                "拉流超时",
+                "连接播放服务器被拒绝",
+                "FLV 拉流连接",
+                "90 秒无媒体产出",
+                "120 秒未收到媒体",
+                "平台解析超时",
+                "平台请求超时",
+                "无法连接平台",
+                "排队或解析超过",
+                "传输或 TLS",
+                "未返回目标房间",
+            ]
+            .iter()
+            .any(|marker| error.contains(marker)))
+}
+
+fn requires_manual_access(record: &crate::model::Recording) -> bool {
+    record.verification_required
+        || matches!(
+            record.access_state.as_str(),
+            "captcha" | "loginRequired" | "loginPrompt"
+        )
+}
+
+fn next_window(record: &crate::model::Recording) -> CheckDeadline {
+    use chrono::Timelike;
+    let now = chrono::Local::now().time().num_seconds_from_midnight();
+    let seconds = record
+        .scheduled_start_time
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .filter_map(|start| {
+            chrono::NaiveTime::parse_from_str(start.trim(), "%H:%M:%S")
+                .or_else(|_| chrono::NaiveTime::parse_from_str(start.trim(), "%H:%M"))
+                .ok()
+        })
+        .map(|start| (start.num_seconds_from_midnight() + 86400 - now) % 86400)
+        .filter(|seconds| *seconds > 0)
+        .min()
+        .unwrap_or(86400);
+    CheckDeadline::after(Duration::from_secs(seconds as u64))
+}
 
 pub struct Scheduler {
     pacer: crate::pacing::Pacer,
-    automatic_pacer: crate::pacing::AutomaticPacer,
+    recovery_requests: RecoveryRequests,
     checks: Arc<
         std::sync::Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>,
     >,
@@ -70,8 +150,8 @@ pub struct Scheduler {
     background: tokio_util::task::TaskTracker,
     starting: Arc<tokio::sync::Mutex<()>>,
     interval_changed: tokio::sync::watch::Sender<u64>,
-    monitor_requests: std::sync::Mutex<std::collections::HashSet<String>>,
-    monitor_changed: tokio::sync::Notify,
+    monitor_requests: Arc<std::sync::Mutex<HashMap<String, CheckDeadline>>>,
+    monitor_changed: Arc<tokio::sync::Notify>,
     storage: crate::storage::Storage,
     pub postprocess: crate::postprocess::Postprocessor,
     pub notifications: crate::notifications::Notifications,
@@ -232,7 +312,7 @@ impl Scheduler {
             notifications,
             automation,
             pacer: crate::pacing::Pacer::default(),
-            automatic_pacer: crate::pacing::AutomaticPacer::default(),
+            recovery_requests: Arc::default(),
             checks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             schedule_edges: std::sync::Mutex::new(std::collections::HashMap::new()),
             live_sources: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
@@ -244,8 +324,8 @@ impl Scheduler {
             recording_enabled,
             storage: crate::storage::Storage::new(stopping.clone()),
             interval_changed: tokio::sync::watch::channel(0).0,
-            monitor_requests: std::sync::Mutex::new(std::collections::HashSet::new()),
-            monitor_changed: tokio::sync::Notify::new(),
+            monitor_requests: Arc::default(),
+            monitor_changed: Arc::new(tokio::sync::Notify::new()),
             stopping,
             postprocess,
             conversion_plans: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
@@ -267,7 +347,10 @@ impl Scheduler {
         self.monitor_requests
             .lock()
             .expect("monitor requests")
-            .extend(ids);
+            .extend(
+                ids.into_iter()
+                    .map(|id| (id, CheckDeadline::after(Duration::ZERO))),
+            );
         self.monitor_changed.notify_one();
     }
 
@@ -282,148 +365,368 @@ impl Scheduler {
     }
 
     pub async fn run(self: Arc<Self>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
-        use tokio::time::Instant;
         let mut changed = self.interval_changed.subscribe();
         let mut interval = self.monitoring_interval().await;
-        let mut deadlines: std::collections::HashMap<String, Instant> = self
-            .store
-            .all()
-            .await
-            .into_iter()
-            .filter(|record| record.monitor_status)
-            .map(|record| (record.rec_id, Instant::now()))
-            .collect();
-        for id in deadlines.keys() {
-            self.store
-                .update(id, |record| {
-                    record.check_state = if record.is_recording {
-                        "idle"
-                    } else {
-                        "queued"
-                    }
-                    .into();
-                    record.next_check_at = Some(chrono::Utc::now().timestamp());
-                })
-                .await;
-        }
+        let mut deadlines: HashMap<String, CheckDeadline> = HashMap::new();
+        let mut fair = crate::pacing::FairQueue::default();
+        let mut running = tokio::task::JoinSet::<CheckCompletion>::new();
         loop {
-            let deadline = deadlines
-                .values()
-                .copied()
-                .min()
-                .unwrap_or_else(|| Instant::now() + Duration::from_secs(86400));
-            tokio::select! { biased;
-                _ = self.stopping.cancelled() => return,
-                _ = shutdown.changed() => return,
-                _ = changed.changed() => {
-                    interval = self.monitoring_interval().await;
-                    for (id, next) in &mut deadlines {
-                        *next = Instant::now() + interval;
-                        self.store.update(id, |r| { if r.check_state != "rechecking" { r.check_state = "idle".into(); } r.next_check_at = Some(chrono::Utc::now().timestamp() + interval.as_secs() as i64); }).await;
+            if self.stopping.is_cancelled() || *shutdown.borrow() || shutdown.has_changed().is_err()
+            {
+                running.abort_all();
+                while running.join_next().await.is_some() {}
+                self.recovery_requests
+                    .lock()
+                    .expect("recovery requests")
+                    .clear();
+                for record in self.store.all().await {
+                    if !record.is_recording {
+                        self.store
+                            .update(&record.rec_id, |r| {
+                                r.clear_queue();
+                                r.check_state = "idle".into();
+                                r.next_check_at = None;
+                            })
+                            .await;
                     }
-                    continue;
-                },
-                _ = self.monitor_changed.notified() => {},
-                _ = tokio::time::sleep_until(deadline) => {},
+                }
+                return;
             }
             let requested =
                 std::mem::take(&mut *self.monitor_requests.lock().expect("monitor requests"));
             let records = self.store.all().await;
-            deadlines.retain(|id, _| records.iter().any(|r| &r.rec_id == id && r.monitor_status));
+            let ids: HashSet<_> = records
+                .iter()
+                .filter(|r| r.monitor_status)
+                .map(|r| r.rec_id.clone())
+                .collect();
+            deadlines.retain(|id, _| ids.contains(id));
             for record in &records {
-                if record.monitor_status && requested.contains(&record.rec_id) {
-                    let now = Instant::now();
-                    deadlines
-                        .entry(record.rec_id.clone())
-                        .and_modify(|due| *due = (*due).min(now))
-                        .or_insert(now);
-                    self.store
-                        .update(&record.rec_id, |r| {
-                            if !r.is_recording
-                                && !matches!(r.check_state.as_str(), "checking" | "rechecking")
-                            {
-                                r.check_state = "queued".into();
-                            }
-                            r.next_check_at = Some(chrono::Utc::now().timestamp());
-                        })
-                        .await;
+                if record.monitor_status {
+                    if let Some(due) = requested.get(&record.rec_id) {
+                        deadlines.insert(record.rec_id.clone(), *due);
+                    } else {
+                        deadlines
+                            .entry(record.rec_id.clone())
+                            .or_insert_with(|| CheckDeadline::after(Duration::ZERO));
+                    }
                 }
             }
-            let now = Instant::now();
-            let due = records
-                .into_iter()
-                .filter(|record| {
-                    record.monitor_status
-                        && deadlines
-                            .get(&record.rec_id)
-                            .is_some_and(|next| *next <= now)
-                })
-                .min_by_key(|record| deadlines[&record.rec_id]);
-            let Some(record) = due else { continue };
-            if !self.recording_enabled.load(Ordering::SeqCst)
-                || record.is_recording
-                || record.check_state == "rechecking"
-            {
-                deadlines.insert(record.rec_id.clone(), now + interval);
-                self.store
-                    .update(&record.rec_id, |r| {
-                        r.next_check_at =
-                            Some(chrono::Utc::now().timestamp() + interval.as_secs() as i64);
-                        if r.is_recording {
-                            r.check_state = "idle".into();
-                        }
+            let recovery = {
+                let mut recovery = self.recovery_requests.lock().expect("recovery requests");
+                recovery.retain(|id, request| {
+                    records.iter().any(|r| {
+                        &r.rec_id == id
+                            && r.schedule_revision == request.revision
+                            && r.monitor_status
+                            && !r.is_recording
+                            && !requires_manual_access(r)
                     })
-                    .await;
-                continue;
-            }
-            self.store
-                .update(&record.rec_id, |r| {
-                    if !matches!(r.check_state.as_str(), "checking" | "rechecking") {
-                        r.check_state = "queued".into();
+                });
+                recovery.clone()
+            };
+            let checking: HashSet<_> = self
+                .checks
+                .lock()
+                .expect("active checks")
+                .keys()
+                .cloned()
+                .collect();
+            let (maximum, spacing) = {
+                let config = self.config.read().await;
+                (
+                    config
+                        .get_i64("platform_max_concurrent_requests", 3)
+                        .clamp(1, 16) as usize,
+                    Duration::from_secs(
+                        config.get_i64("platform_request_interval", 3).clamp(0, 300) as u64,
+                    ),
+                )
+            };
+            let mut candidates = Vec::new();
+            for record in records {
+                if checking.contains(&record.rec_id) || record.check_state == "rechecking" {
+                    continue;
+                }
+                if !record.monitor_status {
+                    self.show_wait(&record, "idle", "paused", None, None, None)
+                        .await;
+                    continue;
+                }
+                if record.is_recording {
+                    if deadlines[&record.rec_id].instant <= Instant::now() {
+                        deadlines.insert(record.rec_id.clone(), CheckDeadline::after(interval));
                     }
-                })
-                .await;
-            let check = async {
-                let _permit = self.automatic_pacer.acquire(&self.stopping).await?;
-                log::info!(
-                    "自动探测开始 task={} platform={} interval={}s",
-                    record.rec_id,
-                    record.platform_key.as_deref().unwrap_or("custom"),
-                    interval.as_secs()
-                );
-                self.check(record.rec_id.clone()).await
-            };
-            let result = tokio::select! { biased;
-                _ = self.stopping.cancelled() => return,
-                _ = shutdown.changed() => return,
-                result = check => result,
-            };
-            if let Err(error) = result {
-                log::debug!("检测未完成: {error}");
-            }
-            // The next ordinary poll is measured per room, after its own completion.
-            self.store
-                .update(&record.rec_id, |r| {
-                    if !self
-                        .checks
+                    self.show_wait(&record, "idle", "recording", None, None, None)
+                        .await;
+                    continue;
+                }
+                if requires_manual_access(&record) {
+                    self.show_wait(&record, "idle", "verification", None, None, None)
+                        .await;
+                    continue;
+                }
+                if !crate::schedule::active(&record).unwrap_or(false) {
+                    self.recovery_requests
                         .lock()
-                        .expect("active checks")
-                        .contains_key(&record.rec_id)
-                    {
-                        r.check_state = "idle".into();
+                        .expect("recovery requests")
+                        .remove(&record.rec_id);
+                    if record.check_wait_reason != "schedule" {
+                        deadlines.insert(record.rec_id.clone(), next_window(&record));
                     }
-                    r.next_check_at = r
-                        .monitor_status
-                        .then_some(chrono::Utc::now().timestamp() + interval.as_secs() as i64);
-                })
+                    let due = deadlines[&record.rec_id];
+                    self.show_wait(
+                        &record,
+                        "idle",
+                        "schedule",
+                        None,
+                        Some(due.timestamp),
+                        Some(due.timestamp),
+                    )
+                    .await;
+                    continue;
+                }
+                if !self.recording_enabled.load(Ordering::SeqCst) {
+                    continue;
+                }
+                let recovering = recovery.contains_key(&record.rec_id);
+                let due = recovery
+                    .get(&record.rec_id)
+                    .map(|r| r.due)
+                    .unwrap_or(deadlines[&record.rec_id]);
+                if due.instant > Instant::now() {
+                    let reason = if recovering {
+                        "recovery"
+                    } else if record.recovery_attempt >= RECOVERY_DELAYS.len() as u32 {
+                        "recoveryExhausted"
+                    } else {
+                        "interval"
+                    };
+                    self.show_wait(
+                        &record,
+                        if recovering { "recovering" } else { "idle" },
+                        reason,
+                        None,
+                        Some(due.timestamp),
+                        Some(deadlines[&record.rec_id].timestamp),
+                    )
+                    .await;
+                } else {
+                    candidates.push((record, due, recovering));
+                }
+            }
+            // Simulate the same platform turns for queue positions as for actual admission.
+            let mut projected = fair.clone();
+            let mut ordered = Vec::new();
+            while !candidates.is_empty() {
+                let index = (0..candidates.len())
+                    .min_by_key(|&i| {
+                        let (r, due, _) = &candidates[i];
+                        (
+                            projected.rank(r.platform_key.as_deref().unwrap_or("custom")),
+                            due.instant,
+                            r.rec_id.clone(),
+                        )
+                    })
+                    .expect("nonempty queue");
+                let candidate = candidates.remove(index);
+                projected.served(candidate.0.platform_key.as_deref().unwrap_or("custom"));
+                ordered.push(candidate);
+            }
+            let mut position = 0;
+            for (record, due, recovering) in ordered {
+                let key = record.platform_key.as_deref().unwrap_or("custom");
+                let gate = self.pacer.status(key, maximum);
+                let capacity = running.len() < AUTOMATIC_LIMIT;
+                let ready = gate.reason == "queue" && capacity;
+                if !ready {
+                    position += 1;
+                    let reason = if gate.reason == "queue" {
+                        "capacity"
+                    } else {
+                        gate.reason
+                    };
+                    let earliest = gate.ready_at.map(|at| {
+                        due.timestamp.max(
+                            chrono::Utc::now().timestamp()
+                                + at.saturating_duration_since(Instant::now())
+                                    .as_secs_f64()
+                                    .ceil() as i64,
+                        )
+                    });
+                    self.show_wait(
+                        &record,
+                        if recovering { "recovering" } else { "queued" },
+                        reason,
+                        Some(position),
+                        if reason == "capacity" { None } else { earliest },
+                        Some(deadlines[&record.rec_id].timestamp),
+                    )
+                    .await;
+                    continue;
+                }
+                self.show_wait(
+                    &record,
+                    "queued",
+                    "queue",
+                    None,
+                    Some(due.timestamp),
+                    Some(deadlines[&record.rec_id].timestamp),
+                )
                 .await;
-            deadlines.insert(record.rec_id, Instant::now() + interval);
+                if self.store.get(&record.rec_id).await.is_none_or(|r| {
+                    r.schedule_revision != record.schedule_revision
+                        || !r.monitor_status
+                        || r.is_recording
+                        || requires_manual_access(&r)
+                }) {
+                    continue;
+                }
+                let Ok(operation) = self.begin_check(&record.rec_id) else {
+                    continue;
+                };
+                let Some(permit) = self.pacer.try_acquire(key, maximum, spacing) else {
+                    continue;
+                };
+                fair.served(key);
+                if recovering {
+                    self.recovery_requests
+                        .lock()
+                        .expect("recovery requests")
+                        .remove(&record.rec_id);
+                }
+                if self
+                    .store
+                    .update_when(
+                        &record.rec_id,
+                        |r| r.schedule_revision == record.schedule_revision && r.monitor_status,
+                        |r| {
+                            r.clear_queue();
+                            if !recovering {
+                                r.recovery_attempt = 0;
+                            }
+                        },
+                    )
+                    .await
+                    .is_none()
+                {
+                    continue;
+                }
+                let scheduler = self.clone();
+                running.spawn(async move {
+                    let _operation = operation;
+                    let result = scheduler
+                        .check_with_permit(
+                            record.rec_id.clone(),
+                            Some(permit),
+                            Some(record.schedule_revision),
+                        )
+                        .await;
+                    CheckCompletion {
+                        expected: record,
+                        recovering,
+                        result,
+                    }
+                });
+            }
+            tokio::select! { biased;
+                _ = self.stopping.cancelled() => {},
+                _ = shutdown.changed() => {},
+                _ = changed.changed() => {
+                    interval = self.monitoring_interval().await;
+                    for due in deadlines.values_mut() { *due = CheckDeadline::after(interval); }
+                },
+                _ = self.monitor_changed.notified() => {},
+                completion = running.join_next(), if !running.is_empty() => {
+                    match completion {
+                        Some(Ok(done)) => {
+                            let id = &done.expected.rec_id;
+                            if let Some(current) = self.store.get(id).await.filter(|r| r.schedule_revision == done.expected.schedule_revision) {
+                                let due = CheckDeadline::after(interval);
+                                deadlines.insert(id.clone(), due);
+                                self.store.update_when(id, |r| r.schedule_revision == current.schedule_revision,
+                                    |r| { r.next_check_at = r.monitor_status.then_some(due.timestamp); }).await;
+                                let error = match &done.result {
+                                    Err(error) => Some(error),
+                                    Ok(CheckOutcome::Failed(error)) if done.recovering => Some(error),
+                                    _ => None,
+                                };
+                                if error.is_some_and(|error| retryable_recording_error(error)) {
+                                    self.room_check().request_recovery(&current).await;
+                                } else if !current.is_recording && !self.recovery_requests.lock().expect("recovery requests").contains_key(id) {
+                                    self.store.update_when(id, |r| r.schedule_revision == current.schedule_revision, |r| {
+                                        r.clear_queue();
+                                        if matches!(done.result, Ok(CheckOutcome::Offline | CheckOutcome::NotifyOnly | CheckOutcome::StreamEnded)) { r.recovery_attempt = 0; }
+                                    }).await;
+                                }
+                            }
+                        },
+                        Some(Err(error)) => log::error!("自动检测任务未完成: {error}"),
+                        None => {},
+                    }
+                },
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+            }
         }
+    }
+
+    async fn show_wait(
+        &self,
+        expected: &crate::model::Recording,
+        phase: &str,
+        reason: &str,
+        position: Option<usize>,
+        ready_at: Option<i64>,
+        next_at: Option<i64>,
+    ) {
+        self.store
+            .update_when(
+                &expected.rec_id,
+                |r| {
+                    r.schedule_revision == expected.schedule_revision
+                        && r.is_recording == expected.is_recording
+                        && !self
+                            .checks
+                            .lock()
+                            .expect("active checks")
+                            .contains_key(&r.rec_id)
+                        && (r.check_state != phase
+                            || r.check_wait_reason != reason
+                            || r.queue_position != position
+                            || r.check_ready_at != ready_at
+                            || r.next_check_at != next_at)
+                },
+                |r| {
+                    r.check_state = phase.into();
+                    r.check_wait_reason = reason.into();
+                    r.queue_position = position;
+                    r.check_ready_at = ready_at;
+                    r.next_check_at = next_at;
+                    if matches!(reason, "paused" | "schedule" | "verification" | "recording") {
+                        r.recovery_at = None;
+                    }
+                },
+            )
+            .await;
     }
 
     /// Detection and manual recording share metadata updates and name persistence.
     pub async fn check(&self, rec_id: String) -> Result<CheckOutcome, String> {
         let _operation = self.begin_check(&rec_id)?;
+        self.reset_manual_recovery(&rec_id).await;
+        let revision = self.store.get(&rec_id).await.map(|r| r.schedule_revision);
+        let result = self.check_with_permit(rec_id.clone(), None, revision).await;
+        let _lifecycle = self.starting.lock().await;
+        self.defer_normal_check(&rec_id, revision).await;
+        result
+    }
+
+    async fn check_with_permit(
+        &self,
+        rec_id: String,
+        permit: Option<crate::pacing::Permit>,
+        revision: Option<u64>,
+    ) -> Result<CheckOutcome, String> {
         if self.stopping.is_cancelled() {
             return Err("应用正在退出".into());
         }
@@ -439,7 +742,11 @@ impl Scheduler {
                 return Ok(CheckOutcome::OutsideSchedule);
             }
         }
-        let (expected, info) = match self.resolve_for(&rec_id).await {
+        let (expected, info) = match self
+            .room_check()
+            .resolve_with_permit(&rec_id, true, permit, revision)
+            .await
+        {
             Ok(resolved) => resolved,
             Err(error) => return Ok(CheckOutcome::Failed(error)),
         };
@@ -455,6 +762,7 @@ impl Scheduler {
                     !self.stopping.is_cancelled()
                         && r.platform_key.as_deref() == Some("kuaishou")
                         && r.url == expected.url
+                        && r.schedule_revision == expected.schedule_revision
                         && r.quality == expected.quality
                         && r.recording_run == expected.recording_run
                 },
@@ -484,7 +792,8 @@ impl Scheduler {
             .get(&expected.rec_id)
             .await
             .ok_or("验证任务已移除")?;
-        if current.platform_key.as_deref() != Some("kuaishou")
+        if !current.same_schedule_as(expected)
+            || current.platform_key.as_deref() != Some("kuaishou")
             || current.url != expected.url
             || current.quality != expected.quality
         {
@@ -515,6 +824,7 @@ impl Scheduler {
         let rec_id = expected.rec_id.clone();
         if self.store.get(&rec_id).await.is_none_or(|current| {
             current.url != expected.url
+                || current.schedule_revision != expected.schedule_revision
                 || current.quality != expected.quality
                 || current.recording_run != expected.recording_run
         }) {
@@ -569,7 +879,7 @@ impl Scheduler {
             }
         }
         if !info.is_live {
-            let was_recording = self.stop_recording_locked(&rec_id).await;
+            let was_recording = self.stop_recording_locked(&rec_id, false).await;
             return if manual {
                 Err("该直播间未开播".into())
             } else {
@@ -853,6 +1163,7 @@ impl Scheduler {
                 r.recording_run = Some(run_id);
                 r.recording_error = None;
                 r.recording_dir = Some(output_dir_str.clone());
+                r.clear_queue();
                 r.speed = Some("0 KB/s".into());
             })
             .await;
@@ -913,6 +1224,10 @@ impl Scheduler {
                                 }
                                 r.speed = None;
                                 r.recording_error = error.clone();
+                                r.clear_queue();
+                                if process.recorded_seconds() >= RECOVERY_HEALTHY_SECONDS {
+                                    r.recovery_attempt = 0;
+                                }
                             })
                             .await;
                         if let Some(plan) = plan {
@@ -935,10 +1250,19 @@ impl Scheduler {
                             live_sources.write().await.remove(&process.rec_id);
                             drop(_filesystem);
                             drop(_starting);
+                            if let Some(record) = &updated {
+                                room_check.defer_after_exit(record).await;
+                            }
                             if refresh_needed {
                                 room_check
                                     .refresh_finished(&process.rec_id, process.run_id)
                                     .await;
+                            } else if let Some(record) = updated.as_ref().filter(|r| {
+                                r.recording_error
+                                    .as_deref()
+                                    .is_some_and(retryable_recording_error)
+                            }) {
+                                room_check.request_recovery(record).await;
                             }
                         }
                         return;
@@ -1016,8 +1340,92 @@ impl Scheduler {
     /// 未开播时返回错误——对应 Python `recording_button_on_click` 的「该直播间未开播」提示。
     pub async fn force_start(&self, rec_id: String) -> Result<CheckOutcome, String> {
         let _operation = self.begin_check(&rec_id)?;
-        let (expected, info) = self.resolve_for(&rec_id).await?;
-        self.accept_resolved(&expected, &info, true).await
+        self.reset_manual_recovery(&rec_id).await;
+        let revision = self.store.get(&rec_id).await.map(|r| r.schedule_revision);
+        let result = async {
+            let (expected, info) = self.resolve_for(&rec_id).await?;
+            self.accept_resolved(&expected, &info, true).await
+        }
+        .await;
+        let _lifecycle = self.starting.lock().await;
+        self.defer_normal_check(&rec_id, revision).await;
+        result
+    }
+
+    async fn reset_manual_recovery(&self, rec_id: &str) {
+        self.recovery_requests
+            .lock()
+            .expect("recovery requests")
+            .remove(rec_id);
+        self.store
+            .update(rec_id, |r| {
+                r.schedule_revision = r.schedule_revision.wrapping_add(1);
+                r.clear_queue();
+                r.recovery_attempt = 0;
+            })
+            .await;
+    }
+
+    async fn defer_normal_check(&self, rec_id: &str, revision: Option<u64>) {
+        let due = CheckDeadline::after(self.monitoring_interval().await);
+        if let Some(record) = self
+            .store
+            .update_when(
+                rec_id,
+                |r| Some(r.schedule_revision) == revision,
+                |r| {
+                    r.next_check_at =
+                        (r.monitor_status && !r.is_recording).then_some(due.timestamp);
+                },
+            )
+            .await
+        {
+            if record.monitor_status {
+                self.monitor_requests
+                    .lock()
+                    .expect("monitor requests")
+                    .insert(rec_id.to_owned(), due);
+            }
+        }
+        self.monitor_changed.notify_one();
+    }
+
+    /// Called only after a committed edit, while the API still owns the lifecycle lock.
+    pub(crate) async fn edited(
+        &self,
+        records: &[crate::model::Recording],
+        previous: &[crate::model::Recording],
+    ) {
+        for record in records {
+            if let Some(token) = self
+                .checks
+                .lock()
+                .expect("active checks")
+                .get(&record.rec_id)
+            {
+                token.cancel();
+            }
+            self.recovery_requests
+                .lock()
+                .expect("recovery requests")
+                .remove(&record.rec_id);
+            let needs_initial_check = record.monitor_status
+                && !record.is_recording
+                && previous
+                    .iter()
+                    .find(|old| old.rec_id == record.rec_id)
+                    .is_some_and(|old| {
+                        !old.monitor_status
+                            || crate::model::room_identity(&old.url)
+                                != crate::model::room_identity(&record.url)
+                    });
+            if needs_initial_check {
+                self.request_monitoring([record.rec_id.clone()]);
+            } else {
+                self.defer_normal_check(&record.rec_id, Some(record.schedule_revision))
+                    .await;
+            }
+        }
     }
 
     /// All checks, including post-recording refreshes, share one resolver and pacer.
@@ -1030,6 +1438,10 @@ impl Scheduler {
             checks: self.checks.clone(),
             stopping: self.stopping.clone(),
             notifications: self.notifications.clone(),
+            starting: self.starting.clone(),
+            recovery_requests: self.recovery_requests.clone(),
+            monitor_changed: self.monitor_changed.clone(),
+            monitor_requests: self.monitor_requests.clone(),
         }
     }
     async fn resolve_for(
@@ -1076,7 +1488,9 @@ impl Scheduler {
         let _starting = self.starting.lock().await;
         let record = self.store.toggle_monitor_locked(rec_id).await?;
         if !record.monitor_status {
-            self.stop_recording_locked(rec_id).await;
+            self.stop_recording_locked(rec_id, true).await;
+        } else {
+            self.store.update(rec_id, |r| r.invalidate_schedule()).await;
         }
         self.request_monitoring([rec_id.to_owned()]);
         Ok(self.store.get(rec_id).await.unwrap_or(record))
@@ -1085,10 +1499,14 @@ impl Scheduler {
     /// 停止录制并更新状态。
     pub async fn stop_recording(&self, rec_id: &str) -> bool {
         let _starting = self.starting.lock().await;
-        self.stop_recording_locked(rec_id).await
+        self.stop_recording_locked(rec_id, true).await
     }
 
-    async fn stop_recording_locked(&self, rec_id: &str) -> bool {
+    async fn stop_recording_locked(&self, rec_id: &str, invalidate: bool) -> bool {
+        self.recovery_requests
+            .lock()
+            .expect("recovery requests")
+            .remove(rec_id);
         if let Some(token) = self.checks.lock().expect("active checks").get(rec_id) {
             token.cancel();
         }
@@ -1098,6 +1516,11 @@ impl Scheduler {
         let elapsed = process.as_ref().map(|p| p.recorded_seconds());
         self.store
             .update(rec_id, |r| {
+                if invalidate {
+                    r.invalidate_schedule();
+                } else {
+                    r.clear_queue();
+                }
                 r.is_recording = false;
                 if let Some(elapsed) = elapsed {
                     r.recorded_seconds = elapsed;
@@ -1112,6 +1535,10 @@ impl Scheduler {
                 }
             })
             .await;
+        if invalidate {
+            let revision = self.store.get(rec_id).await.map(|r| r.schedule_revision);
+            self.defer_normal_check(rec_id, revision).await;
+        }
         if let Some(process) = process {
             let plan = self.conversion_plans.lock().await.remove(&process.run_id);
             if let Some(plan) = plan {
@@ -1131,7 +1558,7 @@ impl Scheduler {
     pub async fn stop_all_for_shutdown(&self) {
         let _starting = self.starting.lock().await;
         for id in self.engine.active_ids().await {
-            self.stop_recording_locked(&id).await;
+            self.stop_recording_locked(&id, true).await;
         }
         self.engine.stop_all(10).await;
     }
@@ -1163,7 +1590,11 @@ impl Scheduler {
         self.monitor_requests
             .lock()
             .expect("monitor requests")
-            .retain(|id| !ids.contains(id));
+            .retain(|id, _| !ids.contains(id));
+        self.recovery_requests
+            .lock()
+            .expect("recovery requests")
+            .retain(|id, _| !ids.contains(id));
         self.schedule_edges
             .lock()
             .expect("schedule edges")
@@ -1252,6 +1683,10 @@ struct RoomCheck {
     >,
     stopping: tokio_util::sync::CancellationToken,
     notifications: crate::notifications::Notifications,
+    starting: Arc<tokio::sync::Mutex<()>>,
+    recovery_requests: RecoveryRequests,
+    monitor_changed: Arc<tokio::sync::Notify>,
+    monitor_requests: Arc<std::sync::Mutex<HashMap<String, CheckDeadline>>>,
 }
 
 fn transient_finished_check(error: &str) -> bool {
@@ -1289,18 +1724,120 @@ fn transient_finished_check(error: &str) -> bool {
 }
 
 impl RoomCheck {
+    async fn defer_after_exit(&self, expected: &crate::model::Recording) {
+        let _lifecycle = self.starting.lock().await;
+        let interval = self
+            .config
+            .read()
+            .await
+            .get_i64("loop_time_seconds", 300)
+            .max(30) as u64;
+        let due = CheckDeadline::after(Duration::from_secs(interval));
+        let updated = self
+            .store
+            .update_when(
+                &expected.rec_id,
+                |r| {
+                    r.schedule_revision == expected.schedule_revision
+                        && r.recording_run == expected.recording_run
+                        && r.monitor_status
+                        && !r.is_recording
+                },
+                |r| r.next_check_at = Some(due.timestamp),
+            )
+            .await;
+        if updated.is_some() {
+            self.monitor_requests
+                .lock()
+                .expect("monitor requests")
+                .insert(expected.rec_id.clone(), due);
+            self.monitor_changed.notify_one();
+        }
+    }
+
+    async fn request_recovery(&self, expected: &crate::model::Recording) -> bool {
+        let _lifecycle = self.starting.lock().await;
+        let Some(record) = self.store.get(&expected.rec_id).await.filter(|r| {
+            !self.stopping.is_cancelled()
+                && r.schedule_revision == expected.schedule_revision
+                && r.url == expected.url
+                && r.quality == expected.quality
+                && r.recording_run == expected.recording_run
+                && r.monitor_status
+                && !r.is_recording
+                && r.only_notify_no_record != Some(true)
+                && !requires_manual_access(r)
+                && crate::schedule::active(r).unwrap_or(false)
+                && !r
+                    .check_error
+                    .as_deref()
+                    .is_some_and(crate::pacing::restricted)
+                && !r
+                    .recording_error
+                    .as_deref()
+                    .is_some_and(crate::pacing::restricted)
+        }) else {
+            return false;
+        };
+        if self
+            .recovery_requests
+            .lock()
+            .expect("recovery requests")
+            .contains_key(&record.rec_id)
+        {
+            return false;
+        }
+        let Some(delay) = RECOVERY_DELAYS.get(record.recovery_attempt as usize) else {
+            self.store
+                .update(&record.rec_id, |r| {
+                    r.clear_queue();
+                    r.check_wait_reason = "recoveryExhausted".into();
+                    r.check_state = "idle".into();
+                })
+                .await;
+            return false;
+        };
+        let due = CheckDeadline::after(Duration::from_secs(*delay));
+        self.recovery_requests
+            .lock()
+            .expect("recovery requests")
+            .insert(
+                record.rec_id.clone(),
+                RecoveryRequest {
+                    revision: record.schedule_revision,
+                    due,
+                },
+            );
+        self.store
+            .update(&record.rec_id, |r| {
+                r.clear_queue();
+                r.recovery_attempt += 1;
+                r.recovery_at = Some(due.timestamp);
+                r.check_ready_at = Some(due.timestamp);
+                r.check_wait_reason = "recovery".into();
+                r.check_state = "recovering".into();
+            })
+            .await;
+        self.monitor_changed.notify_one();
+        true
+    }
+
     async fn check_phase(&self, expected: &crate::model::Recording, phase: &str) {
         self.store
             .update_when(
                 &expected.rec_id,
                 |record| {
                     record.url == expected.url
+                        && record.schedule_revision == expected.schedule_revision
                         && record.quality == expected.quality
                         && record.recording_run == expected.recording_run
                         && record.check_state != phase
                 },
                 |record| {
                     record.check_state = phase.into();
+                    if phase != "queued" {
+                        record.clear_queue();
+                    }
                     if phase == "checking" || phase == "rechecking" {
                         record.last_check_at = Some(chrono::Utc::now().timestamp());
                     }
@@ -1336,9 +1873,23 @@ impl RoomCheck {
         rec_id: &str,
         publish_failure: bool,
     ) -> Result<(crate::model::Recording, crate::resolver::StreamInfo), String> {
+        self.resolve_with_permit(rec_id, publish_failure, None, None)
+            .await
+    }
+
+    async fn resolve_with_permit(
+        &self,
+        rec_id: &str,
+        publish_failure: bool,
+        permit: Option<crate::pacing::Permit>,
+        revision: Option<u64>,
+    ) -> Result<(crate::model::Recording, crate::resolver::StreamInfo), String> {
         let Some(rec) = self.store.get(rec_id).await else {
             return Err(format!("任务不存在: {rec_id}"));
         };
+        if revision.is_some_and(|revision| revision != rec.schedule_revision) {
+            return Err("任务已更新，旧检测结果已丢弃".into());
+        }
 
         let key = rec.platform_key.as_deref().unwrap_or("custom");
         let stop = self
@@ -1374,10 +1925,29 @@ impl RoomCheck {
                     config.get_i64("platform_request_interval", 3).clamp(0, 300) as u64,
                 )
             };
-            let _permit = self
-                .pacer
-                .acquire(key, maximum, Duration::from_secs(spacing), &stop)
-                .await?;
+            let _permit = match permit {
+                Some(permit) => permit,
+                None => {
+                    let gate = self.pacer.status(key, maximum);
+                    self.store
+                        .update_when(
+                            rec_id,
+                            |r| r.schedule_revision == rec.schedule_revision,
+                            |r| {
+                                r.check_wait_reason = gate.reason.into();
+                                r.check_ready_at = gate.ready_at.map(|at| {
+                                    chrono::Utc::now().timestamp()
+                                        + at.saturating_duration_since(Instant::now()).as_secs()
+                                            as i64
+                                });
+                            },
+                        )
+                        .await;
+                    self.pacer
+                        .acquire(key, maximum, Duration::from_secs(spacing), &stop)
+                        .await?
+                }
+            };
             self.check_phase(
                 &rec,
                 if publish_failure {
@@ -1424,6 +1994,7 @@ impl RoomCheck {
         }
         if self.store.get(rec_id).await.is_none_or(|current| {
             current.url != rec.url
+                || current.schedule_revision != rec.schedule_revision
                 || current.quality != rec.quality
                 || current.recording_run != rec.recording_run
         }) {
@@ -1446,6 +2017,7 @@ impl RoomCheck {
                     rec_id,
                     |record| {
                         !stop.is_cancelled()
+                            && record.schedule_revision == rec.schedule_revision
                             && record.url == rec.url
                             && record.quality == rec.quality
                             && record.recording_run == rec.recording_run
@@ -1547,6 +2119,7 @@ impl RoomCheck {
             }
             if self.store.get(rec_id).await.is_none_or(|r| {
                 r.recording_run != Some(run_id)
+                    || r.schedule_revision != expected.schedule_revision
                     || r.is_recording
                     || r.url != expected.url
                     || r.quality != expected.quality
@@ -1580,6 +2153,7 @@ impl RoomCheck {
                 |record| {
                     !self.stopping.is_cancelled()
                         && expected.recording_run.is_some()
+                        && record.schedule_revision == expected.schedule_revision
                         && record.recording_run == expected.recording_run
                         && record.url == expected.url
                         && record.quality == expected.quality
@@ -1588,6 +2162,7 @@ impl RoomCheck {
                 |record| {
                     record.recording_run = None;
                     record.check_state = "idle".into();
+                    record.clear_queue();
                     record.last_check_at = Some(chrono::Utc::now().timestamp());
                     match result {
                         Ok(info) => {
@@ -1600,6 +2175,7 @@ impl RoomCheck {
                             record.access_state.clear();
                             if !info.is_live {
                                 record.recording_error = None;
+                                record.recovery_attempt = 0;
                             }
                         }
                         Err(error) => {
@@ -1619,6 +2195,13 @@ impl RoomCheck {
             )
             .await;
         if let Some(record) = updated {
+            if result.as_ref().is_ok_and(|info| info.is_live)
+                || result
+                    .as_ref()
+                    .is_err_and(|error| retryable_recording_error(error))
+            {
+                self.request_recovery(&record).await;
+            }
             if result.is_ok() && record.is_live != expected.is_live {
                 let mut notification = record.clone();
                 if !record.is_live {
@@ -1726,6 +2309,279 @@ mod tests {
     use super::*;
     use crate::model::Recording;
     use crate::paths::Workspace;
+
+    async fn settle() {
+        for _ in 0..60 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn automatic_workers_are_bounded_and_do_not_wait_inside_platform_slots() {
+        let root = tempfile::tempdir().unwrap();
+        let state = crate::api::bootstrap(Workspace::from_repo_root(root.path()))
+            .await
+            .unwrap();
+        state
+            .config
+            .write()
+            .await
+            .update_user_config(
+                serde_json::json!({"platform_request_interval":"0",
+            "platform_max_concurrent_requests":"16","loop_time_seconds":"4500"})
+                .as_object()
+                .unwrap()
+                .clone(),
+            )
+            .unwrap();
+        state
+            .store
+            .insert(
+                (0..7)
+                    .map(|n| {
+                        let mut r = Recording::new(
+                            format!("q-{n}"),
+                            format!("http://127.0.0.1:1/{n}.mp4"),
+                            n.to_string(),
+                        );
+                        r.only_notify_no_record = Some(true);
+                        r
+                    })
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        let guard = state.store.lifecycle_guard().await;
+        let (stop, rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(state.scheduler.clone().run(rx));
+        settle().await;
+        assert_eq!(
+            state.scheduler.checks.lock().unwrap().len(),
+            AUTOMATIC_LIMIT
+        );
+        let records = state.store.all().await;
+        assert_eq!(
+            records
+                .iter()
+                .filter(|r| r.check_wait_reason == "capacity")
+                .count(),
+            4
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter_map(|r| r.queue_position)
+                .collect::<Vec<_>>(),
+            [1, 2, 3, 4]
+        );
+        drop(guard);
+        settle().await;
+        assert!(state.store.all().await.iter().all(|r| r.is_live));
+        assert!(state.scheduler.checks.lock().unwrap().is_empty());
+        stop.send(true).unwrap();
+        task.await.unwrap();
+        crate::api::shutdown(&state).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cooling_and_outside_window_rooms_never_block_a_ready_platform() {
+        let root = tempfile::tempdir().unwrap();
+        let state = crate::api::bootstrap(Workspace::from_repo_root(root.path()))
+            .await
+            .unwrap();
+        let mut restricted =
+            Recording::new("a".into(), "http://127.0.0.1:1/a.mp4".into(), "A".into());
+        restricted.platform_key = Some("restricted-fixture".into());
+        let mut scheduled =
+            Recording::new("b".into(), "http://127.0.0.1:1/b.mp4".into(), "B".into());
+        scheduled.scheduled_recording = Some(true);
+        scheduled.scheduled_start_time = Some(
+            (chrono::Local::now() + chrono::Duration::hours(2))
+                .format("%H:%M:%S")
+                .to_string(),
+        );
+        scheduled.monitor_hours = Some("0.1".into());
+        let mut ready = Recording::new("c".into(), "http://127.0.0.1:1/c.mp4".into(), "C".into());
+        ready.only_notify_no_record = Some(true);
+        state
+            .store
+            .insert(vec![restricted, scheduled, ready])
+            .await
+            .unwrap();
+        state
+            .scheduler
+            .pacer
+            .result("restricted-fixture", &Err("HTTP 429".into()));
+        let (stop, rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(state.scheduler.clone().run(rx));
+        settle().await;
+        let a = state.store.get("a").await.unwrap();
+        let b = state.store.get("b").await.unwrap();
+        assert_eq!(a.check_wait_reason, "cooldown");
+        assert!(a.last_check_at.is_none());
+        assert_eq!(b.check_wait_reason, "schedule");
+        assert!(b.last_check_at.is_none());
+        assert!(state.store.get("c").await.unwrap().is_live);
+        stop.send(true).unwrap();
+        task.await.unwrap();
+        crate::api::shutdown(&state).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_is_bounded_and_runtime_only() {
+        let (_root, state, _) = finished_recording_fixture().await;
+        state
+            .store
+            .update("finished", |r| {
+                r.recording_run = None;
+                r.recording_error = None;
+            })
+            .await;
+        for (index, delay) in RECOVERY_DELAYS.into_iter().enumerate() {
+            let expected = state.store.get("finished").await.unwrap();
+            assert!(
+                state
+                    .scheduler
+                    .room_check()
+                    .request_recovery(&expected)
+                    .await
+            );
+            assert!(
+                !state
+                    .scheduler
+                    .room_check()
+                    .request_recovery(&expected)
+                    .await,
+                "duplicate recovery is coalesced"
+            );
+            let current = state.store.get("finished").await.unwrap();
+            assert_eq!(current.recovery_attempt, index as u32 + 1);
+            assert_eq!(current.check_state, "recovering");
+            let request = state
+                .scheduler
+                .recovery_requests
+                .lock()
+                .unwrap()
+                .remove("finished")
+                .unwrap();
+            assert_eq!(
+                request.due.instant - Instant::now(),
+                Duration::from_secs(delay)
+            );
+            let json = current.to_storage();
+            for key in [
+                "recovery_at",
+                "recoveryAt",
+                "recovery_attempt",
+                "queue_position",
+                "queuePosition",
+                "schedule_revision",
+            ] {
+                assert!(
+                    json.get(key).is_none(),
+                    "runtime field {key} must not enter the saved schema"
+                );
+            }
+        }
+        let current = state.store.get("finished").await.unwrap();
+        assert!(
+            !state
+                .scheduler
+                .room_check()
+                .request_recovery(&current)
+                .await
+        );
+        assert_eq!(
+            state.store.get("finished").await.unwrap().check_wait_reason,
+            "recoveryExhausted"
+        );
+        crate::api::shutdown(&state).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_never_overrides_stop_edits_authentication_or_notify_only() {
+        for action in [
+            "stop",
+            "pause-resume",
+            "edit",
+            "captcha",
+            "rate-limit",
+            "notify",
+        ] {
+            let (_root, state, _) = finished_recording_fixture().await;
+            state
+                .store
+                .update("finished", |r| {
+                    r.recording_run = None;
+                    r.recording_error = None;
+                })
+                .await;
+            let original = state.store.get("finished").await.unwrap();
+            match action {
+                "stop" => {
+                    state.scheduler.stop_recording("finished").await;
+                }
+                "pause-resume" => {
+                    state.scheduler.toggle_monitor("finished").await.unwrap();
+                    state.scheduler.toggle_monitor("finished").await.unwrap();
+                }
+                "edit" => {
+                    state
+                        .store
+                        .update("finished", |r| r.invalidate_schedule())
+                        .await;
+                }
+                "captcha" => {
+                    state
+                        .store
+                        .update("finished", |r| r.verification_required = true)
+                        .await;
+                }
+                "rate-limit" => {
+                    state
+                        .store
+                        .update("finished", |r| r.check_error = Some("HTTP 429".into()))
+                        .await;
+                }
+                "notify" => {
+                    state
+                        .store
+                        .update("finished", |r| r.only_notify_no_record = Some(true))
+                        .await;
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                !state
+                    .scheduler
+                    .room_check()
+                    .request_recovery(&original)
+                    .await,
+                "{action}"
+            );
+            assert!(state.scheduler.recovery_requests.lock().unwrap().is_empty());
+            crate::api::shutdown(&state).await.unwrap();
+        }
+        for error in [
+            "HTTP 403",
+            "HTTP 401",
+            "验证码",
+            "Cookie 无效",
+            "录制磁盘空间不足",
+            "无法访问录制文件",
+            "未找到 ffmpeg",
+        ] {
+            assert!(!retryable_recording_error(error), "{error}");
+        }
+        for error in [
+            "播放地址返回 HTTP 404",
+            "拉流超时，请检查网络后重试",
+            "FLV 拉流连接中断",
+            "平台返回 HTTP 503",
+        ] {
+            assert!(retryable_recording_error(error), "{error}");
+        }
+    }
 
     #[tokio::test]
     async fn live_source_expiry_and_task_removal_release_cached_state() {
@@ -1967,7 +2823,16 @@ mod tests {
                 .await;
             let current = state.store.get("finished").await.unwrap();
             assert_eq!(current.monitor_status, monitored);
-            assert_eq!(current.check_state, "idle");
+            let recovering = monitored
+                && (outcome.as_ref().is_ok_and(|info| info.is_live)
+                    || outcome
+                        .as_ref()
+                        .is_err_and(|error| retryable_recording_error(error)));
+            assert_eq!(
+                current.check_state,
+                if recovering { "recovering" } else { "idle" }
+            );
+            assert_eq!(current.recovery_at.is_some(), recovering);
             assert!(current.last_check_at.is_some());
             assert_eq!(current.last_success_at.is_some(), outcome.is_ok());
             assert!(!current.is_recording);

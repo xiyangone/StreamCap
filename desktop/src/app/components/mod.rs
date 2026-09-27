@@ -17,7 +17,7 @@ pub use close_dialog::CloseDialog;
 pub use dialog::{ConfirmDialog, Dialog, EmptyState};
 pub use edit_dialog::EditRecordingDialog;
 pub use icons::Icon;
-pub use preview_dialog::{MediaPlayer, PreviewDialog};
+pub use preview_dialog::{preview_state, provide_preview, PreviewHost};
 pub use qr_login_dialog::QrLoginDialog;
 pub use recording_card::RecordingCard;
 pub use toast::Toast;

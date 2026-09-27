@@ -19,6 +19,7 @@ pub fn AppShell() -> impl IntoView {
 #[component]
 fn Shell() -> impl IntoView {
     let state = gateway::provide_app_state();
+    components::provide_preview();
     let desktop = desktop::provide_desktop();
     install_navigation();
     if let Some(root) = document().document_element() {
@@ -95,6 +96,7 @@ fn Shell() -> impl IntoView {
                     <AppRoutes />
                 </main>
             </div>
+            <components::PreviewHost />
             <components::Toast />
             <components::CloseDialog />
         </div>
@@ -190,7 +192,7 @@ fn install_navigation() {
                 || event.alt_key()
                 || !(event.ctrl_key() || event.meta_key())
                 || document()
-                    .query_selector("dialog[open]")
+                    .query_selector("dialog[open][aria-modal=\"true\"]")
                     .ok()
                     .flatten()
                     .is_some()

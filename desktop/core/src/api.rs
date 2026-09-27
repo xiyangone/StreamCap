@@ -61,6 +61,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/settings", get(get_settings).put(update_settings))
         .route("/api/cookies", get(get_cookies).put(update_cookies))
         .route("/api/storage", get(list_storage).delete(delete_storage))
+        .route("/api/storage/size", get(storage_size))
         .route("/api/videos", get(stream_video))
         .route("/api/media/info", get(media_info))
         .route("/api/media/jobs", get(media_jobs))
@@ -640,7 +641,21 @@ fn apply_edit(
     allowed: &[&str],
     config: &ConfigStore,
 ) {
+    let previous_room = crate::model::room_identity(&rec.url);
     apply_changes(rec, changes, allowed);
+    if crate::model::room_identity(&rec.url) != previous_room {
+        rec.platform = None;
+        rec.platform_key = None;
+        rec.is_live = false;
+        rec.live_title = None;
+        rec.check_error = None;
+        rec.recording_error = None;
+        rec.verification_required = false;
+        rec.access_state.clear();
+        rec.last_check_at = None;
+        rec.last_success_at = None;
+    }
+    rec.invalidate_schedule();
     rec.inherited_fields
         .retain(|field| !changes.contains_key(&to_camel(field)));
     for field in follow {
@@ -658,6 +673,7 @@ async fn update_one(
 ) -> ApiResult {
     validate_changes(&payload.changes, &payload.follow_global, EDIT_FIELDS)?;
     let lifecycle = state.store.lifecycle_guard().await;
+    let previous: Vec<_> = state.store.get(&rec_id).await.into_iter().collect();
     let config = state.config.read().await;
     let updated = state
         .store
@@ -672,6 +688,8 @@ async fn update_one(
         })
         .await
         .map_err(ApiError::storage)?;
+    drop(config);
+    state.scheduler.edited(&updated, &previous).await;
     Ok(Json(
         serde_json::to_value(&updated[0]).map_err(|e| ApiError::internal(e.to_string()))?,
     ))
@@ -747,6 +765,7 @@ async fn batch_edit(
 ) -> ApiResult {
     validate_changes(&payload.changes, &payload.follow_global, BATCH_FIELDS)?;
     let lifecycle = state.store.lifecycle_guard().await;
+    let previous = state.store.all().await;
     let config = state.config.read().await;
     let updated = state
         .store
@@ -761,6 +780,8 @@ async fn batch_edit(
         })
         .await
         .map_err(ApiError::storage)?;
+    drop(config);
+    state.scheduler.edited(&updated, &previous).await;
     Ok(Json(json!({ "updated": updated.len() })))
 }
 
@@ -878,6 +899,21 @@ async fn list_storage(
         serde_json::to_value(listing).map_err(|e| ApiError::internal(e.to_string()))?,
     ))
 }
+async fn storage_size(State(state): State<ApiState>, Query(query): Query<PathQuery>) -> ApiResult {
+    let root = state.config.read().await.recordings_root();
+    let relative = query.path;
+    let target = state
+        .storage
+        .blocking(move |_| crate::storage::checked_target(&root, &relative, true))
+        .await
+        .map_err(ApiError::storage)?;
+    let bytes = state
+        .storage
+        .size(target)
+        .await
+        .map_err(ApiError::storage)?;
+    Ok(Json(json!({"size":bytes})))
+}
 #[derive(Debug, Deserialize)]
 struct PathQuery {
     path: String,
@@ -910,6 +946,7 @@ async fn delete_storage(
         })
         .await
         .map_err(ApiError::storage)?;
+    state.storage.invalidate_sizes();
     state.store.snack("已移至回收站");
     Ok(Json(
         json!({"ok":true,"recycled":receipt.recycled,"recycledTo":receipt.recycled_to}),
@@ -1317,7 +1354,18 @@ async fn events(
     let receiver = state.store.subscribe();
 
     let cancel = state.resolver.cancellation();
-    let stream = futures::stream::unfold((receiver, cancel), |(mut rx, cancel)| async move {
+    Sse::new(event_stream(receiver, cancel)).keep_alive(
+        KeepAlive::new()
+            .interval(std::time::Duration::from_secs(5))
+            .event(Event::default().event("heartbeat").data("{}")),
+    )
+}
+
+fn event_stream(
+    receiver: broadcast::Receiver<crate::store::GatewayEvent>,
+    cancel: tokio_util::sync::CancellationToken,
+) -> impl Stream<Item = Result<Event, Infallible>> {
+    futures::stream::unfold((receiver, cancel), |(mut rx, cancel)| async move {
         let event =
             tokio::select! {biased;_=cancel.cancelled()=>return None,event=rx.recv()=>event};
         match event {
@@ -1329,15 +1377,17 @@ async fn events(
                     (rx, cancel),
                 ))
             }
-            Err(broadcast::error::RecvError::Lagged(_)) => Some((
-                Ok(Event::default().event("resync").data("{}")),
-                (rx, cancel),
-            )),
+            Err(broadcast::error::RecvError::Lagged(_)) => {
+                // Do not replay retained stale events over a fresh HTTP snapshot.
+                let receiver = rx.resubscribe();
+                Some((
+                    Ok(Event::default().event("resync").data("{}")),
+                    (receiver, cancel),
+                ))
+            }
             Err(broadcast::error::RecvError::Closed) => None,
         }
-    });
-
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1489,5 +1539,36 @@ mod tests {
 
         apply_changes(&mut rec, &changes, &["quality"]);
         assert!(rec.quality.is_none());
+    }
+}
+
+#[cfg(test)]
+mod event_stream_tests {
+    use super::*;
+    use futures::StreamExt;
+    #[tokio::test]
+    async fn lag_discards_stale_backlog_before_resync_and_shutdown_closes_stream() {
+        let (tx, rx) = broadcast::channel(2);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let response = Sse::new(event_stream(rx, cancel.clone())).into_response();
+        let mut body = response.into_body().into_data_stream();
+        for value in 0..4 {
+            tx.send(crate::store::GatewayEvent {
+                topic: "update".into(),
+                payload: json!({"value":value}),
+            })
+            .unwrap();
+        }
+        let first = body.next().await.unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&first).contains("event: resync"));
+        tx.send(crate::store::GatewayEvent {
+            topic: "update".into(),
+            payload: json!({"value":99}),
+        })
+        .unwrap();
+        let next = body.next().await.unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&next).contains("99"));
+        cancel.cancel();
+        assert!(body.next().await.is_none());
     }
 }

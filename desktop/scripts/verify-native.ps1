@@ -1,10 +1,14 @@
 # One reproducible native validation pipeline. Never launches a deployed application.
-param([string]$OutputDirectory)
+param([string]$ArtifactsDirectory,[string]$OutputDirectory,[switch]$IncludeReal,[string]$ProfileDirectory,[string]$MediaRoot,[string]$MpvPath,[string]$ProxyConfig)
+if($IncludeReal -and (-not $ProfileDirectory -or -not $MediaRoot -or -not $MpvPath)){throw 'Real validation requires explicit profile, media root and benchmark executable'}
 $ErrorActionPreference='Stop'
 $desktop=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $repo=[IO.Path]::GetFullPath((Join-Path $desktop '..'))
 $stamp=(Get-Date -Format 'yyyyMMdd-HHmmss')+'-'+[Guid]::NewGuid().ToString('N').Substring(0,6)
-$run=Join-Path $desktop ('tests/artifacts/verify-'+$stamp)
+$run=if($ArtifactsDirectory){[IO.Path]::GetFullPath($ArtifactsDirectory)}else{Join-Path $desktop ('tests/artifacts/verify-'+$stamp)}
+$allowedArtifacts=[IO.Path]::GetFullPath((Join-Path $desktop 'tests/artifacts'))+[IO.Path]::DirectorySeparatorChar
+if(-not $run.StartsWith($allowedArtifacts,[StringComparison]::OrdinalIgnoreCase)){throw 'Evidence must stay in project test artifacts'}
+if(Test-Path -LiteralPath $run){throw 'Use a fresh evidence directory'}
 $tmp=Join-Path $run 'tmp'
 [IO.Directory]::CreateDirectory($tmp)|Out-Null
 $publish=if($OutputDirectory){[IO.Path]::GetFullPath($OutputDirectory)}else{Join-Path $desktop ('src-tauri/target/native-noFF-'+$stamp)}
@@ -92,6 +96,8 @@ try {
     Step 'native-close' {& (Join-Path $desktop 'tests/native-smoke.ps1') -Executable $exe -ExitMode Choice}
     Step 'native-tray' {& (Join-Path $desktop 'tests/native-smoke.ps1') -Executable $exe -ExitMode Tray}
     Step 'diff-check' {& git diff --check}
+    if($IncludeReal){Step 'real-targets' {& (Join-Path $PSScriptRoot 'verify-real.ps1') -Executable $exe -ProfileDirectory $ProfileDirectory -MediaRoot $MediaRoot -MpvPath $MpvPath -ProxyConfig $ProxyConfig}}
+    Step 'windows-advisory-reachability' {& cargo tree --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc --locked --offline -i glib; if($LASTEXITCODE -ne 0){throw 'Target dependency graph unavailable'}}
     $passed=$true
     if($env:GITHUB_ACTIONS -eq 'true' -and $env:GITHUB_OUTPUT){[IO.File]::AppendAllText($env:GITHUB_OUTPUT,"release-directory=$publish"+[Environment]::NewLine)}
 } catch {$failure=$_.Exception.Message;throw}

@@ -228,6 +228,141 @@ pub fn recording_subtitle(record: &crate::api::gateway::Recording) -> String {
         })
 }
 
+pub fn media_progress(job: &crate::api::gateway::MediaJob, now: i64) -> String {
+    if job.state == "waiting" {
+        return job
+            .queue_position
+            .map(|position| crate::tr_format!("等待处理 · 第 {} 位", position))
+            .unwrap_or_else(|| t("等待处理").into());
+    }
+    let elapsed = job
+        .started_at
+        .map(|start| job.finished_at.unwrap_or(now).saturating_sub(start).max(0) as f64)
+        .unwrap_or(job.elapsed_seconds as f64);
+    let progress = job
+        .stage_percent
+        .map(|percent| crate::tr_format!("本阶段 {}%", percent))
+        .unwrap_or_else(|| {
+            if job.pending() {
+                t("本阶段进度待确认").into()
+            } else {
+                t("处理已结束").into()
+            }
+        });
+    let eta = job
+        .stage_eta_seconds
+        .map(|seconds| crate::tr_format!("本阶段预计剩余 {}", duration(seconds as f64)))
+        .unwrap_or_default();
+    format!(
+        "{} · {}{}",
+        progress,
+        crate::tr_format!("耗时 {}", duration(elapsed)),
+        if eta.is_empty() {
+            String::new()
+        } else {
+            format!(" · {eta}")
+        }
+    )
+}
+
+pub fn interval_label(value: &str) -> String {
+    let Ok(seconds) = value.parse::<u64>() else {
+        return "—".into();
+    };
+    let minutes = if seconds % 60 == 0 {
+        (seconds / 60).to_string()
+    } else {
+        format!("{:.1}", seconds as f64 / 60.0)
+    };
+    crate::tr_format!("{} 秒（{} 分钟）", seconds, minutes)
+}
+
+pub fn queue_label(record: &crate::api::gateway::Recording) -> String {
+    if record.is_recording {
+        return t("录制进行中").into();
+    }
+    if !record.monitor_status {
+        return t("已暂停，不安排检测").into();
+    }
+    if record.check_state == "checking" {
+        return if record.recovery_attempt > 0 {
+            crate::tr_format!("恢复检测中 · 第 {}/3 次", record.recovery_attempt)
+        } else {
+            t("正在请求直播状态").into()
+        };
+    }
+    if record.check_state == "rechecking" {
+        return t("正在确认直播是否结束").into();
+    }
+    if record.verification_required || record.check_wait_reason == "verification" {
+        return t("等待手动验证或登录").into();
+    }
+    let reason = t(match record.check_wait_reason.as_str() {
+        "platformBusy" => "等待同平台检测完成",
+        "platformSpacing" => "同平台请求间隔",
+        "cooldown" => "等待平台冷却",
+        "capacity" => "等待检测空位",
+        "schedule" => "等待定时窗口",
+        "recovery" => "断流后退避等待",
+        "recoveryExhausted" => "恢复尝试已用尽，等待常规检测",
+        "queue" => "即将检测",
+        _ => "等待下次检测",
+    });
+    let reason = if record.check_state == "recovering" {
+        crate::tr_format!("恢复第 {}/3 次 · {}", record.recovery_attempt, reason)
+    } else {
+        reason.to_string()
+    };
+    record
+        .queue_position
+        .map(|position| crate::tr_format!("排队第 {} 位 · {}", position, reason))
+        .unwrap_or(reason)
+}
+
+pub fn queue_time(record: &crate::api::gateway::Recording, now: i64) -> String {
+    if record.is_recording
+        || !record.monitor_status
+        || record.verification_required
+        || matches!(
+            record.check_wait_reason.as_str(),
+            "verification" | "recording"
+        )
+    {
+        return String::new();
+    }
+    if matches!(record.check_state.as_str(), "checking" | "rechecking") {
+        return t("结果返回后自动更新").into();
+    }
+    if matches!(
+        record.check_wait_reason.as_str(),
+        "platformBusy" | "capacity"
+    ) {
+        return t("等待前序任务释放，无固定完成时间").into();
+    }
+    let Some(at) = record
+        .check_ready_at
+        .or(record.recovery_at)
+        .or(record.next_check_at)
+    else {
+        return String::new();
+    };
+    if at <= now {
+        return t("已到时间，等待调度").into();
+    }
+    let remaining = duration((at - now) as f64);
+    if record.check_wait_reason == "cooldown" {
+        crate::tr_format!("冷却剩余 {}", remaining)
+    } else if record.check_wait_reason == "platformSpacing" {
+        crate::tr_format!("最早 {} 后执行", remaining)
+    } else if record.check_state == "recovering" {
+        crate::tr_format!("恢复倒计时 {}", remaining)
+    } else if record.check_wait_reason == "schedule" {
+        crate::tr_format!("距离窗口开始 {}", remaining)
+    } else {
+        crate::tr_format!("下次检测 {} 后", remaining)
+    }
+}
+
 pub fn monitoring_label(record: &crate::api::gateway::Recording) -> &'static str {
     if !record.monitor_status {
         t("监控已暂停")
@@ -235,6 +370,8 @@ pub fn monitoring_label(record: &crate::api::gateway::Recording) -> &'static str
         t("正在复核，监控保持开启")
     } else if record.check_state == "checking" {
         t("检测中")
+    } else if record.check_state == "recovering" {
+        t("断流恢复中，监控保持开启")
     } else if record.verification_required {
         t("等待手动验证")
     } else if record.access_state == "cooldown" {
@@ -267,6 +404,34 @@ pub fn monitoring_label(record: &crate::api::gateway::Recording) -> &'static str
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn queue_labels_distinguish_a_deadline_from_an_execution_estimate() {
+        use crate::api::gateway::Recording;
+        let mut record = Recording {
+            monitor_status: true,
+            next_check_at: Some(5500),
+            check_wait_reason: "interval".into(),
+            ..Default::default()
+        };
+        assert_eq!(interval_label("4500"), "4500 秒（75 分钟）");
+        assert_eq!(queue_time(&record, 1000), "下次检测 01:15:00 后");
+        assert_eq!(queue_time(&record, 5501), "已到时间，等待调度");
+        record.check_state = "recovering".into();
+        record.recovery_attempt = 2;
+        record.queue_position = Some(3);
+        record.check_wait_reason = "platformBusy".into();
+        assert_eq!(
+            queue_label(&record),
+            "排队第 3 位 · 恢复第 2/3 次 · 等待同平台检测完成"
+        );
+        assert_eq!(
+            queue_time(&record, 1000),
+            "等待前序任务释放，无固定完成时间"
+        );
+        record.monitor_status = false;
+        assert_eq!(queue_label(&record), "已暂停，不安排检测");
+        assert!(queue_time(&record, 1000).is_empty());
+    }
     #[test]
     fn an_ended_recording_never_displays_a_stale_live_title_as_current() {
         use crate::api::gateway::Recording;

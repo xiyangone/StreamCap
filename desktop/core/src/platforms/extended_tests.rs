@@ -98,6 +98,19 @@ async fn bigo_live_fixture() {
     assert_eq!(info.anchor_name, "Fixture");
 }
 
+#[test]
+fn separate_platform_accounts_never_share_their_transport_cookie_jar() {
+    let mut a = request("bigo", "https://www.bigo.tv/123");
+    a.cookie = Some("sid=first".into());
+    let first = Context::new(&a, catalog::by_key("bigo").unwrap()).unwrap();
+    let again = Context::new(&a, catalog::by_key("bigo").unwrap()).unwrap();
+    assert!(std::sync::Arc::ptr_eq(&first.jar, &again.jar));
+    let mut b = a.clone();
+    b.cookie = Some("sid=second".into());
+    let other = Context::new(&b, catalog::by_key("bigo").unwrap()).unwrap();
+    assert!(!std::sync::Arc::ptr_eq(&first.jar, &other.jar));
+}
+
 struct SimpleCase {
     key: &'static str,
     url: &'static str,

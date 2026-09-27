@@ -134,6 +134,18 @@ fn invalid_config_is_not_replaced_and_unsupported_flags_cannot_enable() {
     assert!(validate_settings(&patch).is_err());
 }
 
+#[test]
+fn media_process_environment_removes_implicit_proxies_without_mutating_parent() {
+    let mut command = tokio::process::Command::new("unused-fixture");
+    streamcap_core::network::isolate_media_proxy(&mut command);
+    let env = command.as_std().get_envs().collect::<Vec<_>>();
+    for name in ["http_proxy", "https_proxy", "all_proxy", "no_proxy"] {
+        assert!(env.iter().any(
+            |(key, value)| key.to_string_lossy().eq_ignore_ascii_case(name) && value.is_none()
+        ));
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires STREAMCAP_TEST_FFMPEG; uses generated audio, adjacent ffprobe and a random local HTTP port only"]
 async fn ffmpeg_is_stopped_with_a_valid_completed_file() {

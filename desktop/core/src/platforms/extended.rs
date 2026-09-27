@@ -19,44 +19,25 @@ impl<'a> Context<'a> {
         request: &'a ResolveRequest,
         platform: &'static catalog::Platform,
     ) -> Result<Self, String> {
-        let jar = std::sync::Arc::new(reqwest::cookie::Jar::default());
-        if let Some(cookie) = request
-            .cookie
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-        {
-            if cookie.contains(['\r', '\n']) || !cookie.contains('=') {
-                return Err("Cookie 格式无效，未发送匿名请求".into());
-            }
-            let domain = if platform.key == "flextv" {
-                "ttinglive.com"
-            } else {
-                platform.domains[0]
-            };
-            let origin = Url::parse(&format!("https://{domain}/")).map_err(|_| "平台域名无效")?;
-            for pair in cookie.split(';').map(str::trim).filter(|s| s.contains('=')) {
-                jar.add_cookie_str(
-                    &format!("{pair}; Domain=.{domain}; Path=/; Secure"),
-                    &origin,
-                );
-            }
-        }
-        let mut client = reqwest::Client::builder()
-            .no_proxy()
-            .cookie_provider(jar.clone())
-            .user_agent(http::USER_AGENT)
-            .timeout(Duration::from_secs(18))
-            .redirect(reqwest::redirect::Policy::none());
-        if let Some(proxy) = request.proxy.as_deref().filter(|p| !p.is_empty()) {
-            client = client.proxy(reqwest::Proxy::all(proxy).map_err(|_| "代理地址无效")?);
-        }
+        let domain = if platform.key == "flextv" {
+            "ttinglive.com"
+        } else {
+            platform.domains[0]
+        };
+        let transport = crate::network::platform_client(
+            domain,
+            request.proxy.as_deref(),
+            request.cookie.as_deref(),
+            Duration::from_secs(18),
+            false,
+        )?;
         Ok(Self {
             request,
             #[cfg(test)]
             test_responses: None,
-            jar,
+            jar: transport.jar,
             platform,
-            client: client.build().map_err(|_| "平台客户端初始化失败")?,
+            client: transport.client,
             url: http::validate_url(&request.url)?,
             initial_page: std::sync::Mutex::new(None),
         })

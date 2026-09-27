@@ -39,3 +39,32 @@ The Windows process-tree gate starts only a synthetic sleeping pwsh fixture and 
 .github/workflows/test.yml is the single CI entry for pushes, PRs and workflow_dispatch. All triggers run the same verification and upload evidence; only successful manual runs upload the verified noFF EXE.
 
 Time-seek validation uses a synthetic red/blue TS larger than 600 MiB, seeks forward and backward, and decodes the first returned frame. Native smoke drags the growing-recording timeline, returns to latest, and verifies recording remains active; changing only the displayed time is not a pass.
+
+## Network, media and real-target validation
+
+Platform transports are pooled by domain, proxy, credential identity, timeout and redirect policy (32 entries, five-minute idle expiry). QR login sessions remain separate. Native TLS enables ALPN without forcing HTTP/2. FFmpeg and ffprobe do not inherit proxy environment variables; disabling the application proxy still follows OS routing, including TUN. An OS route alone does not identify the final proxy outbound node.
+
+Native FLV downloads follow at most five safe redirects, reject HTTPS downgrade and obvious public-to-loopback pivots, and strip credentials on cross-origin redirects. Directory listings return shallow metadata; size requests are asynchronous, bounded and cancelled when the user navigates away. The size cache is bounded to 64 entries and 30 seconds. Unknown sizes are not represented as zero.
+
+Media metadata includes codec capability. Unsupported MP4 codecs use the existing bounded compatibility stream; a failed native decode switches at most once, and playback events cannot overwrite a decoding error. The full media-processing queue displays stage progress and elapsed time. Estimates describe a measured stage, not the entire queue. Source cleanup retains its existing validation.
+
+Native logs rotate at approximately 4 MiB, retaining the current file and four archives. Startup preserves history and rotation rejects links. Tauri is updated to 2.11.6. Dependency warnings remain visible, with separate Windows-target reachability evidence; unavailable upstream fixes are not claimed as resolved.
+
+For explicit real testing, run scripts/verify-real.ps1 with -Executable (a SHA256-verified project candidate), -ProfileDirectory (read only), -MediaRoot (read only), and -MpvPath (project-local benchmark component). It samples at most seven monitored rooms, obeys per-platform pacing and stops restricted platforms. Credentials remain in memory. No login, CAPTCHA interaction, or user recording task is started. A real preview is bounded to 15 seconds or 512 KiB. An available FLV can additionally be tested through a local relay with one controlled interruption, at most two upstream requests and about 4 MiB per request, writing only isolated output. Optional -ProxyConfig reads local sing-box settings and records only matching test-process route decisions, never controller credentials.
+
+The real-media runner uses a fresh profile, random API/CDP ports, listener ancestry verification, and source hashes. The mpv control uses CPU decoding with null video output; it does not validate libmpv embedding or GPU presentation and is not shipped with the application. verify-native.ps1 -IncludeReal accepts the same explicit paths and treats real-test gaps as non-success. Keep evidence and candidate outputs; remove only explicitly identified temporary files.
+
+
+## September 27, 2026 acceptance contract
+
+Local events stay on one SSE connection with five-second heartbeats, a twenty-second watchdog and snapshot recovery; lag drops the stale broadcast backlog before resync. Switching to WebSocket does not provide upstream platform start notifications. Room detection retains user-configured intervals and platform backoff.
+
+Kuaishou 400002 preserves the official browser-inspection path rather than becoming HTTP 429. Visible human challenges take precedence over frequency text. Restricted pages remain visible for manual recovery without automatic reloads, including an inspection button during cooldown. Account-isolated application profiles persist across cookie refreshes; Edge profiles are not imported. Manual inspection has a thirty-second budget and one-window limit, never resets HTTP cooldown, and never starts a paused task. CAPTCHAs remain user-operated.
+
+Completed-file compatibility playback keeps one backpressured producer across the former 120-second boundary. Read-ahead targets thirty seconds and backward buffers are trimmed between thirty and sixty seconds, with possible network-block/decoder overshoot. Growing files still resume after the probed snapshot tail. Cold seeks retain decoder startup costs; arbitrary zero-latency seeking is not promised. Original media remains read-only.
+
+Both verification scripts accept -ArtifactsDirectory pointing to a fresh project tests/artifacts directory. Offline gates and real-service gaps remain separate. Root StreamCap.exe and its SHA-256 are candidate deliverables, ignored by Git and never automatically deployed. Retain logs, reports, screenshots and candidates; only confirmed temporary targets move to de for manual cleanup.
+
+Committed room changes queue one paced check for monitored tasks, just like resuming monitoring. Cosmetic edits do not trigger extra platform requests. Normal checks retain the user interval: 4500 seconds means 75 minutes, not push-based detection. Paused, scheduled and notification-only behavior is preserved.
+
+Recording and library previews share one application-level panel. Minimize makes it a non-modal floating player that survives navigation; restore retains the decoder, position, pause and volume state. Closing releases preview resources without stopping recording. Native MP4 startup uses the actual first buffered timestamp rather than waiting at an unplayable zero timestamp.

@@ -50,8 +50,6 @@ fn limited_text(text: &str) -> bool {
     [
         "请求过快",
         "频繁",
-        "访问受限",
-        "请求受限",
         "too many requests",
         "rate limit",
         "ip banned",
@@ -108,11 +106,16 @@ pub fn evaluate_verification_page(
     // Access failures describe this navigation, not the stream's live/offline state.
     // Limited pages often deliberately omit the author; classify them before identity checks.
     let error_text = room.map(room_error_text).unwrap_or_default();
-    if limited_text(visible_text) || limited_text(&error_text) {
-        return VerificationPage::RateLimited;
-    }
-    if challenge_visible {
+    let blocked_text = visible_text
+        .lines()
+        .any(|line| matches!(line.trim(), "请完成滑块验证" | "请完成人机验证"));
+    if challenge_visible || blocked_text {
         return VerificationPage::Challenge;
+    }
+    if limited_text(visible_text)
+        || (limited_text(&error_text) && !room.is_some_and(human_challenge_code))
+    {
+        return VerificationPage::RateLimited;
     }
     if login_required_text(visible_text) || login_required_text(&error_text) {
         return VerificationPage::LoginRequired;
@@ -208,6 +211,10 @@ pub fn parse_state(state: &Value, quality: Option<&str>) -> Result<StreamInfo, S
     let room = target_room(state).ok_or("快手未返回目标房间，不能确认是否开播")?;
     parse_room(room, quality)
 }
+fn human_challenge_code(room: &Value) -> bool {
+    let value = &room["errorType"]["type"];
+    value.as_i64() == Some(400002) || value.as_str() == Some("400002")
+}
 pub fn parse_room(room: &Value, quality: Option<&str>) -> Result<StreamInfo, String> {
     let error = &room["errorType"];
     let code = error["type"]
@@ -215,14 +222,16 @@ pub fn parse_room(room: &Value, quality: Option<&str>) -> Result<StreamInfo, Str
         .or_else(|| error["type"].as_str()?.parse().ok());
     let title = error["title"].as_str().unwrap_or_default();
     let message = room_error_text(room);
+    // A human-verification response may also say requests were frequent.
+    // Preserve the browser recovery path; it is not an HTTP 429 response.
+    if human_challenge_code(room) || title.contains("请完成滑块验证") {
+        return Err(PAGE_CHECK_REQUIRED.into());
+    }
     if limited_text(&message) {
         return Err(RATE_LIMITED.into());
     }
     if login_required_text(&message) {
         return Err(LOGIN_REQUIRED.into());
-    }
-    if code == Some(400002) || title.contains("请完成滑块验证") {
-        return Err(PAGE_CHECK_REQUIRED.into());
     }
     if code.is_some_and(|n| n != 0) || !title.is_empty() {
         return Err(format!(
@@ -325,6 +334,7 @@ struct AccessState {
     login_required: bool,
     ready: Instant,
     page_ready: Instant,
+    manual_page_ready: Instant,
     failures: u32,
 }
 impl Default for AccessState {
@@ -336,6 +346,7 @@ impl Default for AccessState {
             login_required: false,
             ready: Instant::now(),
             page_ready: Instant::now(),
+            manual_page_ready: Instant::now(),
             failures: 0,
         }
     }
@@ -374,6 +385,7 @@ impl KuaishouResolver {
         &self,
         saved: Option<&str>,
         interval: Duration,
+        manual: bool,
     ) -> Result<OwnedSemaphorePermit, String> {
         let permit = self
             .pages
@@ -386,6 +398,16 @@ impl KuaishouResolver {
             .transpose()?;
         let mut state = self.access.lock().await;
         state.set_cookie(cookie);
+        // An explicit inspection has its own budget. It never resets the HTTP
+        // cooldown and never opens a second window or repeatedly refreshes one.
+        if manual {
+            if state.manual_page_ready > Instant::now() {
+                return Err(PAGE_RETRY_LATER.into());
+            }
+            state.manual_page_ready = Instant::now() + Duration::from_secs(30);
+            state.page_required = true;
+            return Ok(permit);
+        }
         if state.ready > Instant::now() {
             return Err(RATE_LIMITED.into());
         }
@@ -403,7 +425,9 @@ impl KuaishouResolver {
         let mut state = self.access.lock().await;
         match error {
             RATE_LIMITED => {
-                state.limit();
+                if state.ready <= Instant::now() {
+                    state.limit();
+                }
                 state.page_required = false;
             }
             LOGIN_REQUIRED => {
@@ -432,6 +456,7 @@ impl KuaishouResolver {
         Ok(())
     }
     pub async fn reset_session(&self) {
+        crate::network::prune_idle_clients();
         let mut state = self.access.lock().await;
         state.cookie = None;
         state.page_cookie = None;
@@ -540,17 +565,55 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn manual_inspection_has_a_budget_without_resetting_http_cooldown() {
+        let resolver = KuaishouResolver::default();
+        resolver.page_problem(RATE_LIMITED).await;
+        let permit = resolver
+            .begin_page_check(None, Duration::from_secs(4500), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            resolver
+                .begin_page_check(None, Duration::from_secs(4500), true)
+                .await
+                .unwrap_err(),
+            PAGE_IN_PROGRESS
+        );
+        drop(permit);
+        assert_eq!(
+            resolver
+                .begin_page_check(None, Duration::from_secs(4500), true)
+                .await
+                .unwrap_err(),
+            PAGE_RETRY_LATER
+        );
+        assert_eq!(
+            resolver
+                .begin_page_check(None, Duration::from_secs(4500), false)
+                .await
+                .unwrap_err(),
+            RATE_LIMITED
+        );
+        tokio::time::advance(Duration::from_secs(30)).await;
+        let _permit = resolver
+            .begin_page_check(None, Duration::from_secs(4500), true)
+            .await
+            .unwrap();
+        assert!(resolver.access.lock().await.ready > Instant::now());
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn http_browser_and_credential_changes_share_rate_limit_cooldown() {
         let resolver = KuaishouResolver::default();
         let permit = resolver
-            .begin_page_check(Some("did=fixture"), Duration::from_secs(4500))
+            .begin_page_check(Some("did=fixture"), Duration::from_secs(4500), false)
             .await
             .unwrap();
         resolver.page_problem(RATE_LIMITED).await;
         drop(permit);
         assert_eq!(
             resolver
-                .begin_page_check(Some("did=fixture"), Duration::from_secs(4500))
+                .begin_page_check(Some("did=fixture"), Duration::from_secs(4500), false)
                 .await
                 .unwrap_err(),
             RATE_LIMITED
@@ -573,14 +636,14 @@ mod tests {
         tokio::time::advance(Duration::from_secs(600)).await;
         assert_eq!(
             resolver
-                .begin_page_check(Some("did=changed"), Duration::from_secs(4500))
+                .begin_page_check(Some("did=changed"), Duration::from_secs(4500), false)
                 .await
                 .unwrap_err(),
             PAGE_RETRY_LATER
         );
         tokio::time::advance(Duration::from_secs(3900)).await;
         assert!(resolver
-            .begin_page_check(Some("did=changed"), Duration::from_secs(4500))
+            .begin_page_check(Some("did=changed"), Duration::from_secs(4500), false)
             .await
             .is_ok());
     }
@@ -589,12 +652,12 @@ mod tests {
     async fn concurrent_rooms_and_manual_reopens_cannot_create_more_page_requests() {
         let resolver = KuaishouResolver::default();
         let permit = resolver
-            .begin_page_check(None, Duration::from_secs(4500))
+            .begin_page_check(None, Duration::from_secs(4500), false)
             .await
             .unwrap();
         assert_eq!(
             resolver
-                .begin_page_check(None, Duration::from_secs(4500))
+                .begin_page_check(None, Duration::from_secs(4500), false)
                 .await
                 .unwrap_err(),
             PAGE_IN_PROGRESS
@@ -602,7 +665,7 @@ mod tests {
         drop(permit);
         assert_eq!(
             resolver
-                .begin_page_check(None, Duration::from_secs(4500))
+                .begin_page_check(None, Duration::from_secs(4500), false)
                 .await
                 .unwrap_err(),
             PAGE_RETRY_LATER
@@ -615,7 +678,7 @@ mod tests {
         resolver.page_problem(LOGIN_REQUIRED).await;
         assert_eq!(
             resolver
-                .begin_page_check(None, Duration::from_secs(4500))
+                .begin_page_check(None, Duration::from_secs(4500), false)
                 .await
                 .unwrap_err(),
             LOGIN_REQUIRED
@@ -623,7 +686,7 @@ mod tests {
         resolver.reset_session().await;
         assert_eq!(
             resolver
-                .begin_page_check(None, Duration::from_secs(4500))
+                .begin_page_check(None, Duration::from_secs(4500), false)
                 .await
                 .unwrap_err(),
             PAGE_RETRY_LATER

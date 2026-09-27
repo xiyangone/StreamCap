@@ -64,6 +64,8 @@ struct DurationCache(VecDeque<(PathBuf, FileStamp, MediaProbe, Instant)>);
 struct MediaProbe {
     duration: f64,
     copy: bool,
+    video_codec: Option<String>,
+    audio_codec: Option<String>,
 }
 
 impl DurationCache {
@@ -105,6 +107,10 @@ pub struct PreviewInfo {
     pub duration_seconds: Option<f64>,
     pub seekable: bool,
     pub seek_error: Option<String>,
+    pub native_compatible: Option<bool>,
+    pub compatibility_available: bool,
+    pub video_codec: Option<String>,
+    pub audio_codec: Option<String>,
 }
 impl Preview {
     pub fn new(engine: Engine, stop: CancellationToken) -> Self {
@@ -172,7 +178,10 @@ impl Preview {
                 "目标时间尚未录制，请选择已录范围",
             ));
         }
-        let playback_seconds = (duration - start_seconds).min(120.0);
+        // The consumer bounds read-ahead and applies backpressure to stdout.
+        // One producer avoids decoder teardown every 120 seconds; a growing
+        // recording still stops at the verified snapshot and is resumed later.
+        let playback_seconds = duration - start_seconds;
         if media.copy {
             let mut command = preview_command(&ffmpeg);
             command
@@ -228,6 +237,7 @@ impl Preview {
             .try_acquire_owned()
             .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "预览已达并发上限"))?;
         let mut command = tokio::process::Command::new(ffmpeg);
+        crate::network::isolate_media_proxy(&mut command);
         command
             .args([
                 "-v",
@@ -382,6 +392,7 @@ impl Preview {
             .try_acquire_owned()
             .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "预览已达并发上限"))?;
         let mut command = tokio::process::Command::new(ffmpeg);
+        crate::network::isolate_media_proxy(&mut command);
         command.args([
             "-v",
             "error",
@@ -467,17 +478,26 @@ impl Preview {
         );
         let mut duration_seconds = None;
         let mut seek_error = None;
-        if needs_timeline {
-            match ffmpeg.and_then(|path| crate::paths::adjacent_ffprobe(&path)) {
-                Some(ffprobe) => match self
-                    .probe_duration(ffprobe, target, stamp.clone(), is_recording)
-                    .await
-                {
-                    Ok(media) => duration_seconds = Some(media.duration),
-                    Err(error) => seek_error = Some(error.to_string()),
-                },
-                None => seek_error = Some("按时间预览需要 FFmpeg 和同目录 ffprobe".into()),
+        let ffprobe = ffmpeg.and_then(|path| crate::paths::adjacent_ffprobe(&path));
+        let compatibility_available = ffprobe.is_some();
+        let mut native_compatible = None;
+        let mut video_codec = None;
+        let mut audio_codec = None;
+        if let Some(ffprobe) = ffprobe {
+            match self
+                .probe_duration(ffprobe, target, stamp.clone(), is_recording)
+                .await
+            {
+                Ok(media) => {
+                    duration_seconds = Some(media.duration);
+                    native_compatible = Some(native_compatible_media(&format, &media));
+                    video_codec = media.video_codec;
+                    audio_codec = media.audio_codec;
+                }
+                Err(error) => seek_error = Some(error.to_string()),
             }
+        } else if needs_timeline {
+            seek_error = Some("按时间预览需要 FFmpeg 和同目录 ffprobe".into());
         }
         Ok(PreviewInfo {
             format,
@@ -486,6 +506,10 @@ impl Preview {
             duration_seconds,
             seekable: duration_seconds.is_some(),
             seek_error,
+            native_compatible,
+            compatibility_available,
+            video_codec,
+            audio_codec,
         })
     }
 
@@ -535,6 +559,7 @@ impl Preview {
                 let _permit = permit;
                 let result = async {
                     let mut command = tokio::process::Command::new(ffprobe);
+        crate::network::isolate_media_proxy(&mut command);
                     command.args(["-v","error","-protocol_whitelist","file","-probesize","2000000","-analyzeduration","2000000","-duration_probesize","2000000","-show_entries","format=duration:stream=codec_type,codec_name,pix_fmt","-of","json"])
                         .arg(target).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).kill_on_drop(true);
                     #[cfg(windows)] command.creation_flags(0x08000000);
@@ -552,7 +577,9 @@ impl Preview {
                     let data: serde_json::Value=serde_json::from_slice(&bytes).map_err(io::Error::other)?;
                     let duration = data["format"]["duration"].as_str().and_then(|value|value.parse::<f64>().ok()).filter(|duration|duration.is_finite()&&*duration>0.0)
                         .ok_or_else(||io::Error::other("文件尚未写入可播放的完整片段"))?;
-                    Ok(MediaProbe { duration, copy: can_copy(&data) })
+                    let streams = data["streams"].as_array();
+                    let codec = |kind| streams.and_then(|streams|streams.iter().find(|stream|stream["codec_type"]==kind)).and_then(|stream|stream["codec_name"].as_str()).map(str::to_owned);
+                    Ok(MediaProbe { duration, copy: can_copy(&data), video_codec: codec("video"), audio_codec: codec("audio") })
                 }.await;
                 let _=sender.send(result);
             });
@@ -569,6 +596,7 @@ impl Preview {
 
 fn preview_command(ffmpeg: &std::path::Path) -> tokio::process::Command {
     let mut command = tokio::process::Command::new(ffmpeg);
+    crate::network::isolate_media_proxy(&mut command);
     command
         .args([
             "-v",
@@ -592,6 +620,33 @@ fn preview_command(ffmpeg: &std::path::Path) -> tokio::process::Command {
     command
 }
 
+fn native_compatible_media(format: &str, media: &MediaProbe) -> bool {
+    match format {
+        "mp4" | "m4v" => {
+            media.copy
+                || (media.video_codec.is_none()
+                    && matches!(media.audio_codec.as_deref(), Some("aac" | "mp3")))
+        }
+        "mp3" => media.video_codec.is_none() && media.audio_codec.as_deref() == Some("mp3"),
+        "m4a" | "aac" => media.video_codec.is_none() && media.audio_codec.as_deref() == Some("aac"),
+        "wav" => {
+            media.video_codec.is_none()
+                && media
+                    .audio_codec
+                    .as_deref()
+                    .is_some_and(|c| c.starts_with("pcm_"))
+        }
+        "webm" => {
+            matches!(media.video_codec.as_deref(), Some("vp8" | "vp9") | None)
+                && matches!(media.audio_codec.as_deref(), Some("opus" | "vorbis") | None)
+        }
+        "ogg" => {
+            media.video_codec.is_none()
+                && matches!(media.audio_codec.as_deref(), Some("opus" | "vorbis"))
+        }
+        _ => false,
+    }
+}
 fn can_copy(data: &serde_json::Value) -> bool {
     let Some(streams) = data["streams"].as_array() else {
         return false;
@@ -681,6 +736,8 @@ mod preview_cache_tests {
         MediaProbe {
             duration,
             copy: true,
+            video_codec: Some("h264".into()),
+            audio_codec: Some("aac".into()),
         }
     }
     #[test]

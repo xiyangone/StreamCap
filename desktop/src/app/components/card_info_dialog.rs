@@ -38,6 +38,10 @@ pub fn CardInfoDialog(target: RwSignal<Option<Recording>>) -> impl IntoView {
                 <div><dt>{t("最近检查")}</dt><dd>{move || crate::app::labels::modified_time(record().last_check_at.map(|value| value as f64))}</dd></div>
                 <div><dt>{t("最近成功检查")}</dt><dd>{move || crate::app::labels::modified_time(record().last_success_at.map(|value| value as f64))}</dd></div>
                 <div><dt>{t("下次计划检测")}</dt><dd>{move || crate::app::labels::modified_time(record().next_check_at.map(|value| value as f64))}</dd></div>
+                <div><dt>{t("检测安排")}</dt><dd>{move || crate::app::labels::queue_label(&record())}</dd></div>
+                <div><dt>{t("执行时间")}</dt><dd>{move || crate::app::labels::queue_time(&record(), state.now.get())}</dd></div>
+                <div><dt>{t("最早执行时间")}</dt><dd>{move || crate::app::labels::modified_time(record().check_ready_at.map(|value| value as f64))}</dd></div>
+                <div><dt>{t("断流恢复")}</dt><dd>{move || crate::tr_format!("已安排 {}/3 次", record().recovery_attempt)}</dd></div>
                 <div><dt>{t("本次录制时长")}</dt><dd>{move||crate::app::labels::duration(record().recorded_seconds)}</dd></div><div><dt>{t("录制速率")}</dt><dd>{move || record().speed.unwrap_or_else(|| "—".into())}</dd></div>
                 <div><dt>{t("保存目录")}</dt><dd class="break-anywhere">{move || record().recording_dir.unwrap_or_else(|| t("尚未生成录制文件").into())}</dd></div>
             </dl>

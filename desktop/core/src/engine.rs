@@ -892,6 +892,7 @@ impl Engine {
         log::info!("启动录制 {rec_id}");
 
         let mut command = Command::new(ffmpeg);
+        crate::network::isolate_media_proxy(&mut command);
         command
             .args(&args)
             .stdin(Stdio::piped())

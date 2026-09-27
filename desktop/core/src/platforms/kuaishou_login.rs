@@ -235,7 +235,7 @@ async fn login_flow(
     let http = if endpoints.is_loopback() {
         PlatformHttp::for_loopback()?
     } else {
-        PlatformHttp::new("kuaishou.com", proxy, None, Duration::from_secs(75))?
+        PlatformHttp::fresh("kuaishou.com", proxy, None, Duration::from_secs(75))?
     };
     let endpoint = |p: &str| {
         endpoints

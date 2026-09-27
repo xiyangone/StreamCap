@@ -37,6 +37,31 @@ async fn start_backend() -> (String, tempfile::TempDir) {
 }
 
 #[tokio::test]
+async fn media_queue_contract_contains_stage_fields_even_before_progress_is_available() {
+    let job = streamcap_core::model::MediaJob {
+        id: "test".into(),
+        task_id: None,
+        source: "a.ts".into(),
+        output: "a.mp4".into(),
+        state: streamcap_core::model::MediaJobState::Waiting,
+        delete_original: false,
+        source_removed: false,
+        message: "waiting".into(),
+        stage_percent: None,
+        stage_eta_seconds: None,
+        started_at: None,
+        finished_at: None,
+        elapsed_seconds: 0,
+        queue_position: Some(2),
+    };
+    let json = serde_json::to_value(job).unwrap();
+    assert!(json["stagePercent"].is_null());
+    assert!(json["stageEtaSeconds"].is_null());
+    assert_eq!(json["queuePosition"], 2);
+    assert_eq!(json["elapsedSeconds"], 0);
+}
+
+#[tokio::test]
 async fn missing_recording_roots_never_rewrite_settings_or_historical_paths_at_bootstrap() {
     let directory = tempfile::tempdir().unwrap();
     let workspace = Workspace {
@@ -132,6 +157,150 @@ async fn status_matches_frontend_contract() {
     assert!(status["activeRecordings"].is_number());
     assert!(status["totalRecordings"].is_number());
     assert!(status["resolverReady"].is_boolean());
+}
+
+#[tokio::test]
+async fn queue_contract_is_runtime_only_and_committed_edits_clear_old_recovery() {
+    use streamcap_core::service::{Server, ServerOptions};
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Workspace::from_repo_root(dir.path());
+    let state = bootstrap(workspace.clone()).await.unwrap();
+    let mut record = streamcap_core::Recording::new(
+        "queued".into(),
+        "http://127.0.0.1:1/live.flv".into(),
+        "Fixture".into(),
+    );
+    record.queue_position = Some(4);
+    record.check_wait_reason = "recovery".into();
+    record.check_ready_at = Some(2_000_000_000);
+    record.recovery_at = record.check_ready_at;
+    record.recovery_attempt = 2;
+    record.check_state = "recovering".into();
+    state.store.insert(vec![record]).await.unwrap();
+    let server = Server::start(
+        state.clone(),
+        ServerOptions {
+            port: 0,
+            monitoring: false,
+        },
+    )
+    .await
+    .unwrap();
+    let base = format!("http://{}", server.address());
+    let list = get_json(&format!("{base}/api/recordings")).await;
+    assert_eq!(list[0]["queuePosition"], 4);
+    assert_eq!(list[0]["recoveryAttempt"], 2);
+    assert_eq!(list[0]["checkReadyAt"], 2_000_000_000);
+    let response = reqwest::Client::new()
+        .put(format!("{base}/api/recordings/queued"))
+        .json(&json!({"changes":{"streamerName":"Edited"}}))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    let edited = get_json(&format!("{base}/api/recordings")).await;
+    assert!(edited[0]["queuePosition"].is_null() && edited[0]["recoveryAt"].is_null());
+    assert_eq!(edited[0]["recoveryAttempt"], 0);
+    let saved: Value =
+        serde_json::from_slice(&std::fs::read(workspace.recordings_path()).unwrap()).unwrap();
+    assert_eq!(saved[0]["streamer_name"], "Edited");
+    for key in [
+        "queuePosition",
+        "queue_position",
+        "recoveryAttempt",
+        "recovery_attempt",
+        "check_ready_at",
+        "schedule_revision",
+    ] {
+        assert!(saved[0].get(key).is_none(), "{key} must not be persisted");
+    }
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn changing_room_clears_old_access_state_but_same_room_edits_preserve_verification() {
+    use streamcap_core::service::{Server, ServerOptions};
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Workspace::from_repo_root(dir.path());
+    let state = bootstrap(workspace).await.unwrap();
+    let mut record = streamcap_core::Recording::new(
+        "changed-room".into(),
+        "https://live.kuaishou.com/u/old-room".into(),
+        "Fixture".into(),
+    );
+    record.only_notify_no_record = Some(true);
+    record.is_live = true;
+    record.live_title = Some("Old room title".into());
+    record.check_error = Some("需要验证码".into());
+    record.verification_required = true;
+    record.access_state = "captcha".into();
+    record.recording_error = Some("Old room failure".into());
+    record.last_check_at = Some(1);
+    record.last_success_at = Some(1);
+    state.store.insert(vec![record]).await.unwrap();
+    let server = Server::start(
+        state.clone(),
+        ServerOptions {
+            port: 0,
+            monitoring: false,
+        },
+    )
+    .await
+    .unwrap();
+    let client = reqwest::Client::new();
+    let endpoint = format!("http://{}/api/recordings/changed-room", server.address());
+    for changes in [
+        json!({"streamerName":"Renamed"}),
+        json!({"url":"https://live.kuaishou.com/u/old-room?utm_source=share"}),
+    ] {
+        let edited: Value = client
+            .put(&endpoint)
+            .json(&json!({"changes":changes}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(edited["verificationRequired"], true);
+        assert_eq!(edited["accessState"], "captcha");
+        assert_eq!(edited["platformKey"], "kuaishou");
+    }
+    let edited: Value = client
+        .put(&endpoint)
+        .json(&json!({"changes":{"url":"http://127.0.0.1:1/new-room.mp4"}}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(edited["verificationRequired"], false);
+    assert_eq!(edited["accessState"], "");
+    assert!(edited["platformKey"].is_null());
+    assert!(edited["platform"].is_null());
+    assert_eq!(edited["isLive"], false);
+    for field in [
+        "checkError",
+        "recordingError",
+        "lastCheckAt",
+        "lastSuccessAt",
+        "liveTitle",
+    ] {
+        assert!(
+            edited[field].is_null(),
+            "stale {field} must not follow the new room"
+        );
+    }
+    assert_eq!(
+        state.scheduler.check("changed-room".into()).await.unwrap(),
+        streamcap_core::scheduler::CheckOutcome::NotifyOnly
+    );
+    server.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -431,8 +600,10 @@ async fn storage_lists_created_files() {
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["name"], json!("抖音"));
     assert_eq!(items[0]["isDir"], json!(true));
-    assert_eq!(items[0]["size"], json!(10));
-    assert_eq!(listing["totalSize"], json!(10));
+    assert_eq!(items[0]["sizeKnown"], false);
+    assert_eq!(listing["totalSizeKnown"], false);
+    let size = get_json(&format!("{base}/api/storage/size?path=%E6%8A%96%E9%9F%B3")).await;
+    assert_eq!(size["size"], json!(10));
 
     // 进入子目录
     let sub = get_json(&format!("{base}/api/storage?subfolder=%E6%8A%96%E9%9F%B3")).await;
@@ -1008,22 +1179,55 @@ async fn creating_and_resuming_a_monitor_schedules_checks_without_start_requests
         .unwrap()
         .status()
         .is_success());
-    // A resumed room joins the 20-40 second automatic queue instead of causing a burst.
-    // Advance only the test clock, never the real platform's configured interval.
-    tokio::time::pause();
-    for _ in 0..10 {
-        tokio::task::yield_now().await;
-    }
-    assert!(!state.store.get(id).await.unwrap().is_live);
-    tokio::time::advance(std::time::Duration::from_secs(40)).await;
-    for _ in 0..30 {
-        tokio::task::yield_now().await;
-    }
+    // No unrelated global delay when this platform has no spacing or active requests.
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !state.store.get(id).await.unwrap().is_live {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     assert!(state.store.get(id).await.unwrap().is_live);
-    tokio::time::resume();
     assert_eq!(
         state.config.read().await.get_i64("loop_time_seconds", 0),
         4500
     );
     server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn idle_sse_emits_a_visible_heartbeat_without_detecting_live_rooms() {
+    use futures::StreamExt;
+    let (base, _guard) = start_backend().await;
+    let client = reqwest::Client::new();
+    let response = client
+        .get(format!("{base}/api/events"))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("text/event-stream"));
+    let mut stream = response.bytes_stream();
+    let mut text = String::new();
+    tokio::time::timeout(std::time::Duration::from_secs(8), async {
+        while !text.contains("event: heartbeat") {
+            text.push_str(&String::from_utf8_lossy(
+                &stream.next().await.unwrap().unwrap(),
+            ));
+        }
+    })
+    .await
+    .unwrap();
+    assert!(text.contains("data: {}"));
+    let records: serde_json::Value = client
+        .get(format!("{base}/api/recordings"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(records.as_array().unwrap().len(), 0);
 }

@@ -130,6 +130,20 @@ pub struct Recording {
     pub last_success_at: Option<i64>,
     #[serde(default, skip_deserializing)]
     pub next_check_at: Option<i64>,
+    #[serde(default, skip_deserializing)]
+    pub queue_position: Option<usize>,
+    #[serde(default, skip_deserializing)]
+    pub check_wait_reason: String,
+    /// Earliest eligible time, not a promise about network completion.
+    #[serde(default, skip_deserializing)]
+    pub check_ready_at: Option<i64>,
+    #[serde(default, skip_deserializing)]
+    pub recovery_at: Option<i64>,
+    #[serde(default, skip_deserializing)]
+    pub recovery_attempt: u32,
+    /// Invalidates queued work and late replies, including same-URL edits and pause/resume.
+    #[serde(skip)]
+    pub(crate) schedule_revision: u64,
     /// Internal attempt identity; never sent to the UI or persisted with user tasks.
     #[serde(skip)]
     pub(crate) recording_run: Option<uuid::Uuid>,
@@ -186,6 +200,12 @@ impl Recording {
             last_check_at: None,
             last_success_at: None,
             next_check_at: None,
+            queue_position: None,
+            check_wait_reason: String::new(),
+            check_ready_at: None,
+            recovery_at: None,
+            recovery_attempt: 0,
+            schedule_revision: 0,
             recording_run: None,
             live_title: None,
             speed: None,
@@ -216,6 +236,28 @@ impl Recording {
 
     pub fn is_inherited(&self, field: &str) -> bool {
         self.inherited_fields.iter().any(|f| f == field)
+    }
+
+    pub fn same_schedule_as(&self, other: &Self) -> bool {
+        self.rec_id == other.rec_id
+            && self.schedule_revision == other.schedule_revision
+            && self.url == other.url
+            && self.quality == other.quality
+    }
+
+    pub(crate) fn clear_queue(&mut self) {
+        self.queue_position = None;
+        self.check_ready_at = None;
+        self.check_wait_reason.clear();
+        self.recovery_at = None;
+    }
+
+    pub(crate) fn invalidate_schedule(&mut self) {
+        self.schedule_revision = self.schedule_revision.wrapping_add(1);
+        self.clear_queue();
+        self.recovery_attempt = 0;
+        self.recording_run = None;
+        self.check_state = "idle".into();
     }
 
     /// 持久化视图始终使用磁盘模型，避免 API 字段泄漏进用户文件。
@@ -473,6 +515,18 @@ pub struct MediaJob {
     pub source: String,
     pub output: String,
     pub state: MediaJobState,
+    #[serde(default)]
+    pub stage_percent: Option<u8>,
+    #[serde(default)]
+    pub stage_eta_seconds: Option<u64>,
+    #[serde(default)]
+    pub started_at: Option<i64>,
+    #[serde(default)]
+    pub finished_at: Option<i64>,
+    #[serde(default)]
+    pub elapsed_seconds: u64,
+    #[serde(default)]
+    pub queue_position: Option<usize>,
     pub delete_original: bool,
     pub source_removed: bool,
     pub message: String,

@@ -92,6 +92,26 @@ async fn shutdown_cancels_resolver_and_unsupported_has_no_fallback() {
     assert!(resolver.resolve(req).await.unwrap_err().contains("退出"));
 }
 
+#[test]
+fn actual_text_only_kuaishou_challenge_is_not_offline_or_missing_author() {
+    use streamcap_core::platforms::kuaishou::{evaluate_verification_page, VerificationPage};
+    let state = serde_json::json!({"room":{"author":{},"isLiving":false,"liveStream":{},"errorType":{"type":400002,"title":"请完成滑块验证"}}});
+    assert!(matches!(
+        evaluate_verification_page(
+            &state,
+            "real-target",
+            "请完成滑块验证\n浏览其他内容",
+            false,
+            Some("OD")
+        ),
+        VerificationPage::Challenge
+    ));
+    assert!(!matches!(
+        evaluate_verification_page(&state, "real-target", "页面加载中", false, Some("OD")),
+        VerificationPage::Challenge
+    ));
+}
+
 #[tokio::test]
 async fn qr_cookie_exchange_and_cancel_are_in_process() {
     use axum::{
@@ -352,18 +372,18 @@ fn kuaishou_rendered_offline_page_can_override_a_stale_challenge_marker() {
 }
 
 #[test]
-fn kuaishou_rate_limit_precedes_400002_and_missing_identity_without_faking_offline() {
+fn kuaishou_human_code_preserves_inspection_and_explicit_rate_limit_stays_distinct() {
     for field in ["title", "content"] {
         let mut room = json!({"author":{},"isLiving":false,"liveStream":{},"errorType":{"type":400002,"title":"请完成滑块验证"}});
         room["errorType"][field] = json!("请求过快，请稍后重试");
         assert_eq!(
             kuaishou::parse_room(&room, None).unwrap_err(),
-            kuaishou::RATE_LIMITED
+            kuaishou::PAGE_CHECK_REQUIRED
         );
-        assert_eq!(
+        assert!(matches!(
             kuaishou::evaluate_verification_page(&json!({"room":room}), "target", "", false, None),
-            kuaishou::VerificationPage::RateLimited
-        );
+            kuaishou::VerificationPage::Unknown(_)
+        ));
     }
     assert_eq!(
         kuaishou::evaluate_verification_page(
@@ -769,4 +789,34 @@ fn douyin_uses_hls_only_when_no_valid_flv_is_provided() {
     assert!(info.record_url.ends_with("a.m3u8"));
     value["data"]["data"][0]["stream_url"]["hls_pull_url_map"] = json!({});
     assert!(douyin::parse_json(&value, None).is_err());
+}
+
+#[test]
+fn visible_human_challenge_wins_over_frequency_copy_without_assuming_offline() {
+    use streamcap_core::platforms::kuaishou;
+    let room = json!({"author":{},"isLiving":false,"liveStream":{},"errorType":{"type":"400002","title":"请求频繁，请完成人机验证"}});
+    assert_eq!(
+        kuaishou::parse_room(&room, None).unwrap_err(),
+        kuaishou::PAGE_CHECK_REQUIRED
+    );
+    assert_eq!(
+        kuaishou::evaluate_verification_page(
+            &json!({"room":room}),
+            "target",
+            "请求频繁，请完成人机验证",
+            true,
+            None
+        ),
+        kuaishou::VerificationPage::Challenge
+    );
+    assert_eq!(
+        kuaishou::evaluate_verification_page(
+            &json!({}),
+            "target",
+            "HTTP 429 too many requests",
+            false,
+            None
+        ),
+        kuaishou::VerificationPage::RateLimited
+    );
 }

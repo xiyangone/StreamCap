@@ -190,6 +190,69 @@ fn recycle_success_and_locked_failure_never_use_permanent_delete() {
     assert!(file.exists());
 }
 
+#[tokio::test]
+async fn shallow_listing_exposes_unknown_sizes_and_explicit_size_query_is_cached() {
+    let (server, dir) = server().await;
+    let folder = dir.path().join("downloads/room/nested");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("file.ts"), b"12345").unwrap();
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", server.address());
+    let listing: serde_json::Value = client
+        .get(format!("{base}/api/storage"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listing["totalSizeKnown"], false);
+    assert_eq!(listing["items"][0]["sizeKnown"], false);
+    let size: serde_json::Value = client
+        .get(format!("{base}/api/storage/size?path=room"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(size["size"], 5);
+    let bad = client
+        .get(format!("{base}/api/storage/size?path=../config"))
+        .send()
+        .await
+        .unwrap();
+    assert!(!bad.status().is_success());
+    server.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn dropping_a_filesystem_request_cancels_its_worker() {
+    let storage = Storage::new(CancellationToken::new());
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let (done, finished) = tokio::sync::oneshot::channel();
+    let worker = storage.clone();
+    let request = tokio::spawn(async move {
+        worker
+            .blocking(move |cancel| {
+                let _ = started.send(());
+                while !cancel.is_cancelled() {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                let _ = done.send(());
+                Ok(())
+            })
+            .await
+    });
+    ready.await.unwrap();
+    request.abort();
+    let _ = request.await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), finished)
+        .await
+        .unwrap()
+        .unwrap();
+    storage.shutdown().await;
+}
+
 #[cfg(windows)]
 #[test]
 fn recycles_nonempty_unicode_directory_as_a_directory() {

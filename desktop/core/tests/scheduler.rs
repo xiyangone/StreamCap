@@ -314,8 +314,8 @@ async fn committed_interval_changes_rearm_without_an_immediate_check() {
     tokio::task::yield_now().await;
     tokio::time::advance(Duration::from_secs(29)).await;
     assert!(!state.store.get("timer").await.unwrap().is_live);
-    // The shared automatic queue may delay a short 30-second interval by up to 10 seconds.
-    tokio::time::advance(Duration::from_secs(11)).await;
+    // A free platform can run at its deadline; there is no extra global 20–40 second wait.
+    tokio::time::advance(Duration::from_secs(1)).await;
     for _ in 0..5 {
         tokio::task::yield_now().await;
     }
@@ -326,8 +326,14 @@ async fn committed_interval_changes_rearm_without_an_immediate_check() {
     scheduler.finish_background().await;
 }
 
+async fn settle_checks() {
+    for _ in 0..40 {
+        tokio::task::yield_now().await;
+    }
+}
+
 #[tokio::test(start_paused = true)]
-async fn automatic_startup_is_one_room_at_a_time_and_each_room_keeps_4500_seconds() {
+async fn automatic_checks_use_platform_spacing_and_keep_each_room_interval() {
     let dir = tempfile::tempdir().unwrap();
     let state = bootstrap(Workspace::from_repo_root(dir.path()))
         .await
@@ -337,85 +343,71 @@ async fn automatic_startup_is_one_room_at_a_time_and_each_room_keeps_4500_second
         .write()
         .await
         .update_user_config(
-            json!({"loop_time_seconds":"4500","platform_request_interval":"0"})
-                .as_object()
-                .unwrap()
-                .clone(),
+            json!({"loop_time_seconds":"4500",
+        "platform_request_interval":"3", "platform_max_concurrent_requests":"1"})
+            .as_object()
+            .unwrap()
+            .clone(),
         )
         .unwrap();
-    let records = (0..3)
-        .map(|index| {
-            let mut record = Recording::new(
-                format!("paced-{index}"),
-                format!("http://127.0.0.1:1/{index}.mp4"),
-                format!("Paced {index}"),
-            );
-            record.only_notify_no_record = Some(true);
-            record
-        })
-        .collect();
-    state.store.insert(records).await.unwrap();
+    state
+        .store
+        .insert(
+            (0..3)
+                .map(|index| {
+                    let mut r = Recording::new(
+                        format!("paced-{index}"),
+                        format!("http://127.0.0.1:1/{index}.mp4"),
+                        format!("Paced {index}"),
+                    );
+                    r.only_notify_no_record = Some(true);
+                    r
+                })
+                .collect(),
+        )
+        .await
+        .unwrap();
     let (stop, receiver) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(state.scheduler.clone().run(receiver));
-    for _ in 0..30 {
-        tokio::task::yield_now().await;
-    }
-    assert_eq!(
-        state.store.all().await.iter().filter(|r| r.is_live).count(),
-        1,
-        "startup must not launch all rooms"
-    );
-    for expected in [2, 3] {
-        tokio::time::advance(Duration::from_secs(19)).await;
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(
-            state.store.all().await.iter().filter(|r| r.is_live).count(),
-            expected - 1
-        );
-        tokio::time::advance(Duration::from_secs(21)).await;
-        for _ in 0..30 {
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(
-            state.store.all().await.iter().filter(|r| r.is_live).count(),
-            expected
-        );
-    }
+    settle_checks().await;
+    assert!(state.store.get("paced-0").await.unwrap().is_live);
+    let waiting = state.store.get("paced-1").await.unwrap();
+    assert_eq!(waiting.queue_position, Some(1));
+    assert_eq!(waiting.check_wait_reason, "platformSpacing");
+    assert!(waiting.check_ready_at.is_some());
+    tokio::time::advance(Duration::from_secs(2)).await;
+    settle_checks().await;
+    assert!(!state.store.get("paced-1").await.unwrap().is_live);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    settle_checks().await;
+    assert!(state.store.get("paced-1").await.unwrap().is_live);
+    tokio::time::advance(Duration::from_secs(3)).await;
+    settle_checks().await;
+    assert!(state.store.get("paced-2").await.unwrap().is_live);
     for index in 0..3 {
         state
             .store
             .update(&format!("paced-{index}"), |r| r.is_live = false)
             .await;
     }
-    tokio::time::advance(Duration::from_secs(4419)).await;
-    for _ in 0..20 {
-        tokio::task::yield_now().await;
-    }
-    assert!(
-        state.store.all().await.iter().all(|r| !r.is_live),
-        "ordinary polling must not be accelerated"
-    );
+    tokio::time::advance(Duration::from_secs(4493)).await;
+    settle_checks().await;
+    assert!(state.store.all().await.iter().all(|r| !r.is_live));
     tokio::time::advance(Duration::from_secs(1)).await;
-    for _ in 0..30 {
-        tokio::task::yield_now().await;
-    }
+    settle_checks().await;
     assert!(state.store.get("paced-0").await.unwrap().is_live);
     assert!(!state.store.get("paced-1").await.unwrap().is_live);
-    assert!(!state.store.get("paced-2").await.unwrap().is_live);
     assert_eq!(
         state.config.read().await.get_i64("loop_time_seconds", 0),
         4500
     );
-    assert!(state.engine.active_ids().await.is_empty());
     stop.send(true).unwrap();
     task.await.unwrap();
     streamcap_core::api::shutdown(&state).await.unwrap();
 }
 
 #[tokio::test(start_paused = true)]
-async fn queued_recovery_stays_staggered_and_shutdown_cancels_the_queue() {
+async fn pausing_a_queued_monitor_and_shutdown_cancel_pending_checks() {
     let dir = tempfile::tempdir().unwrap();
     let state = bootstrap(Workspace::from_repo_root(dir.path()))
         .await
@@ -425,65 +417,51 @@ async fn queued_recovery_stays_staggered_and_shutdown_cancels_the_queue() {
         .write()
         .await
         .update_user_config(
-            json!({"loop_time_seconds":"4500","platform_request_interval":"0"})
-                .as_object()
-                .unwrap()
-                .clone(),
+            json!({"loop_time_seconds":"4500",
+        "platform_request_interval":"30", "platform_max_concurrent_requests":"1"})
+            .as_object()
+            .unwrap()
+            .clone(),
         )
         .unwrap();
     let (stop, receiver) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(state.scheduler.clone().run(receiver));
-    tokio::task::yield_now().await;
-    let records = (0..3)
-        .map(|index| {
-            let mut record = Recording::new(
-                format!("resume-{index}"),
-                format!("http://127.0.0.1:1/{index}.mp4"),
-                format!("Resume {index}"),
-            );
-            record.only_notify_no_record = Some(true);
-            record
-        })
-        .collect();
-    state.store.insert(records).await.unwrap();
+    state
+        .store
+        .insert(
+            (0..3)
+                .map(|index| {
+                    let mut r = Recording::new(
+                        format!("resume-{index}"),
+                        format!("http://127.0.0.1:1/{index}.mp4"),
+                        format!("Resume {index}"),
+                    );
+                    r.only_notify_no_record = Some(true);
+                    r
+                })
+                .collect(),
+        )
+        .await
+        .unwrap();
     state
         .scheduler
         .request_monitoring(["resume-0", "resume-1", "resume-2", "resume-1"].map(str::to_owned));
-    for _ in 0..30 {
-        tokio::task::yield_now().await;
-    }
+    settle_checks().await;
     assert_eq!(
         state.store.all().await.iter().filter(|r| r.is_live).count(),
         1
     );
-    tokio::time::advance(Duration::from_secs(19)).await;
-    for _ in 0..10 {
-        tokio::task::yield_now().await;
-    }
-    assert_eq!(
-        state.store.all().await.iter().filter(|r| r.is_live).count(),
-        1
-    );
-    state
-        .store
-        .update("resume-1", |record| record.monitor_status = false)
-        .await;
-    state.scheduler.request_monitoring(["resume-1".into()]);
-    tokio::time::advance(Duration::from_secs(21)).await;
-    for _ in 0..30 {
-        tokio::task::yield_now().await;
-    }
-    assert!(
-        !state.store.get("resume-1").await.unwrap().is_live,
-        "a paused queued room is never requested"
-    );
+    state.scheduler.toggle_monitor("resume-1").await.unwrap();
+    settle_checks().await;
+    let paused = state.store.get("resume-1").await.unwrap();
+    assert!(!paused.is_live && !paused.monitor_status);
+    assert!(paused.queue_position.is_none() && paused.next_check_at.is_none());
     stop.send(true).unwrap();
     task.await.unwrap();
     tokio::time::advance(Duration::from_secs(100)).await;
-    assert!(
-        !state.store.get("resume-2").await.unwrap().is_live,
-        "shutdown cancels the pending staggered check"
-    );
+    settle_checks().await;
+    let pending = state.store.get("resume-2").await.unwrap();
+    assert!(!pending.is_live && pending.queue_position.is_none());
     streamcap_core::api::shutdown(&state).await.unwrap();
 }
 #[tokio::test]
@@ -629,9 +607,11 @@ async fn failed_name_persistence_prevents_both_start_paths_from_claiming_success
         let mut expected = before.clone();
         expected.check_state = "idle".into();
         expected.last_check_at = current.last_check_at;
+        expected.next_check_at = current.next_check_at;
         assert!(expected.last_check_at.is_some());
         assert_eq!(
-            current, expected,
+            serde_json::to_value(&current).unwrap(),
+            serde_json::to_value(&expected).unwrap(),
             "only attempt state may change when persistence fails"
         );
         let mut phases = Vec::new();
@@ -641,12 +621,21 @@ async fn failed_name_persistence_prevents_both_start_paths_from_claiming_success
             let mut expected = serde_json::to_value(&before).unwrap();
             expected["checkState"] = emitted["checkState"].clone();
             expected["lastCheckAt"] = emitted["lastCheckAt"].clone();
+            for key in ["nextCheckAt", "checkReadyAt", "checkWaitReason"] {
+                expected[key] = emitted[key].clone();
+            }
             assert_eq!(
                 emitted, expected,
                 "never publish an unsaved name or recording success"
             );
-            phases.push(emitted["checkState"].as_str().unwrap().to_owned());
+            if matches!(
+                emitted["checkState"].as_str(),
+                Some("queued" | "checking" | "idle")
+            ) {
+                phases.push(emitted["checkState"].as_str().unwrap().to_owned());
+            }
         }
+        phases.dedup();
         assert_eq!(phases, ["queued", "checking", "idle"]);
         assert!(state.engine.active_ids().await.is_empty());
         std::fs::remove_dir(workspace.recordings_path()).unwrap();
@@ -920,4 +909,40 @@ async fn verified_kuaishou_room_keeps_monitoring_intent_and_runtime_state_out_of
             .contains("已更新"));
         streamcap_core::api::shutdown(&state).await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn human_access_report_is_pushed_without_overwriting_last_verified_live_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = bootstrap(Workspace::from_repo_root(dir.path()))
+        .await
+        .unwrap();
+    let mut record = Recording::new(
+        "human".into(),
+        "https://live.kuaishou.com/u/fixture".into(),
+        "Fixture".into(),
+    );
+    record.platform_key = Some("kuaishou".into());
+    record.monitor_status = true;
+    record.is_live = true;
+    state.store.insert(vec![record]).await.unwrap();
+    let expected = state.store.get("human").await.unwrap();
+    let mut events = state.store.subscribe();
+    state
+        .scheduler
+        .report_kuaishou_access(
+            &expected,
+            streamcap_core::platforms::kuaishou::VERIFICATION_REQUIRED,
+        )
+        .await;
+    let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(event.topic, "update");
+    let actual = state.store.get("human").await.unwrap();
+    assert!(actual.is_live && actual.monitor_status && actual.verification_required);
+    assert_eq!(actual.access_state, "captcha");
+    assert!(!actual.is_recording);
+    streamcap_core::api::shutdown(&state).await.unwrap();
 }

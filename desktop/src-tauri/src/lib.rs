@@ -9,6 +9,7 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{Manager, RunEvent, WindowEvent};
 mod kuaishou_verification;
 mod lifecycle;
+mod logging;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -34,10 +35,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     workspace.ensure_ready()?;
     let log_dir = workspace.user_data_dir.join("logs");
     std::fs::create_dir_all(&log_dir)?;
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_dir.join("native.log"))?;
+    let log = logging::RollingLog::open(&log_dir)?;
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .target(env_logger::Target::Pipe(Box::new(log)))
         .try_init();

@@ -98,13 +98,13 @@ try {
   const verificationSource=createServer((req,res)=>{
     if(req.url!=='/kuaishou-fixture/room'){res.writeHead(404);res.end();return;}
     verificationRequests++;
-    const room=verificationMode==='challenge'||verificationMode==='late-offline'?{author:{},liveStream:{},isLiving:false,errorType:{type:400002,title:'请完成滑块验证'}}:verificationMode==='stale-offline'?{author:{id:'fixture-verify',name:'验证夹具'},liveStream:{},isLiving:false,errorType:{type:400002,title:'请完成滑块验证'}}:{author:{id:'fixture-verify',name:'验证夹具'},liveStream:{},isLiving:false,errorType:{}};
+    const room=['challenge','late-offline','text-challenge'].includes(verificationMode)?{author:{},liveStream:{},isLiving:false,errorType:{type:400002,title:'请完成滑块验证'}}:verificationMode==='stale-offline'?{author:{id:'fixture-verify',name:'验证夹具'},liveStream:{},isLiving:false,errorType:{type:400002,title:'请完成滑块验证'}}:{author:{id:'fixture-verify',name:'验证夹具'},liveStream:{},isLiving:false,errorType:{}};
     if(['rate-limit','login-required','login-prompt'].includes(verificationMode)){room.author={};room.errorType={type:400002,title:verificationMode==='login-required'?'请先登录后观看':'请完成滑块验证',content:verificationMode==='rate-limit'?'请求过快，请稍后重试':''};}
     const state={user:{userInfoQuery:{ownerInfo:{originUserId:'fixture-user',name:'验证账号'}}},liveroom:{playList:[room]}};
     const send=()=>{if(res.destroyed)return;
     res.writeHead(200,{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store',...(verificationMode==='public-offline'?{'Set-Cookie':['userId=; Path=/; Max-Age=0','site_proof=fixture-public; Path=/; SameSite=Lax']}:verificationMode!=='challenge'?{'Set-Cookie':'site_proof=fixture-verified; Path=/; SameSite=Lax'}:{})});
     const delayed=verificationMode==='late-offline'?"setTimeout(()=>{window.__INITIAL_STATE__.liveroom.playList[0]={author:{id:'fixture-verify',name:'验证夹具'},isLiving:false,liveStream:{}};document.querySelector('.player').textContent='验证夹具 主播尚未开播，可以观看其他直播';},5500);":verificationMode==='transient-challenge'?"setTimeout(()=>{document.querySelector('.player').textContent='验证夹具 主播尚未开播，可以观看其他直播';},2500);":"";
-    const playerText=verificationMode==='rate-limit'?'请求过快，请稍后重试':verificationMode==='login-required'?'请先登录后观看':verificationMode==='login-prompt'?'页面加载中':verificationMode==='challenge'||verificationMode==='transient-challenge'?'<div class="captcha" style="width:300px;height:120px">请完成滑块验证</div>':verificationMode==='late-offline'?'页面加载中':'验证夹具 主播尚未开播，可以观看其他直播';
+    const playerText=verificationMode==='text-challenge'?'请完成滑块验证':verificationMode==='rate-limit'?'请求过快，请稍后重试':verificationMode==='login-required'?'请先登录后观看':verificationMode==='login-prompt'?'页面加载中':verificationMode==='challenge'||verificationMode==='transient-challenge'?'<div class="captcha" style="width:300px;height:120px">请完成滑块验证</div>':verificationMode==='late-offline'?'页面加载中':'验证夹具 主播尚未开播，可以观看其他直播';
     const loginPrompt=['login-prompt','public-login-prompt','rate-limit'].includes(verificationMode)?'<div role="dialog" class="login-panel" style="width:350px;height:250px">登录畅享蓝光直播画质 快手APP登录 手机号登录</div>':'';
     res.end('<!doctype html><html><head><title>本机快手验证夹具</title></head><body><h1>本机验证夹具</h1><div class="live-room"><div class="swiper-slide-active"><div class="player">'+playerText+'</div></div></div>'+loginPrompt+'<div style="display:none"><div class="captcha" style="width:300px;height:120px">隐藏的验证码模板</div></div><script>window.__INITIAL_STATE__ = '+JSON.stringify(state)+';'+delayed+'document.currentScript.remove();</script></body></html>');};
     if(verificationDelayMs)setTimeout(send,verificationDelayMs);else send();
@@ -134,10 +134,16 @@ try {
   assert.equal(verificationRequests,countBeforeVerify,'checking the current page must not force a second navigation');
   assert.equal(await readCookie(),seedCookie,'challenge must not replace saved cookies');
   await verificationPage.screenshot({path:path.join(output,'native-kuaishou-challenge.png'),fullPage:true});
+  await verificationPage.evaluate(()=>localStorage.setItem('streamcap-fixture-proof','persisted'));
   await verificationCall({action:'smoke-close'});
   await eventually(verificationStatus,status=>!status.active&&status.activeWorkers===0,'verification X cleans its window and workers');
   assert.equal((await native()).closing,false);assert.equal(await readCookie(),seedCookie);
   const requestsAfterClose=verificationRequests;await sleep(400);assert.equal(verificationRequests,requestsAfterClose,'cancelled verification must not continue network requests');
+  await openVerification();
+  const reopenedProofPage=await eventually(()=>browser.contexts().flatMap(context=>context.pages()).find(p=>p.url()===verificationUrl),Boolean,'persistent isolated verification profile');
+  assert.equal(await reopenedProofPage.evaluate(()=>localStorage.getItem('streamcap-fixture-proof')),'persisted');
+  await verificationCall({action:'smoke-close'});
+  await eventually(verificationStatus,s=>!s.active&&s.activeWorkers===0,'persistent proof check cleanup');
   verificationDelayMs=1500;await openVerification();
   const pendingVerification=await verificationCall({action:'complete'});assert.equal(pendingVerification.busy,true);
   await verificationCall({action:'smoke-close'});
@@ -190,12 +196,14 @@ try {
     verificationMode=mode;
     const opened=await verificationCall({action:'smoke-open-background',recId:verifyTask.recId,fixtureUrl:verificationUrl});
     assert.equal(opened.active,true);
-    await eventually(async()=>{const status=await verificationStatus();assert.equal(status.visible,false,mode+' is not a CAPTCHA and must not surface');return status;},status=>!status.active&&status.activeWorkers===0,mode+' terminates hidden inspection',15000);
+    await eventually(verificationStatus,status=>status.active&&status.visible&&!status.busy,mode+' keeps an inspectable official page',15000);
     const checked=(await(await fetch(base+'/api/recordings')).json()).find(task=>task.recId===verifyTask.recId);
     assert.equal(checked.accessState,expected);assert.equal(checked.verificationRequired,false);assert.equal(checked.isRecording,false);
     assert.equal(checked.isLive,beforeProblem.isLive);assert.equal(checked.lastSuccessAt,beforeProblem.lastSuccessAt);
     assert.equal(await readCookie(),beforeProblemCookie,'unreadable pages must never overwrite credentials');
     assert.equal(verificationRequests,count+1,'one page request only');
+    await verificationCall({action:'smoke-close'});
+    await eventually(verificationStatus,status=>!status.active&&status.activeWorkers===0,mode+' explicit close releases the observer');
   }
   await setCookie(await readCookie());
   verificationMode='challenge';
@@ -205,7 +213,15 @@ try {
   assert.equal(captchaTask.accessState,'captcha');assert.equal(captchaTask.verificationRequired,true);
   await verificationCall({action:'smoke-close'});
   await eventually(verificationStatus,state=>!state.active&&state.activeWorkers===0,'challenge cancellation closes background observer');
-  const verificationValidation={singleWindow:true,remoteIpcDenied,challengeNotOffline:true,currentPageOnly:true,removedInitialScript:true,lateSameDocumentRecovery:true,hiddenChallengeIgnored:true,cookieScopeConsistent:true,publicRoomWithoutLogin:true,savedIdentityPreserved:true,offlineNoPopup:true,onlyRealChallengeSurfaced:true,renderedOfflineAutoRecovery:true,cancelPreservesCookie:true,pendingCancelCleansWorkers:true,staleSessionCancelled:true,verifiedCookieSaved:true,pausedTaskNotStarted:true,rateLimitBeforeIdentity:true,loginPromptIsNotExpiredSession:true,loginRequiredIsNotCaptcha:true,accessFailureNoPopup:true,transientChallengeNoPopup:true};
+  await setCookie(await readCookie()); // Reset only the synthetic scenario's explicit dismissal.
+  verificationMode='text-challenge';
+  await verificationCall({action:'smoke-open-background',recId:verifyTask.recId,fixtureUrl:verificationUrl});
+  await eventually(async()=>{const status=await verificationStatus();return status.visible;},Boolean,'text-only access challenge surfaces only after stable observations',15000);
+  const textBlocked=(await(await fetch(base+'/api/recordings')).json()).find(task=>task.recId===verifyTask.recId);
+  assert.equal(textBlocked.verificationRequired,true);assert.equal(textBlocked.isRecording,false);
+  await verificationCall({action:'cancel'});
+  await eventually(verificationStatus,status=>!status.active&&status.activeWorkers===0,'text-only challenge cleanup');
+  const verificationValidation={persistentAccountProfile:true,textOnlyChallenge:true,singleWindow:true,remoteIpcDenied,challengeNotOffline:true,currentPageOnly:true,removedInitialScript:true,lateSameDocumentRecovery:true,hiddenChallengeIgnored:true,cookieScopeConsistent:true,publicRoomWithoutLogin:true,savedIdentityPreserved:true,offlineNoPopup:true,recoverablePageSurfaced:true,renderedOfflineAutoRecovery:true,cancelPreservesCookie:true,pendingCancelCleansWorkers:true,staleSessionCancelled:true,verifiedCookieSaved:true,pausedTaskNotStarted:true,rateLimitBeforeIdentity:true,loginPromptIsNotExpiredSession:true,loginRequiredIsNotCaptcha:true,accessFailureHasManualRecovery:true,transientChallengeNoPopup:true};
   const fixture=await fs.readFile(path.join(output,'native-preview.ts'));
   const mediaSource=createServer((_req,res)=>{res.writeHead(200,{'Content-Type':'video/mp2t','Content-Length':fixture.length});res.end(fixture);});
   await new Promise(resolve=>mediaSource.listen(0,'127.0.0.1',resolve));
@@ -231,9 +247,22 @@ try {
   await page.waitForFunction(()=>{const video=document.querySelector('video');return video?.readyState>=2&&Number(video.dataset.timelinePosition)>2;},null,{timeout:15000});
   assert.equal((await(await fetch(base+'/api/recordings')).json()).find(r=>r.recId===mediaTask.recId).isRecording,true,'seeking must not stop recording');
   await page.screenshot({path:path.join(output,'native-ts-live-preview.png'),fullPage:true,animations:'disabled'});
+  await page.locator('video').evaluate(v=>{window.nativeMiniVideo=v;window.nativeMiniTime=Number(v.dataset.timelinePosition);});
+  await previewModal.getByRole('button',{name:'最小化预览',exact:true}).click();
+  await page.getByRole('navigation',{name:'主导航'}).getByRole('link',{name:'偏好设置',exact:true}).click();
+  await page.getByRole('button',{name:'网络与检测',exact:true}).click();
+  await page.getByRole('textbox',{name:/检测间隔/}).focus();
+  assert.equal(await previewModal.evaluate(node=>node.matches(':modal')),false);
+  assert.equal(await page.locator('video').evaluate(v=>v===window.nativeMiniVideo),true);
+  await page.waitForFunction(()=>{const v=document.querySelector('video');return v===window.nativeMiniVideo&&!v.paused&&Number(v.dataset.timelinePosition)>window.nativeMiniTime+.1;});
+  await page.screenshot({path:path.join(output,'native-mini-preview-settings.png'),fullPage:true,animations:'disabled'});
+  await previewModal.getByRole('button',{name:'恢复预览',exact:true}).click();
+  assert.equal(await previewModal.evaluate(node=>node.matches(':modal')),true);
+  assert.equal(await page.locator('video').evaluate(v=>v===window.nativeMiniVideo),true);
   assert.equal(await previewModal.locator('.directory-note,.modal-actions').count(),0);
   await previewModal.getByRole('button',{name:'关闭对话框',exact:true}).click();
   await eventually(()=>page.evaluate(async()=> (await import('/media-player.js')).activePlayerCount()),count=>count===0,'disposed player');
+  await page.getByRole('navigation',{name:'主导航'}).getByRole('link',{name:'录制任务',exact:true}).click();
   await mediaCard.getByRole('button',{name:'停止录制',exact:true}).click();
   const completedJob=await eventually(async()=>{const response=await fetch(base+'/api/media/jobs');assert.equal(response.status,200);return (await response.json()).jobs.find(j=>j.taskId===mediaTask.recId&&j.state==='complete');},Boolean,'verified media job',25000);
   assert.equal(completedJob.deleteOriginal,deleteOriginal);assert.equal(completedJob.sourceRemoved,deleteOriginal);
@@ -249,7 +278,7 @@ try {
   const sourceExists=await fs.stat(path.join(outputRoot,completedJob.source)).then(()=>true,error=>{if(error.code==='ENOENT')return false;throw error;});
   assert.equal(sourceExists,!deleteOriginal);assert.ok((await fs.stat(path.join(outputRoot,completedJob.output))).size>0);
   await new Promise(resolve=>{mediaSource.closeAllConnections();mediaSource.close(resolve);});
-  const mediaValidation={tsLiveDecoded:true,liveSeekingForwardAndBackward:true,returnToLatest:true,mp4Decoded:true,originalTsKept:!deleteOriginal,originalTsRemoved:deleteOriginal,previewDisposed:true};
+  const mediaValidation={miniPreviewAcrossRoutes:true,tsLiveDecoded:true,liveSeekingForwardAndBackward:true,returnToLatest:true,mp4Decoded:true,originalTsKept:!deleteOriginal,originalTsRemoved:deleteOriginal,previewDisposed:true};
   const modal=page.getByRole('dialog',{name:'关闭 StreamCap',exact:true});
   const requestClose=async()=>{await page.getByRole('button',{name:'关闭窗口',exact:true}).click();await modal.waitFor({state:'visible'});};
   await requestClose();assert.equal((await native()).closePending,true);

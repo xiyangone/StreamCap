@@ -101,6 +101,7 @@ impl Resolver {
     pub async fn shutdown(&self) {
         self.stop.cancel();
         self.login.shutdown().await;
+        crate::network::prune_idle_clients();
     }
     pub async fn kuaishou_session_changed(&self) {
         self.kuaishou.reset_session().await;
@@ -109,8 +110,11 @@ impl Resolver {
         &self,
         saved: Option<&str>,
         interval: Duration,
+        manual: bool,
     ) -> Result<tokio::sync::OwnedSemaphorePermit, String> {
-        self.kuaishou.begin_page_check(saved, interval).await
+        self.kuaishou
+            .begin_page_check(saved, interval, manual)
+            .await
     }
     pub async fn kuaishou_page_problem(&self, error: &str) {
         self.kuaishou.page_problem(error).await;

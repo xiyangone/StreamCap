@@ -168,8 +168,8 @@ h3 { font-size: 14px; font-weight: 600; }
 .preference-summary small { display: block; color: var(--subtle); font-size: 9px; }
 .preference-summary strong { display: block; margin-top: 3px; font-size: 11px; font-weight: 500; }
 .count-pill { font-size: 10px; border: 1px solid var(--border); border-radius: 6px; color: var(--subtle); padding: 2px 7px; font-weight: 500; }
-.cards-grid, .skeleton-grid { display: grid; grid-template-columns: repeat(auto-fill,minmax(min(100%,300px),1fr)); gap: 15px; }
-.recording-card { padding: 18px; min-width: 0; transition: border-color 160ms,box-shadow 160ms; }
+.cards-grid, .skeleton-grid { display: grid; grid-template-columns: repeat(auto-fill,minmax(min(100%,300px),1fr)); gap: 15px; align-items: start; }
+.recording-card { padding: 16px; min-width: 0; transition: border-color 160ms,box-shadow 160ms; }
 .recording-card:hover { border-color: rgba(var(--accent-rgb),.27); box-shadow: var(--shadow-hover); }
 .recording-card.selected { border-color: var(--accent); box-shadow: 0 0 0 1px rgba(var(--accent-rgb),.22); }
 .card-head, .card-head-right, .card-platform { display: flex; align-items: center; }
@@ -188,19 +188,20 @@ h3 { font-size: 14px; font-weight: 600; }
 .badge.monitoring { color: var(--accent); background: var(--accent-soft); }
 .badge.stopped { color: var(--subtle); background: var(--surface-hover); }
 .badge.attention { color: var(--danger); background: var(--danger-soft); }
-.card-main { margin-top: 17px; min-width: 0; }
+.card-main { margin-top: 12px; min-width: 0; }
 .card-name { display: block; text-align: left; font-size: 15px; font-weight: 600; padding: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .card-name:hover { color: var(--accent); }
 .card-subtitle { color: var(--subtle); font-size: 10px; margin-top: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .card-recording-error { display: flex; align-items: flex-start; gap: 6px; color: var(--danger); font-size: 11px; line-height: 1.6; margin-top: 7px; }
 .card-recording-error > .icon { flex: 0 0 auto; margin-top: 2px; }
 .card-recording-error > span { min-width: 0; overflow-wrap: anywhere; }
-.card-meta { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 15px 0; min-width: 0; }
+.card-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; margin-top: 10px; min-width: 0; }
+.card-meta { display: flex; flex: 1 1 auto; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin: 0; min-width: 0; }
 .card-tags { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; }
-.card-tags span { padding: 2px 6px; border: 1px solid var(--line); background: var(--field); border-radius: 4px; color: var(--muted); font-size: 9px; }
-.card-speed { display: flex; gap: 4px; align-items: center; font-size: 9px; color: var(--success); white-space: nowrap; font-variant-numeric: tabular-nums; }
-.card-actions { display: flex; flex-direction: column; align-items: stretch; gap: 10px; padding-top: 12px; border-top: 1px solid var(--line); }
-.card-primary-actions { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.card-tags span { padding: 2px 6px; border: 1px solid var(--line); background: var(--field); border-radius: 4px; color: var(--muted); font-size: 10px; }
+.card-speed { display: flex; gap: 4px; align-items: center; margin-left: auto; font-size: 10px; color: var(--success); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.card-actions { display: flex; flex-direction: row; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
+.card-primary-actions { display: flex; flex: 1 1 220px; align-items: center; gap: 8px; min-width: 0; }
 .card-primary-actions > .button { flex: 1 0 auto; min-height: 34px; font-size: 11px; white-space: nowrap; }
 .card-primary-actions > .card-monitor { padding: 6px 10px; }
 .button.card-record { background: var(--accent-soft); color: var(--accent); min-height: 32px; padding: 6px 9px; font-size: 10px; border-radius: 8px; }
@@ -241,7 +242,7 @@ textarea.input { resize: vertical; line-height: 1.65; }
 .list-view .card-head { align-items: flex-start; flex-direction: column; gap: 7px; }
 .list-view .card-main, .list-view .card-meta { margin: 0; }
 .list-view .card-meta { flex-wrap: wrap; gap: 8px; }
-.list-view .card-actions { border: 0; padding: 0; gap: 7px; }
+.list-view .card-actions { border: 0; margin: 0; padding: 0; gap: 7px; }
 .list-view .card-name { font-size: 12px; }
 .list-view .card-tools { flex-wrap: wrap; max-width: 90px; }
 .empty-panel { padding: 30px 20px; text-align: center; }
@@ -665,12 +666,14 @@ textarea.input { resize: vertical; line-height: 1.65; }
 @media (max-width: 520px) { .native-desktop .topbar { gap: 3px; min-height: 44px; padding: 0 0 0 12px; } .native-desktop .topbar-actions { gap: 4px; } .native-desktop .window-button { width: 34px; } .native-desktop .sync-status { font-size: 9px; } .close-option { gap: 10px; padding: 14px; } .capture-panel { min-height: 175px; padding: 20px; } }
 
 @media (min-width: 761px) {
-  .list-view .recording-card { grid-template-columns: 124px minmax(120px,1fr) auto; grid-template-areas: "head main actions" "head monitor actions" "head meta actions"; column-gap: 16px; row-gap: 5px; min-height: 88px; padding: 14px 17px; }
+  .list-view .recording-card { grid-template-columns: 124px minmax(120px,1fr) auto; grid-template-areas: "head main actions" "head summary actions" "head schedule actions"; column-gap: 16px; row-gap: 5px; min-height: 88px; padding: 12px 16px; }
   .list-view .card-head { grid-area: head; }
   .list-view .card-main { grid-area: main; }
-  .list-view .card-monitor-row { grid-area: monitor; margin: 0; }
-  .list-view .card-meta { grid-area: meta; display: flex; justify-content: flex-start; gap: 14px; padding: 0; margin: 0; }
-  .list-view .card-actions { grid-area: actions; gap: 10px; }
+  .list-view .card-summary { grid-area: summary; margin: 0; }
+  .list-view .card-schedule { grid-area: schedule; margin: 2px 0; }
+  .list-view .card-meta { display: flex; justify-content: flex-start; gap: 10px; padding: 0; margin: 0; }
+  .list-view .card-actions { grid-area: actions; flex-direction: column; flex-wrap: nowrap; gap: 8px; }
+  .list-view .card-primary-actions { flex: 0 0 auto; width: 100%; }
   .list-view .card-tools { max-width: none; flex-wrap: nowrap; gap: 5px; }
 }
 
@@ -708,14 +711,26 @@ textarea.input { resize: vertical; line-height: 1.65; }
 .recording-plan .health-row > strong { text-align: right; overflow-wrap: anywhere; }
 .stat-icon.attention { color: var(--danger); background: var(--danger-soft); }
 .recording-card.needs-attention { border-color: color-mix(in srgb, var(--danger) 35%, var(--border)); }
-.card-monitor-row { display: flex; align-items: center; gap: 8px; margin-top: 12px; min-width: 0; }
-.card-monitor-row > span { display: inline-flex; align-items: center; gap: 5px; font-size: 10px; color: var(--muted); }
+.card-monitor-row { display: flex; align-items: center; gap: 8px; margin: 0; min-width: 0; }
+.card-monitor-row > span { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; color: var(--muted); }
 .card-monitor-row > span.monitor-on { color: var(--success); }
+.card-schedule { display: flex; flex-wrap: wrap; gap: 3px 12px; min-width: 0; margin-top: 8px; padding: 6px 8px; border-radius: 7px; background: var(--field); border: 1px solid var(--line); font-size: 11px; line-height: 1.5; }
+.card-queue-label { color: var(--muted); overflow-wrap: anywhere; }
+.card-queue-time { color: var(--text); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.card-queue-time:empty { display: none; }
+.card-schedule[data-wait-reason="cooldown"], .card-schedule[data-wait-reason="verification"] { background: var(--warning-soft); }
+.queue-overview { display: flex; flex-wrap: wrap; gap: 12px 24px; align-items: center; padding: 14px 18px; margin: 18px 0; font-size: 12px; }
+.queue-overview > strong { display: inline-flex; align-items: center; gap: 7px; }
+.queue-overview > span { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); }
+.queue-overview b { color: var(--text); font-variant-numeric: tabular-nums; }
+.queue-overview > a { margin-left: auto; }
+.interval-summary { padding: 8px 12px; border-radius: 8px; background: var(--accent-soft); color: var(--accent); font-size: 13px; font-variant-numeric: tabular-nums; }
+.setting-note { margin: 8px 0 12px; color: var(--muted); font-size: 12px; line-height: 1.7; }
 .card-check-error { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; color: var(--danger); margin-top: 7px; font-size: 11px; line-height: 1.6; }
 .card-check-error > span { display: flex; align-items: flex-start; gap: 5px; min-width: 0; overflow-wrap: anywhere; }
 .card-check-error > span > .icon { flex: 0 0 auto; margin-top: 2px; }
 .card-check-error .card-verify { min-height: 30px; white-space: nowrap; font-size: 11px; padding: 4px 8px; }
-@media (min-width: 1101px) { .list-view .card-actions { flex-direction: row; align-items: center; gap: 12px; } }
+@media (min-width: 1101px) { .list-view .card-actions { flex-direction: row; align-items: center; gap: 12px; } .list-view .card-primary-actions { width: auto; } }
 @media (min-width: 761px) and (max-width: 1100px) { .list-view .recording-card { grid-template-columns: 100px minmax(100px,1fr) auto; column-gap: 12px; } }
 .card-duration { color: var(--text); font-variant-numeric: tabular-nums; margin-right: 5px; }
 .button.card-record:not(.recording) { background: var(--field); border-color: var(--border); color: var(--muted); }
@@ -723,7 +738,7 @@ textarea.input { resize: vertical; line-height: 1.65; }
 .file-table .file-actions { width: 158px; min-width: 158px; }
 .convert-action { margin-right: 8px; min-width: 88px; gap: 5px; }
 @media (max-width: 900px) { .workbench-overview { grid-template-columns: 1fr; } }
-@media (max-width: 760px) { .list-view .card-monitor-row { grid-column: 1 / -1; } }
+@media (max-width: 760px) { .list-view .card-summary, .list-view .card-schedule { grid-column: 1 / -1; } .queue-overview { gap: 10px 16px; } }
 @media (max-width: 520px) { .card-monitor-row > span { font-size: 11px; } .card-primary-actions > .button, .card-tools .icon-button { min-height: 40px; } .file-table .file-actions { width: 142px; min-width: 142px; } .convert-action { min-width: 78px; padding-inline: 7px; } }
 
 /* Compact, keyboard-accessible task actions. */
@@ -796,3 +811,39 @@ textarea.input { resize: vertical; line-height: 1.65; }
 @media(max-width:620px) { .seek-controls { padding-inline: 9px; } .seek-transport { gap: 2px; flex-wrap: wrap; } .seek-volume { display: none; } .seek-time { font-size: 10px; padding-inline: 3px; } .seek-button { width: 32px; min-width: 32px; } .seek-rate { width: 49px; } .preview-heading { gap: 9px; } }
 @media(max-width:520px) { .card-tools .icon-button { width: 40px; min-width: 40px; height: 40px; min-height: 40px; } .seek-button { height: 40px; } .preview-current-file { display: none; } .seek-latest { font-size: 9px; } }
 @media(prefers-reduced-motion:reduce) { .seek-button, .card-tool::after, .player-control-tip::after { transition: none; } }
+
+/* Directory scans never hide navigation; progress reflects a single measured stage. */
+.media-job-detail { display: block; color: var(--muted); font-size: 11px; line-height: 1.6; font-variant-numeric: tabular-nums; }
+.media-job-row { display: grid; grid-template-columns: minmax(0,1fr) minmax(120px,1fr); gap: 5px 14px; padding: 12px 0; }
+.media-job-source { overflow-wrap: anywhere; }
+.media-job-row progress { width: 100%; height: 6px; accent-color: var(--accent); }
+.media-jobs { max-height: 520px; overflow: auto; }
+@media(max-width:760px) { .media-job-row { grid-template-columns: minmax(0,1fr); } }
+
+/* One non-modal preview survives route changes without remounting its decoder. */
+.modal-header-actions { display: flex; align-items: center; gap: 4px; }
+.modal.preview-shell.modal-minimized { position: fixed; inset: auto 20px 82px auto; margin: 0; width: min(360px,calc(100vw - 32px)); max-height: calc(100dvh - 152px); z-index: 40; border: 1px solid var(--line); border-radius: 14px; box-shadow: 0 12px 42px #101b3433; }
+.modal-minimized[open] { animation: none; }
+.modal-minimized .modal-header { padding: 6px 8px 6px 14px; }
+.modal-minimized .modal-header h2 { font-size: 13px; }
+.modal-minimized .modal-header .eyebrow { display: none; }
+.modal-minimized .modal-header .icon-button { width: 36px; height: 36px; }
+.modal-minimized .modal-body { padding: 0; }
+.modal-minimized .preview-heading { margin: 0; padding: 8px 12px; }
+.modal-minimized .preview-context { min-width: 0; }
+.modal-minimized .preview-context > div { min-width: 0; }
+.modal-minimized .preview-title, .modal-minimized .preview-media-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+.modal-minimized .preview-media-title { padding: 8px 12px; margin: 0; }
+.modal-minimized .preview-heading > button, .modal-minimized .preview-eyebrow, .modal-minimized .preview-files-heading, .modal-minimized .preview-file-list, .modal-minimized .media-job-status { display: none; }
+.modal-minimized .media-preview:not(:fullscreen) { margin: 0; border: 0; border-radius: 0; }
+.modal-minimized .media-preview:not(:fullscreen) .video-player { height: 190px; min-height: 0; max-height: 28dvh; aspect-ratio: auto; object-fit: contain; }
+.modal-minimized .media-preview:not(:fullscreen) .seek-controls { padding: 0 8px 7px; }
+.modal-minimized .media-preview:not(:fullscreen) .seek-transport { gap: 2px; flex-wrap: wrap; }
+.modal-minimized .media-preview:not(:fullscreen) .seek-time { font-size: 10px; padding: 0 2px; }
+.modal-minimized .media-preview:not(:fullscreen) .seek-volume,
+.modal-minimized .media-preview:not(:fullscreen) .seek-rate,
+.modal-minimized .media-preview:not(:fullscreen) .seek-transport > .player-control-tip:nth-child(2),
+.modal-minimized .media-preview:not(:fullscreen) .seek-transport > .player-control-tip:nth-child(3) { display: none; }
+.modal-minimized .media-preview:not(:fullscreen) .seek-button { width: 32px; min-width: 32px; height: 34px; }
+.modal-minimized .audio-art { min-height: 90px; padding: 16px; }
+@media(max-width:620px) { .modal.preview-shell.modal-minimized { right: 12px; bottom: 88px; } }

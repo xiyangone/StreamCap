@@ -174,6 +174,104 @@ fn recordings(root: &Path) -> Vec<PathBuf> {
 }
 
 #[tokio::test]
+#[ignore = "requires STREAMCAP_TEST_FFMPEG; synthetic incompatible MP4 codecs only"]
+async fn incompatible_mp4_codecs_use_decodable_compatibility_preview() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path(), false).await;
+    for (name, codec, pixels, native) in [
+        ("avc", "libx264", "yuv420p", true),
+        ("legacy", "mpeg4", "yuv420p", false),
+        ("hevc10", "libx265", "yuv420p10le", false),
+    ] {
+        let relative = format!("{name}.mp4");
+        let path = dir.path().join("downloads").join(&relative);
+        let mut encode = command(&ffmpeg());
+        encode.args([
+            "-v",
+            "error",
+            "-nostdin",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x120:rate=10",
+            "-t",
+            "2",
+            "-an",
+            "-c:v",
+            codec,
+            "-pix_fmt",
+            pixels,
+        ]);
+        if codec == "libx265" {
+            encode.args(["-x265-params", "log-level=error:pools=1"]);
+        }
+        assert!(encode.arg(&path).output().await.unwrap().status.success());
+        let before = std::fs::read(&path).unwrap();
+        let info = state
+            .preview
+            .info(
+                &state.storage,
+                dir.path().join("downloads"),
+                relative.clone(),
+                Some(ffmpeg()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(info.native_compatible, Some(native));
+        assert!(info.compatibility_available);
+        assert!(info.duration_seconds.unwrap() > 1.0);
+        if !native {
+            let response = state
+                .preview
+                .transcode(
+                    &state.storage,
+                    dir.path().join("downloads"),
+                    relative,
+                    ffmpeg(),
+                    0.4,
+                )
+                .await
+                .unwrap();
+            let bytes = axum::body::to_bytes(response.into_body(), 8 * 1024 * 1024)
+                .await
+                .unwrap();
+            assert!(bytes.len() > 1880);
+            assert_eq!(bytes[0], 0x47);
+        }
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+    api::shutdown(&state).await.unwrap();
+}
+#[tokio::test]
+#[ignore = "requires STREAMCAP_TEST_FFMPEG; synthetic queue progress only"]
+async fn media_progress_has_real_stage_values_and_finishes_at_one_hundred() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path(), false).await;
+    let source = dir.path().join("downloads/progress.ts");
+    std::fs::write(&source, sample_ts("4").await).unwrap();
+    let job = state
+        .scheduler
+        .postprocess
+        .enqueue_manual(dir.path().join("downloads"), "progress.ts", false)
+        .await
+        .unwrap();
+    assert_eq!(job.stage_percent, None);
+    wait_jobs(&state).await;
+    let done = state
+        .scheduler
+        .postprocess
+        .jobs()
+        .into_iter()
+        .find(|j| j.id == job.id)
+        .unwrap();
+    assert_eq!(done.state, MediaJobState::Complete);
+    assert_eq!(done.stage_percent, Some(100));
+    assert!(done.started_at.is_some() && done.finished_at.is_some());
+    assert!(source.exists());
+    api::shutdown(&state).await.unwrap();
+}
+
+#[tokio::test]
 #[ignore = "requires STREAMCAP_TEST_FFMPEG and rustc; real local recording with a gated slow subtitle probe"]
 async fn media_slow_finish_publishes_stop_releases_global_locks_and_is_awaited_at_shutdown() {
     let tools = tempfile::tempdir().unwrap();
@@ -1396,7 +1494,8 @@ async fn media_browser_copy_preview_has_correct_frames_and_bounded_seek_latency(
         .output()
         .await
         .unwrap();
-    println!("{}", String::from_utf8_lossy(&result.stdout));
+    let browser_output = String::from_utf8_lossy(&result.stdout);
+    println!("{browser_output}");
     server.shutdown().await.unwrap();
     assert!(
         result.status.success(),

@@ -67,6 +67,16 @@ pub struct Recording {
     pub last_success_at: Option<i64>,
     #[serde(default)]
     pub next_check_at: Option<i64>,
+    #[serde(default)]
+    pub queue_position: Option<usize>,
+    #[serde(default)]
+    pub check_wait_reason: String,
+    #[serde(default)]
+    pub check_ready_at: Option<i64>,
+    #[serde(default)]
+    pub recovery_at: Option<i64>,
+    #[serde(default)]
+    pub recovery_attempt: u32,
     pub live_title: Option<String>,
     pub speed: Option<String>,
     pub recording_dir: Option<String>,
@@ -78,7 +88,9 @@ impl Recording {
     pub fn task_phase(&self) -> TaskPhase {
         if self.is_recording {
             TaskPhase::Recording
-        } else if self.needs_attention() || self.check_state == "rechecking" {
+        } else if self.needs_attention()
+            || matches!(self.check_state.as_str(), "rechecking" | "recovering")
+        {
             TaskPhase::Attention
         } else if self.is_live {
             TaskPhase::LiveIdle
@@ -115,6 +127,13 @@ impl Recording {
             StatusKind::Recording
         } else if self.check_state == "rechecking" {
             StatusKind::Rechecking
+        } else if self.check_wait_reason == "cooldown" && self.monitor_status {
+            StatusKind::Cooldown
+        } else if self.check_state == "recovering"
+            && self.monitor_status
+            && !self.verification_required
+        {
+            StatusKind::Recovering
         } else if self
             .recording_error
             .as_ref()
@@ -173,6 +192,7 @@ pub enum StatusKind {
     Queued,
     Checking,
     Rechecking,
+    Recovering,
     RecordingFailed,
     Verification,
     CheckFailed,
@@ -192,6 +212,7 @@ impl StatusKind {
             Self::Queued => crate::app::i18n::t("排队中"),
             Self::Checking => crate::app::i18n::t("检测中"),
             Self::Rechecking => crate::app::i18n::t("录制结束，复核中"),
+            Self::Recovering => crate::app::i18n::t("等待恢复录制"),
             Self::RecordingFailed => crate::app::i18n::t("录制异常"),
             Self::Verification => crate::app::i18n::t("待验证"),
             Self::CheckFailed => crate::app::i18n::t("检测异常"),
@@ -216,6 +237,7 @@ impl StatusKind {
             | Self::Queued
             | Self::Checking
             | Self::Rechecking
+            | Self::Recovering
             | Self::PageCheck => "badge monitoring",
             Self::Stopped => "badge stopped",
         }
@@ -316,8 +338,15 @@ pub struct StorageItem {
     pub name: String,
     pub is_dir: bool,
     pub size: u64,
+    #[serde(default = "known_size")]
+    pub size_known: bool,
+    #[serde(default)]
+    pub size_error: Option<String>,
     pub path: String,
     pub modified: Option<f64>,
+}
+fn known_size() -> bool {
+    true
 }
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -325,6 +354,8 @@ pub struct StorageListing {
     pub root: String,
     pub items: Vec<StorageItem>,
     pub total_size: u64,
+    #[serde(default = "known_size")]
+    pub total_size_known: bool,
 }
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -653,6 +684,7 @@ pub struct AppState {
     pub system_dark: RwSignal<bool>,
     pub accent: RwSignal<String>,
     pub grid_view: RwSignal<bool>,
+    pub now: RwSignal<i64>,
 }
 impl AppState {
     pub fn recording(self, id: &str) -> Option<Recording> {
@@ -1057,7 +1089,15 @@ pub fn provide_app_state() -> AppState {
             appearance["accent"].as_str().unwrap_or("blue"),
         )),
         grid_view: RwSignal::new(true),
+        now: RwSignal::new((js_sys::Date::now() / 1000.0) as i64),
     };
+    let clock = StoredValue::new_local(Some(gloo_timers::callback::Interval::new(
+        1000,
+        move || {
+            let _ = state.now.try_set((js_sys::Date::now() / 1000.0) as i64);
+        },
+    )));
+    on_cleanup(move || clock.update_value(|timer| *timer = None));
     provide_context(state);
     state
 }
@@ -1095,13 +1135,24 @@ async fn call<T: DeserializeOwned>(
     path: &str,
     body: Option<Value>,
 ) -> Result<T, String> {
+    call_controlled(method, path, body, None).await
+}
+async fn call_controlled<T: DeserializeOwned>(
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+    controller: Option<web_sys::AbortController>,
+) -> Result<T, String> {
     let base = gateway_base();
     if base.is_empty() {
         return Err(crate::app::i18n::t("原生运行配置未就绪，请从桌面程序启动").into());
     }
     let url = format!("{base}{path}");
-    let abort = web_sys::AbortController::new()
-        .map_err(|_| crate::app::i18n::t("无法创建请求").to_string())?;
+    let abort = match controller {
+        Some(controller) => controller,
+        None => web_sys::AbortController::new()
+            .map_err(|_| crate::app::i18n::t("无法创建请求").to_string())?,
+    };
     let builder = match method {
         "POST" => Request::post(&url),
         "PUT" => Request::put(&url),
@@ -1116,6 +1167,8 @@ async fn call<T: DeserializeOwned>(
     .map_err(|_| crate::app::i18n::t("无法构造请求").to_string())?;
     let timeout_ms = if path == "/api/tools/install" {
         600_000
+    } else if path.starts_with("/api/storage/size?") {
+        120_000
     } else if method == "GET" {
         12_000
     } else {
@@ -1380,12 +1433,30 @@ pub async fn save_cookies(patch: Value) -> Result<(), String> {
         .await
         .map(|_| ())
 }
-pub async fn fetch_storage(subfolder: Option<String>) -> Result<StorageListing, String> {
+pub async fn fetch_storage(
+    subfolder: Option<String>,
+    abort: web_sys::AbortController,
+) -> Result<StorageListing, String> {
     let query = subfolder
         .filter(|s| !s.is_empty())
         .map(|s| format!("?subfolder={}", encode(&s)))
         .unwrap_or_default();
-    call("GET", &format!("/api/storage{query}"), None).await
+    call_controlled("GET", &format!("/api/storage{query}"), None, Some(abort)).await
+}
+pub async fn fetch_storage_size(
+    path: &str,
+    abort: web_sys::AbortController,
+) -> Result<u64, String> {
+    let value: Value = call_controlled(
+        "GET",
+        &format!("/api/storage/size?path={}", encode(path)),
+        None,
+        Some(abort),
+    )
+    .await?;
+    value["size"]
+        .as_u64()
+        .ok_or_else(|| crate::app::i18n::t("体积信息无效").into())
 }
 pub async fn delete_storage(path: &str) -> Result<(), String> {
     call::<Value>(
@@ -1477,6 +1548,18 @@ pub fn save_appearance(state: AppState) {
 #[serde(rename_all = "camelCase")]
 pub struct MediaJob {
     pub id: String,
+    #[serde(default)]
+    pub stage_percent: Option<u8>,
+    #[serde(default)]
+    pub stage_eta_seconds: Option<u64>,
+    #[serde(default)]
+    pub started_at: Option<i64>,
+    #[serde(default)]
+    pub finished_at: Option<i64>,
+    #[serde(default)]
+    pub elapsed_seconds: u64,
+    #[serde(default)]
+    pub queue_position: Option<usize>,
     pub task_id: Option<String>,
     pub source: String,
     pub output: String,
@@ -1512,6 +1595,7 @@ pub struct EventConnection {
     _open: Closure<dyn FnMut(web_sys::Event)>,
     _error: Closure<dyn FnMut(web_sys::Event)>,
     retry_timer: Rc<RefCell<Option<gloo_timers::callback::Timeout>>>,
+    _watchdog: gloo_timers::callback::Interval,
 }
 impl Drop for EventConnection {
     fn drop(&mut self) {
@@ -1533,8 +1617,11 @@ pub fn subscribe_events(state: AppState) -> Option<EventConnection> {
     }
     let source = web_sys::EventSource::new(&format!("{base}/api/events")).ok()?;
     let retry_timer = Rc::new(RefCell::new(None::<gloo_timers::callback::Timeout>));
+    let last_event = Rc::new(std::cell::Cell::new(js_sys::Date::now()));
+    let opened_at = last_event.clone();
     let connected_timer = retry_timer.clone();
     let on_open = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
+        opened_at.set(js_sys::Date::now());
         connected_timer.borrow_mut().take();
         state.events_connected.set(true);
         leptos::task::spawn_local(async move {
@@ -1557,12 +1644,32 @@ pub fn subscribe_events(state: AppState) -> Option<EventConnection> {
     });
     source.set_onopen(Some(on_open.as_ref().unchecked_ref()));
     source.set_onerror(Some(on_error.as_ref().unchecked_ref()));
+    let watched_source = source.clone();
+    let watched_event = last_event.clone();
+    let watchdog = gloo_timers::callback::Interval::new(5000, move || {
+        if js_sys::Date::now() - watched_event.get() > 20000.0 {
+            watched_event.set(js_sys::Date::now());
+            watched_source.close();
+            let _ = state.events_connected.try_set(false);
+            let _ = state
+                .events_revision
+                .try_update(|value| *value = value.wrapping_add(1));
+        }
+    });
     let mut messages = Vec::new();
     for event_name in [
-        "update", "delete", "settings", "mediaJob", "resync", "snack",
+        "update",
+        "delete",
+        "settings",
+        "mediaJob",
+        "resync",
+        "snack",
+        "heartbeat",
     ] {
+        let observed_at = last_event.clone();
         let handler = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(
             move |event: web_sys::MessageEvent| {
+                observed_at.set(js_sys::Date::now());
                 let Some(text) = event.data().as_string() else {
                     return;
                 };
@@ -1648,6 +1755,7 @@ pub fn subscribe_events(state: AppState) -> Option<EventConnection> {
         _open: on_open,
         _error: on_error,
         retry_timer,
+        _watchdog: watchdog,
     })
 }
 

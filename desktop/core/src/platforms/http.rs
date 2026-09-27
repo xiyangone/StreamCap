@@ -16,6 +16,19 @@ impl PlatformHttp {
         cookie: Option<&str>,
         timeout: Duration,
     ) -> Result<Self, String> {
+        let pooled = crate::network::platform_client(domain, proxy, cookie, timeout, true)?;
+        Ok(Self {
+            client: pooled.client,
+            jar: pooled.jar,
+        })
+    }
+    /// Login sessions must not share cookies with the long-lived room client pool.
+    pub fn fresh(
+        domain: &'static str,
+        proxy: Option<&str>,
+        cookie: Option<&str>,
+        timeout: Duration,
+    ) -> Result<Self, String> {
         Self::build(domain, proxy, cookie, timeout, false)
     }
     pub fn for_loopback() -> Result<Self, String> {
@@ -129,7 +142,7 @@ pub fn validate_stream_url(value: &str) -> Result<Url, String> {
     Ok(url)
 }
 
-fn trusted_redirect(url: &Url, domain: &str, loopback: bool) -> bool {
+pub(crate) fn trusted_redirect(url: &Url, domain: &str, loopback: bool) -> bool {
     if !url.username().is_empty() || url.password().is_some() {
         return false;
     }

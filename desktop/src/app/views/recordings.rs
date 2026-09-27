@@ -3,8 +3,8 @@ use crate::{
     api::gateway::{self, Recording, TaskPhase},
     app::{
         components::{
-            AddRecordingDialog, BatchEditDialog, CardInfoDialog, ConfirmDialog,
-            EditRecordingDialog, EmptyState, Icon, PreviewDialog, RecordingCard,
+            preview_state, AddRecordingDialog, BatchEditDialog, CardInfoDialog, ConfirmDialog,
+            EditRecordingDialog, EmptyState, Icon, RecordingCard,
         },
         labels::platform_label,
     },
@@ -83,7 +83,7 @@ pub fn RecordingsView() -> impl IntoView {
     let add = RwSignal::new(false);
     let editing = RwSignal::new(None::<Recording>);
     let info = RwSignal::new(None::<Recording>);
-    let preview = RwSignal::new(None::<Recording>);
+    let preview = preview_state();
     let batch_open = RwSignal::new(false);
     let batch_ids = RwSignal::new(Vec::<String>::new());
     let delete_open = RwSignal::new(false);
@@ -271,10 +271,10 @@ pub fn RecordingsView() -> impl IntoView {
             <Show when=move || state.loading.get()><div class="skeleton-grid" aria-label=t("加载任务")><div class="skeleton" /><div class="skeleton" /><div class="skeleton" /></div></Show>
             <Show when=move || !state.loading.get() && visible.get().is_empty()><div class="glass empty-panel"><EmptyState icon="search" title=t("没有匹配的直播间") description=t("尝试调整搜索条件，或添加新的直播间。") /><button class="button secondary" on:click=move |_| { keyword.set(String::new()); platform.set(String::new()); filter.set(Filter::All); }>{t("清除筛选")}</button></div></Show>
             <div class="cards-grid" class:list-view=move || !state.grid_view.get()>
-                <For each=move || visible.get() key=|id| id.clone() children=move |id| state.recording_untracked(&id).map(|rec| view! { <RecordingCard recording=rec selectable=true selected=selected on_edit=Callback::new(move |r| editing.set(Some(r))) on_info=Callback::new(move |r| info.set(Some(r))) on_preview=Callback::new(move |r| preview.set(Some(r))) /> }) />
+                <For each=move || visible.get() key=|id| id.clone() children=move |id| state.recording_untracked(&id).map(|rec| view! { <RecordingCard recording=rec selectable=true selected=selected on_edit=Callback::new(move |r| editing.set(Some(r))) on_info=Callback::new(move |r| info.set(Some(r))) on_preview=Callback::new(move |r| preview.open_recording(r)) /> }) />
             </div>
         </div>
-        <AddRecordingDialog open=add /><EditRecordingDialog target=editing /><BatchEditDialog open=batch_open ids=batch_ids /><CardInfoDialog target=info /><PreviewDialog target=preview />
+        <AddRecordingDialog open=add /><EditRecordingDialog target=editing /><BatchEditDialog open=batch_open ids=batch_ids /><CardInfoDialog target=info />
         <ConfirmDialog open=delete_open title=t("移除所选直播间") description=Signal::derive(move || crate::tr_format!("将移除选中的 {} 个直播间。其他任务及已有录制文件保持不变。", delete_ids.get().len())) busy=busy on_confirm=delete />
     }
 }

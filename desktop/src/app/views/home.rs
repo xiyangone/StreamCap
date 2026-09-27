@@ -3,8 +3,8 @@ use crate::{
     api::gateway::{self, Recording, TaskPhase},
     app::{
         components::{
-            AddRecordingDialog, CardInfoDialog, EditRecordingDialog, EmptyState, Icon,
-            PreviewDialog, RecordingCard,
+            preview_state, AddRecordingDialog, CardInfoDialog, EditRecordingDialog, EmptyState,
+            Icon, RecordingCard,
         },
         labels::{format_label, quality_label},
     },
@@ -17,7 +17,7 @@ pub fn HomeView() -> impl IntoView {
     let add = RwSignal::new(false);
     let editing = RwSignal::new(None::<Recording>);
     let info = RwSignal::new(None::<Recording>);
-    let preview = RwSignal::new(None::<Recording>);
+    let preview = preview_state();
     let active = move || {
         state.recording_list.with(|items| {
             items
@@ -50,6 +50,25 @@ pub fn HomeView() -> impl IntoView {
                 .count()
         })
     };
+    let queue_counts = Memo::new(move |_| {
+        state.recordings.with(|records| {
+            records
+                .iter()
+                .filter(|r| r.monitor_status && !r.is_recording)
+                .fold([0usize; 4], |mut counts, r| {
+                    if matches!(r.check_state.as_str(), "checking" | "rechecking") {
+                        counts[0] += 1;
+                    } else if r.check_wait_reason == "cooldown" {
+                        counts[3] += 1;
+                    } else if r.check_state == "recovering" {
+                        counts[2] += 1;
+                    } else if r.check_state == "queued" {
+                        counts[1] += 1;
+                    }
+                    counts
+                })
+        })
+    });
     let recent = Memo::new(move |_| {
         state.recording_list.with(|list| {
             let mut items: Vec<_> = list.iter().collect();
@@ -100,21 +119,27 @@ pub fn HomeView() -> impl IntoView {
                 </section>
                 <section class="health-panel glass recording-plan"><div class="section-heading compact"><h2>{t("当前录制方案")}</h2><a class="text-link" href="/settings">{t("调整设置")}<Icon name="chevron" size=14 /></a></div>
                     <div class="health-row"><span>{t("画质与格式")}</span><strong>{move || format!("{} · {}", quality_label(Some(&state.setting("record_quality", "OD"))), format_label(Some(&state.setting("video_format", "TS"))))}</strong></div>
-                    <div class="health-row"><span>{t("检测间隔")}</span><strong>{move || crate::tr_format!("每 {} 秒",state.setting("loop_time_seconds","300"))}</strong></div>
+                    <div class="health-row"><span>{t("检测间隔")}</span><strong>{move || crate::app::labels::interval_label(&state.setting("loop_time_seconds","300"))}</strong></div>
                     <div class="health-row"><span>{t("录制后处理")}</span><strong>{postprocess}</strong></div>
                 </section>
             </div>
+            <section class="queue-overview glass" aria-label=t("检测队列")>
+                <strong><Icon name="refresh" size=16 />{t("检测队列")}</strong>
+                <span>{t("检测中")}<b>{move || queue_counts.get()[0]}</b></span><span>{t("排队中")}<b>{move || queue_counts.get()[1]}</b></span>
+                <span>{t("断流恢复")}<b>{move || queue_counts.get()[2]}</b></span><span>{t("平台冷却中")}<b>{move || queue_counts.get()[3]}</b></span>
+                <a class="text-link" href="/recordings">{t("查看全部")}<Icon name="chevron" size=14 /></a>
+            </section>
             <section class="recent-section"><div class="section-heading"><div><h2>{t("优先关注")}<span class="count-pill">{move || state.recording_list.with(Vec::len)}</span></h2><p>{t("失败与正在录制的任务优先显示")}</p></div><a class="text-link" href="/recordings">{t("查看全部")}<Icon name="arrow" size=15 /></a></div>
                 <Show when=move || state.loading.get()><div class="skeleton-grid" aria-label=t("正在加载任务")><div class="skeleton" /><div class="skeleton" /><div class="skeleton" /></div></Show>
                 <Show when=move || !state.loading.get() && state.recording_list.with(Vec::is_empty)><div class="glass empty-panel"><EmptyState icon="video" title=t("你的直播间，从这里开始") description=t("添加第一个直播间，开启属于你的录制工作空间。") /><button class="button primary" on:click=move |_| add.set(true)><Icon name="plus" size=17 />{t("添加第一个直播间")}</button></div></Show>
                 <div class="cards-grid">
                     <For each=move || recent.get() key=|id| id.clone() children=move |id| state.recording_untracked(&id).map(|rec| view! {
-                        <RecordingCard recording=rec on_edit=Callback::new(move |r| editing.set(Some(r))) on_info=Callback::new(move |r| info.set(Some(r))) on_preview=Callback::new(move |r| preview.set(Some(r))) />
+                        <RecordingCard recording=rec on_edit=Callback::new(move |r| editing.set(Some(r))) on_info=Callback::new(move |r| info.set(Some(r))) on_preview=Callback::new(move |r| preview.open_recording(r)) />
                     }) />
                 </div>
             </section>
             <footer class="page-footer"><span><Icon name="shield" size=14 />{t("录制文件保存在本地")}</span><span>{t("专注此刻，留存精彩")}</span></footer>
         </div>
-        <AddRecordingDialog open=add /><EditRecordingDialog target=editing /><CardInfoDialog target=info /><PreviewDialog target=preview />
+        <AddRecordingDialog open=add /><EditRecordingDialog target=editing /><CardInfoDialog target=info />
     }
 }

@@ -2,6 +2,7 @@
 use serde::Serialize;
 use serde_json::Value;
 use std::{
+    hash::{Hash, Hasher},
     sync::{atomic::Ordering, Arc, Mutex},
     time::Duration,
 };
@@ -240,7 +241,7 @@ async fn open_inner(
         match owner
             .core
             .resolver
-            .kuaishou_begin_page_check(cookie.as_deref(), Duration::from_secs(interval))
+            .kuaishou_begin_page_check(cookie.as_deref(), Duration::from_secs(interval), manual)
             .await
         {
             Ok(permit) => Some(Arc::new(permit)),
@@ -303,9 +304,10 @@ async fn create_window(app: &AppHandle, session: &Session, smoke: bool) -> Resul
             .core
             .workspace
             .user_data_dir
-            .join("webview-kuaishou"),
+            .join("webview-kuaishou")
+            .join(profile_key(session.original_cookie.as_deref())),
     )
-    .incognito(true)
+    .incognito(false)
     .menu(menu)
     .on_navigation(move |url| allowed_navigation(url, navigation_origin.as_deref()))
     .on_page_load(move |window, payload| {
@@ -427,10 +429,6 @@ pub fn begin_complete(app: &AppHandle) -> Result<(), String> {
                 dispose(&handle, session.id, false);
             }
             Err(error) => {
-                if terminal_page_problem(&error) {
-                    dispose(&handle, session.id, true);
-                    return;
-                }
                 let owner = handle.state::<Verification>();
                 let mut state = owner.state.lock().expect("verification state");
                 if let Some(current) = state
@@ -544,9 +542,9 @@ fn schedule_automatic_check(app: AppHandle, label: String) {
                     challenge.observe(std::time::Instant::now(), false);
                     challenge_reported = false;
                     if terminal_page_problem(&error) {
-                        log::info!("快手页面检查已停止: {error}");
-                        dispose(&handle, session.id, true);
-                        return;
+                        // Keep the official page visible for human inspection.
+                        // Only inspect the DOM here: no refresh or HTTP retry.
+                        surface_page(&handle, &session, &error);
                     }
                     if last_error.as_ref() != Some(&error) {
                         log::info!("快手页面自动检查未完成: {error}");
@@ -560,19 +558,13 @@ fn schedule_automatic_check(app: AppHandle, label: String) {
             if !session.surfaced.load(Ordering::SeqCst)
                 && started.elapsed() >= Duration::from_secs(30)
             {
-                handle
-                    .state::<Verification>()
-                    .core
-                    .store
-                    .snack_error("快手页面暂不可读，自动检查已停止；可在任务中手动重试");
+                surface_page(&handle, &session, "页面尚未恢复，请检查当前页面");
                 handle
                     .state::<Verification>()
                     .core
                     .scheduler
                     .report_kuaishou_access(&session.record, kuaishou::PAGE_UNAVAILABLE)
                     .await;
-                dispose(&handle, session.id, true);
-                return;
             }
         }
         session.auto_running.store(false, Ordering::SeqCst);
@@ -663,6 +655,14 @@ async fn evaluate_current_page(
         .ok_or("目标主播地址无效")?;
     let visible_text = data["text"].as_str().unwrap_or_default();
     let challenge_visible = data["challengeVisible"].as_bool().unwrap_or(false);
+    // Keep the cause diagnosable without recording page text, cookies or URLs.
+    log::debug!(
+        "快手页面观察 code={:?} challenge={} login_prompt={}",
+        data.pointer("/state/room/errorType/type")
+            .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok())),
+        challenge_visible,
+        data["loginPromptVisible"].as_bool().unwrap_or(false)
+    );
     let info = match kuaishou::evaluate_verification_page(
         &data["state"],
         expected_id,
@@ -711,7 +711,8 @@ async fn evaluate_current_page(
         .get(&session.record.rec_id)
         .await
         .ok_or("验证任务已移除")?;
-    if current.url != session.record.url
+    if !current.same_schedule_as(&session.record)
+        || current.url != session.record.url
         || current.quality != session.record.quality
         || current.platform_key.as_deref() != Some("kuaishou")
     {
@@ -777,6 +778,26 @@ async fn evaluate_current_page(
         Err(_) => "快手页面已恢复；当前任务未恢复，请查看任务状态".into(),
     }))
 }
+fn profile_key(cookie: Option<&str>) -> String {
+    // Account-bound profile; cookie refreshes must not discard browser proof.
+    // The original user ID is neither used as a path nor written to diagnostics.
+    let identity = cookie_value(cookie.unwrap_or_default(), "userId");
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    identity.as_deref().unwrap_or("public").hash(&mut hash);
+    format!("account-{:016x}", hash.finish())
+}
+fn surface_page(app: &AppHandle, session: &Session, message: &str) {
+    if session.stop.is_cancelled() {
+        return;
+    }
+    if let Some(window) = app.get_webview_window(LABEL) {
+        let _ = window.set_title(&format!("快手页面检查 · {message}"));
+        if !session.surfaced.swap(true, Ordering::SeqCst) {
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+    }
+}
 fn terminal_page_problem(error: &str) -> bool {
     matches!(
         error,
@@ -797,6 +818,17 @@ async fn report_page_problem(
         .cloned();
     if session.stop.is_cancelled() || saved != session.original_cookie {
         return Err("旧页面检查已失效，未应用结果".into());
+    }
+    if owner
+        .core
+        .store
+        .get(&session.record.rec_id)
+        .await
+        .is_some_and(|record| {
+            record.same_schedule_as(&session.record) && record.check_error.as_deref() == Some(error)
+        })
+    {
+        return Ok(());
     }
     owner.core.resolver.kuaishou_page_problem(error).await;
     owner
@@ -944,6 +976,18 @@ mod tests {
         // A stalled observer is not proof that the challenge stayed visible.
         assert!(!challenge.observe(now + Duration::from_secs(10), true));
         assert!(!challenge.observe(now + Duration::from_secs(11), true));
+    }
+    #[test]
+    fn browser_profile_persists_across_cookie_refresh_but_never_crosses_accounts() {
+        assert_eq!(
+            profile_key(Some("userId=one; did=old")),
+            profile_key(Some("did=new; userId=one"))
+        );
+        assert_ne!(
+            profile_key(Some("userId=one")),
+            profile_key(Some("userId=two"))
+        );
+        assert_ne!(profile_key(None), profile_key(Some("userId=one")));
     }
     #[test]
     fn public_room_readability_never_overwrites_saved_login_or_requires_an_unneeded_login() {

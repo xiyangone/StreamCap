@@ -42,6 +42,9 @@ export function seedRecordings() {
     isRecording: recording, recordedSeconds: recording ? 3661 : 0, recordingError: null, checkError: null, verificationRequired: false, liveTitle: title, speed: recording ? '2.4 MB/s' : null,
     recordingDir: recording ? 'X:/Fixture/Recordings/云间电台' : null,
     inheritedFields: Object.keys(inheritance), videoBitrate: null,
+    checkState: 'idle', checkWaitReason: recording ? 'recording' : monitor ? 'interval' : 'paused',
+    queuePosition: null, checkReadyAt: null, recoveryAt: null, recoveryAttempt: 0,
+    nextCheckAt: monitor && !recording ? Math.floor(Date.now() / 1000) + 600 : null,
   }));
 }
 
@@ -154,11 +157,11 @@ export async function createHarness(label, options = {}) {
   let tsPromise;
   let mp4Promise;
   const mp4Bytes=()=>mp4Promise??=promisify(execFile)(process.env.STREAMCAP_TEST_FFMPEG||'ffmpeg',['-v','error','-nostdin','-f','lavfi','-i','testsrc2=size=160x120:rate=10','-f','lavfi','-i','sine=frequency=440:sample_rate=48000','-t','4','-c:v','libx264','-preset','ultrafast','-g','10','-pix_fmt','yuv420p','-c:a','aac','-movflags','frag_keyframe+empty_moov','-f','mp4','pipe:1'],{windowsHide:true,encoding:'buffer',timeout:15000,maxBuffer:4*1024*1024}).then(({stdout})=>stdout);
-  const tsBytes = () => tsPromise ??= promisify(execFile)(process.env.STREAMCAP_TEST_FFMPEG || 'ffmpeg', ['-v','error','-nostdin','-f','lavfi','-i','testsrc2=size=160x120:rate=10','-f','lavfi','-i','sine=frequency=440:sample_rate=48000','-t','6','-c:v','libx264','-preset','ultrafast','-tune','zerolatency','-g','10','-pix_fmt','yuv420p','-c:a','aac','-f','mpegts','pipe:1'], { windowsHide: true, encoding: 'buffer', timeout: 15000, maxBuffer: 4*1024*1024 }).then(({stdout}) => stdout);
+  const tsBytes = () => tsPromise ??= promisify(execFile)(process.env.STREAMCAP_TEST_FFMPEG || 'ffmpeg', ['-v','error','-nostdin','-f','lavfi','-i','testsrc2=size=160x120:rate=10','-f','lavfi','-i','sine=frequency=440:sample_rate=48000','-t','6','-c:v','libx264','-preset','ultrafast','-tune','zerolatency','-g','10','-pix_fmt','yuv420p','-c:a','aac','-f','mpegts','-muxdelay','0','pipe:1'], { windowsHide: true, encoding: 'buffer', timeout: 15000, maxBuffer: 4*1024*1024 }).then(({stdout}) => stdout);
   let tsFilePromise;
   const segmentBytes=async(start)=>{
     const file=await (tsFilePromise??=tsBytes().then(async bytes=>{const file=join(temp,'seek-source.ts');await writeFile(file,bytes);return file;}));
-    const {stdout}=await promisify(execFile)(process.env.STREAMCAP_TEST_FFMPEG||'ffmpeg',['-v','error','-nostdin','-ss',String(start),'-i',file,'-t',String(Math.max(.3,6-start)),'-c:v','libx264','-preset','ultrafast','-tune','zerolatency','-c:a','aac','-f','mpegts','pipe:1'],{windowsHide:true,encoding:'buffer',timeout:15000,maxBuffer:4*1024*1024});return stdout;
+    const {stdout}=await promisify(execFile)(process.env.STREAMCAP_TEST_FFMPEG||'ffmpeg',['-v','error','-nostdin','-ss',String(start),'-i',file,'-t',String(Math.max(.3,6-start)),'-c:v','libx264','-preset','ultrafast','-tune','zerolatency','-c:a','aac','-f','mpegts','-muxdelay','0','pipe:1'],{windowsHide:true,encoding:'buffer',timeout:15000,maxBuffer:4*1024*1024});return stdout;
   };
   const server = createServer(async (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -199,7 +202,8 @@ export async function createHarness(label, options = {}) {
       if (path === '/api/events') {
         res.writeHead(200, { 'Content-Type': 'text/event-stream', Connection: 'keep-alive' });
         res.flushHeaders(); res.write(': isolated-fixture\n\n'); streams.add(res);
-        res.on('close', () => streams.delete(res)); return;
+        const heartbeat = setInterval(() => res.write('event: heartbeat\ndata: {}\n\n'), 5000);
+        res.on('close', () => { clearInterval(heartbeat); streams.delete(res); }); return;
       }
       if (path === '/api/recordings' && method === 'GET') { json(res, state.recordings); return; }
       if (path === '/api/recordings' && method === 'POST') {
@@ -238,9 +242,12 @@ export async function createHarness(label, options = {}) {
         }
         if (method === 'PUT') { applyEdit(record, body); json(res, { updated: true }); return; }
         if (method === 'POST') {
-          if (action === 'monitor') { record.monitorStatus = !record.monitorStatus; if (!record.monitorStatus) record.isRecording = false; }
+          if (action === 'monitor') { record.monitorStatus = !record.monitorStatus; if (!record.monitorStatus) record.isRecording = false;
+            Object.assign(record,{queuePosition:null,recoveryAt:null,recoveryAttempt:0,checkReadyAt:null,checkState:'idle',
+              checkWaitReason:record.monitorStatus?'interval':'paused',nextCheckAt:record.monitorStatus?Math.floor(Date.now()/1000)+600:null}); }
           if (action === 'start' || action === 'check') { if (!record.streamerName.trim()) record.streamerName = '自动识别主播'; record.isRecording = true; record.isLive = true; record.recordingError = null; record.speed = '1.8 MB/s'; }
-          if (action === 'stop') { record.isRecording = false; record.recordingError = null; record.speed = null; }
+          if (action === 'stop') { record.isRecording = false; record.recordingError = null; record.speed = null;
+            Object.assign(record,{queuePosition:null,recoveryAt:null,recoveryAttempt:0,checkReadyAt:null,checkState:'idle',checkWaitReason:record.monitorStatus?'interval':'paused'}); }
           emit('update', record); json(res, { ok: true }); return;
         }
       }
@@ -285,6 +292,10 @@ export async function createHarness(label, options = {}) {
         if (method === 'PUT') for (const [key, value] of Object.entries(body.cookies ?? {})) { if (value) state.cookies[key] = value; else delete state.cookies[key]; }
         json(res, { cookies: state.cookies }); return;
       }
+      if (path === '/api/storage/size') {
+        const entry=state.files.find(item=>item.path===url.searchParams.get('path'));
+        setTimeout(()=>{if(!res.destroyed)json(res,{size:entry?.size||0});},state.storageSizeDelay||25);return;
+      }
       if (path === '/api/storage') {
         if (method === 'DELETE') {
           const target = url.searchParams.get('path');
@@ -293,10 +304,10 @@ export async function createHarness(label, options = {}) {
         }
         const folder = url.searchParams.get('subfolder') ?? '';
         const items = state.files.filter((f) => f.path.split('/').slice(0, -1).join('/') === folder);
-        json(res, { root: 'X:/Fixture/Recordings', items, totalSize: items.reduce((sum, item) => sum + item.size, 0) }); return;
+        json(res, { root: 'X:/Fixture/Recordings', items:items.map(item=>({...item,size:item.isDir?0:item.size,sizeKnown:!item.isDir})), totalSizeKnown:!items.some(item=>item.isDir), totalSize: items.filter(item=>!item.isDir).reduce((sum, item) => sum + item.size, 0) }); return;
       }
       if (path === '/api/media/jobs') { json(res, { jobs: state.mediaJobs, ready: true, activePreviews: state.activePreviews }); return; }
-      if (path === '/api/media/info') { const file = url.searchParams.get('path') || ''; json(res, { format: file.split('.').at(-1), isRecording: state.previewLive, durationSeconds: 6, seekable: true, size: file.endsWith('.ts') ? (await tsBytes()).length : 16044 }); return; }
+      if (path === '/api/media/info') { const file = url.searchParams.get('path') || ''; json(res, { format: file.split('.').at(-1), nativeCompatible:!file.endsWith('.ts'), compatibilityAvailable:true, isRecording: state.previewLive, durationSeconds: 6, seekable: true, size: file.endsWith('.ts') ? (await tsBytes()).length : 16044 }); return; }
       if (path === '/api/media/remux') {
         const source = body.path; const output = source.replace(/\.ts$/i, '.mp4');
         if (state.files.some(f => f.path === output)) { json(res, {detail:'同名 MP4 已存在，未覆盖'},409); return; }
