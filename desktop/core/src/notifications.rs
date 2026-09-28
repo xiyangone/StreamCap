@@ -1,10 +1,14 @@
 //! Bounded notifications. Transport errors never print destination credentials.
 use crate::{config::ConfigStore, model::Recording, store::Store};
 use serde_json::{json, Value};
-use std::{sync::Arc, time::Duration};
-use tokio::sync::{RwLock, Semaphore};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use tokio::sync::RwLock;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct Delivery {
     pub channel: &'static str,
     pub url: String,
@@ -155,14 +159,67 @@ pub fn accepted(channel: &str, value: &Value) -> bool {
         _ => false,
     }
 }
+const NOTIFICATION_CAPACITY: usize = 128;
+const NOTIFICATION_WORKERS: usize = 4;
+#[derive(PartialEq)]
+struct Notification {
+    record_id: String,
+    started: bool,
+    title: String,
+    content: String,
+    deliveries: Vec<Delivery>,
+    email: Option<EmailConfig>,
+}
+#[derive(Default)]
+struct NotificationQueue {
+    pending: VecDeque<Arc<Notification>>,
+    active: HashMap<String, Arc<Notification>>,
+    workers: usize,
+}
+impl NotificationQueue {
+    fn enqueue(&mut self, message: Notification) -> Result<(), ()> {
+        // Coalesce only the latest same-state event; preserve start/end/start transitions.
+        if let Some(index) = self
+            .pending
+            .iter()
+            .rposition(|p| p.record_id == message.record_id)
+        {
+            if self.pending[index].started == message.started {
+                self.pending[index] = Arc::new(message);
+                return Ok(());
+            }
+        } else if self
+            .active
+            .get(&message.record_id)
+            .is_some_and(|active| active.as_ref() == &message)
+        {
+            return Ok(());
+        }
+        if self.pending.len() + self.active.len() >= NOTIFICATION_CAPACITY {
+            return Err(());
+        }
+        self.pending.push_back(Arc::new(message));
+        Ok(())
+    }
+    fn take(&mut self) -> Option<Arc<Notification>> {
+        let index = self
+            .pending
+            .iter()
+            .position(|p| !self.active.contains_key(&p.record_id))?;
+        let message = self.pending.remove(index)?;
+        self.active
+            .insert(message.record_id.clone(), message.clone());
+        Some(message)
+    }
+}
+
 #[derive(Clone)]
 pub struct Notifications {
     config: Arc<RwLock<ConfigStore>>,
     store: Store,
     stop: CancellationToken,
     tasks: TaskTracker,
-    slots: Arc<Semaphore>,
-    admission: Arc<std::sync::Mutex<()>>,
+    queue: Arc<Mutex<NotificationQueue>>,
 }
 impl Notifications {
     pub fn new(config: Arc<RwLock<ConfigStore>>, store: Store) -> Self {
@@ -171,11 +228,13 @@ impl Notifications {
             store,
             stop: CancellationToken::new(),
             tasks: TaskTracker::new(),
-            slots: Arc::new(Semaphore::new(32)),
-            admission: Arc::new(std::sync::Mutex::new(())),
+            queue: Arc::default(),
         }
     }
     pub async fn changed(&self, record: &Recording, started: bool) {
+        if self.stop.is_cancelled() {
+            return;
+        }
         let config = self.config.read().await;
         let enabled = config.get_bool(
             if started {
@@ -231,71 +290,123 @@ impl Notifications {
             .get_bool("email_enabled", false)
             .then(|| email_config(&config));
         drop(config);
-        let _admission = self.admission.lock().expect("notification admission");
+        if plan.is_empty() && email.is_none() {
+            return;
+        }
+        self.enqueue(Notification {
+            record_id: record.rec_id.clone(),
+            started,
+            title,
+            content,
+            deliveries: plan,
+            email,
+        });
+    }
+    fn enqueue(&self, message: Notification) {
+        let mut queue = self.queue.lock().expect("notification queue");
         if self.stop.is_cancelled() {
             return;
         }
-        let Ok(permit) = self.slots.clone().try_acquire_owned() else {
+        if queue.enqueue(message).is_err() {
+            drop(queue);
             self.store.snack_error("通知队列已满，本次消息未发送");
             return;
-        };
-        let manager = self.clone();
-        self.tasks.spawn(async move {
-            let _permit = permit;
-            let work = async {
-                let client = match reqwest::Client::builder()
-                    .no_proxy()
-                    .timeout(Duration::from_secs(12))
-                    .redirect(reqwest::redirect::Policy::none())
-                    .build()
-                {
-                    Ok(c) => c,
-                    Err(_) => return,
+        }
+        // Only a fixed number of workers may wait on transports. No task per queued message.
+        while queue.workers < NOTIFICATION_WORKERS
+            && queue.workers < queue.pending.len() + queue.active.len()
+        {
+            queue.workers += 1;
+            let manager = self.clone();
+            self.tasks.spawn(async move {
+                manager.run_worker().await;
+            });
+        }
+    }
+    async fn run_worker(&self) {
+        loop {
+            let message = {
+                let mut queue = self.queue.lock().expect("notification queue");
+                let message = if self.stop.is_cancelled() {
+                    None
+                } else {
+                    queue.take()
                 };
-                for delivery in plan {
-                    let result = async {
-                        let request = client.post(&delivery.url);
-                        let response = if delivery.form {
-                            request.form(&delivery.payload)
-                        } else {
-                            request.json(&delivery.payload)
-                        }
-                        .send()
-                        .await
-                        .map_err(|_| ())?;
-                        if !response.status().is_success() {
-                            return Err(());
-                        }
-                        let value: Value = response_json(response).await?;
-                        if accepted(delivery.channel, &value) {
-                            Ok(())
-                        } else {
-                            Err(())
-                        }
-                    }
-                    .await;
-                    if result.is_err() {
-                        manager.store.snack_error(format!(
-                            "{} 通知发送失败，请检查配置和网络",
-                            delivery.channel
-                        ));
-                    }
-                }
-                if let Some(email) = email {
-                    if send_email(email, &title, &content).await.is_err() {
-                        manager
-                            .store
-                            .snack_error("邮件通知发送失败，请检查 SMTP 配置");
+                match message {
+                    Some(message) => message,
+                    None => {
+                        queue.workers -= 1;
+                        return;
                     }
                 }
             };
-            tokio::select! {biased;_=manager.stop.cancelled()=>{},_=work=>{}};
-        });
+            tokio::select! { biased;
+                _ = self.stop.cancelled() => {},
+                _ = self.deliver(&message) => {},
+            }
+            self.queue
+                .lock()
+                .expect("notification queue")
+                .active
+                .remove(&message.record_id);
+        }
+    }
+    async fn deliver(&self, message: &Notification) {
+        let client = match reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(12))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+        {
+            Ok(client) => client,
+            Err(_) => {
+                self.store.snack_error("无法初始化通知客户端");
+                return;
+            }
+        };
+        for delivery in &message.deliveries {
+            let result = async {
+                let request = client.post(&delivery.url);
+                let response = if delivery.form {
+                    request.form(&delivery.payload)
+                } else {
+                    request.json(&delivery.payload)
+                }
+                .send()
+                .await
+                .map_err(|_| ())?;
+                if !response.status().is_success() {
+                    return Err(());
+                }
+                let value = response_json(response).await?;
+                if accepted(delivery.channel, &value) {
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            }
+            .await;
+            if result.is_err() {
+                self.store.snack_error(format!(
+                    "{} 通知发送失败，请检查配置和网络",
+                    delivery.channel
+                ));
+            }
+        }
+        if let Some(email) = &message.email {
+            if send_email(email.clone(), &message.title, &message.content)
+                .await
+                .is_err()
+            {
+                self.store.snack_error("邮件通知发送失败，请检查 SMTP 配置");
+            }
+        }
     }
     pub async fn shutdown(&self) {
         {
-            let _admission = self.admission.lock().expect("notification admission");
+            let mut queue = self.queue.lock().expect("notification queue");
             self.stop.cancel();
+            queue.pending.clear();
             self.tasks.close();
         }
         self.tasks.wait().await;
@@ -315,6 +426,7 @@ async fn response_json(mut response: reqwest::Response) -> Result<Value, ()> {
     serde_json::from_slice(&body).map_err(|_| ())
 }
 
+#[derive(Clone, PartialEq)]
 struct EmailConfig {
     host: String,
     port: u16,
@@ -373,6 +485,146 @@ async fn send_email(c: EmailConfig, title: &str, body: &str) -> Result<(), Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn message(id: &str, started: bool) -> Notification {
+        Notification {
+            record_id: id.into(),
+            started,
+            title: "fixture".into(),
+            content: "body".into(),
+            deliveries: vec![],
+            email: None,
+        }
+    }
+    #[test]
+    fn notification_queue_coalesces_duplicates_without_losing_transitions() {
+        let mut queue = NotificationQueue::default();
+        queue.enqueue(message("a", true)).unwrap();
+        queue.enqueue(message("a", true)).unwrap();
+        assert_eq!(queue.pending.len(), 1);
+        let active = queue.take().unwrap();
+        assert!(active.started);
+        queue.enqueue(message("a", true)).unwrap();
+        assert!(queue.pending.is_empty());
+        queue.enqueue(message("a", false)).unwrap();
+        queue.enqueue(message("a", true)).unwrap();
+        queue.enqueue(message("b", true)).unwrap();
+        assert_eq!(queue.take().unwrap().record_id, "b");
+        assert!(queue.take().is_none());
+        queue.active.remove("a");
+        assert!(!queue.take().unwrap().started);
+        queue.active.remove("a");
+        assert!(queue.take().unwrap().started);
+    }
+    #[test]
+    fn notification_capacity_counts_active_and_pending() {
+        let mut queue = NotificationQueue::default();
+        for i in 0..NOTIFICATION_CAPACITY {
+            queue.enqueue(message(&i.to_string(), true)).unwrap();
+        }
+        queue.take().unwrap();
+        assert!(queue.enqueue(message("overflow", true)).is_err());
+        assert!(queue.enqueue(message("1", true)).is_ok());
+        queue.active.remove("0");
+        assert!(queue.enqueue(message("next", true)).is_ok());
+    }
+    #[tokio::test]
+    async fn notifications_drain_burst_with_bounded_workers_and_cancel_on_shutdown() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let received = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let (r, a, p) = (received.clone(), active.clone(), peak.clone());
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(move || {
+                let (r, a, p) = (r.clone(), a.clone(), p.clone());
+                async move {
+                    let count = a.fetch_add(1, Ordering::SeqCst) + 1;
+                    p.fetch_max(count, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(12)).await;
+                    a.fetch_sub(1, Ordering::SeqCst);
+                    r.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(json!({"ok":true}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
+        let config = ConfigStore::load(crate::Workspace::from_repo_root(dir.path())).unwrap();
+        let manager = Notifications::new(
+            Arc::new(RwLock::new(config)),
+            Store::new(crate::Workspace::from_repo_root(dir.path())),
+        );
+        for i in 0..40 {
+            let mut m = message(&i.to_string(), true);
+            m.deliveries.push(Delivery {
+                channel: "telegram",
+                url: url.clone(),
+                payload: json!({}),
+                form: false,
+            });
+            manager.enqueue(m);
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while received.load(Ordering::SeqCst) < 40 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(peak.load(Ordering::SeqCst) <= NOTIFICATION_WORKERS);
+        manager.shutdown().await;
+        manager.enqueue(message("after-shutdown", true));
+        let queue = manager.queue.lock().unwrap();
+        assert!(queue.pending.is_empty());
+        assert!(queue.active.is_empty());
+        assert_eq!(queue.workers, 0);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn shutdown_cancels_inflight_delivery_and_discards_pending_messages() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let (accepted, ready) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let _ = accepted.send(());
+            std::future::pending::<()>().await;
+            drop(socket);
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = crate::Workspace::from_repo_root(dir.path());
+        let manager = Notifications::new(
+            Arc::new(RwLock::new(ConfigStore::load(workspace.clone()).unwrap())),
+            Store::new(workspace),
+        );
+        let mut first = message("a", true);
+        first.deliveries.push(Delivery {
+            channel: "telegram",
+            url,
+            payload: json!({}),
+            form: false,
+        });
+        manager.enqueue(first);
+        tokio::time::timeout(Duration::from_secs(2), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        for n in 0..30 {
+            manager.enqueue(message("a", n % 2 == 0));
+        }
+        assert!(!manager.queue.lock().unwrap().pending.is_empty());
+        tokio::time::timeout(Duration::from_secs(1), manager.shutdown())
+            .await
+            .unwrap();
+        let queue = manager.queue.lock().unwrap();
+        assert!(queue.pending.is_empty());
+        assert!(queue.active.is_empty());
+        assert_eq!(queue.workers, 0);
+        server.abort();
+    }
     #[test]
     fn provider_failure_is_not_reported_as_success() {
         assert!(accepted("telegram", &json!({"ok":true})));

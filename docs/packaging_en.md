@@ -72,3 +72,11 @@ Recording and library previews share one application-level panel. Minimize makes
 ## 2026-09-27 dependency update batch
 
 This batch pins Tauri/API/CLI 2.12.0, tauri-build 2.7.0, dialog 2.8.0, notification 2.5.0, Leptos 0.8.21, Router 0.8.16, wasm-bindgen and its project CLI 0.2.129, js-sys/web-sys 0.3.106, and rquickjs 0.14.0. Transitive resolutions are recorded in the three Cargo.lock files. The reqwest 0.12 TLS path, user-directory behavior and monitoring policy are unchanged. Downloads use a project-local Cargo cache and tools stay in desktop/target/tools; system PATH is unchanged. New candidates require the complete verification gate without overwriting existing candidates or the running installation.
+
+## 2026-09-28 runtime improvements
+
+- Recording previews follow the latest task state by ID. Deletion closes the task preview and cancels file requests; ordinary state updates retain the player. Independent library previews are unaffected by unrelated task deletion.
+- Platform checks queue before taking execution slots. New/resumed/manual checks receive bounded priority: at most three consecutive priority admissions, with aging opportunities for normal checks after 30 seconds. Platform rotation, concurrency, spacing and cooldown remain enforced. Each platform allows at most 1024 waiters; cancellation removes the ticket without disabling monitoring.
+- External notifications use an in-memory queue of at most 128 pending/in-flight messages and four sender workers. Per-task delivery order is preserved, consecutive same-state events are coalesced, and overflow is reported. This is not a durable queue: shutdown cancels sends and clears pending messages.
+- Media sorting supports name, modification time and size in both directions, remembered within the desktop profile. Directories remain first, unknown sizes follow known values of the same kind, and asynchronous size updates do not block navigation.
+- A single-target read-only Kuaishou probe distinguishes transport, business readability and target identity. Stream URLs alone do not prove a room is live. Without verified conflicting live data, state precedence and saved cookies are unchanged.

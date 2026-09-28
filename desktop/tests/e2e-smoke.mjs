@@ -808,6 +808,62 @@ try {
     await page.waitForFunction(async()=>(await import('/media-player.js')).activePlayerCount()===0);
     assert.equal(await page.locator('audio').count(),0);
   });
+  await step('任务预览同步改名和下播，删除后取消轮询且迟到结果不复活', async () => {
+    const rec={...seedRecordings()[0],recId:'preview-state-regression',streamerName:'预览同步回归'};
+    state.recordings.push(rec);h.emit('update',rec);await navigate('录制任务');
+    await visible(card(rec.recId));await card(rec.recId).getByRole('button',{name:'预览录制文件',exact:true}).click();
+    const modal=dialog('录制预览');await page.waitForFunction(()=>document.querySelector('video')?.currentTime>.1);
+    await modal.getByRole('button',{name:'暂停',exact:true}).click();
+    const before=await page.locator('video').evaluate(v=>{window.synchronizedPreview=v;return v.currentTime;});
+    rec.streamerName='后台同步后的主播';rec.isLive=false;h.emit('update',rec);
+    await waitState(()=>modal.locator('.preview-title').innerText(),text=>text===rec.streamerName,'预览同步最新名字');
+    assert.equal(await modal.getByRole('button',{name:'预览直播源',exact:true}).count(),0);
+    assert.equal(await page.locator('video').evaluate(v=>v===window.synchronizedPreview&&v.paused),true);
+    assert.ok(Math.abs(await page.locator('video').evaluate(v=>v.currentTime)-before)<.1);
+    await modal.getByRole('button',{name:'最小化预览',exact:true}).click();await navigate('偏好设置');
+    const endpoint='/api/recordings/'+rec.recId+'/files';
+    h.delayNext('GET',endpoint,1800);
+    const previous=requests('GET',endpoint).length;
+    await waitState(()=>requests('GET',endpoint).length,count=>count>previous,'慢轮询已发出');
+    state.recordings=state.recordings.filter(r=>r.recId!==rec.recId);h.emit('delete',[rec.recId]);
+    await hidden(modal);await page.waitForFunction(async()=>(await import('/media-player.js')).activePlayerCount()===0);
+    const count=requests('GET',endpoint).length;await new Promise(resolve=>setTimeout(resolve,2300));
+    assert.equal(requests('GET',endpoint).length,count,'删除后不新增文件请求');
+    assert.equal(await page.locator('dialog[open].preview-shell').count(),0,'迟到响应不得恢复预览');
+    assert.equal(await page.locator('video').count(),0);
+  });
+  await step('文件轮询超时显示错误且下一次请求恢复，不复用已取消控制器', async () => {
+    const rec={...seedRecordings()[0],recId:'preview-timeout-regression',streamerName:'预览超时恢复'};
+    state.recordings.push(rec);h.emit('update',rec);await navigate('录制任务');await visible(card(rec.recId));
+    const endpoint='/api/recordings/'+rec.recId+'/files';h.delayNext('GET',endpoint,12500);
+    await card(rec.recId).getByRole('button',{name:'预览录制文件',exact:true}).click();const modal=dialog('录制预览');
+    await eventually(()=>modal.locator('[role="alert"]').count(),count=>count===1,'单次超时必须显示错误',14500);
+    assert.equal(await modal.locator('.loading-state').count(),0);
+    await eventually(()=>modal.locator('video').count(),count=>count===1,'下一次轮询恢复播放',6000);
+    assert.ok(requests('GET',endpoint).length>=2);assert.equal(await modal.locator('[role="alert"]').count(),0);
+    state.recordings=state.recordings.filter(r=>r.recId!==rec.recId);h.emit('delete',[rec.recId]);await hidden(modal);
+    await page.waitForFunction(async()=>(await import('/media-player.js')).activePlayerCount()===0);
+  });
+  await step('媒体排序支持三种字段、双方向和跨页记忆，目录始终优先', async () => {
+    await navigate('媒体库');await page.getByRole('button',{name:'返回媒体库根目录',exact:true}).click();
+    const rows=page.locator('.file-table tbody tr');await waitState(()=>rows.count(),n=>n===4,'媒体列表');
+    const names=()=>rows.locator('.file-name strong').allTextContents();
+    const expected=(key,desc)=>state.files.filter(file=>!file.path.includes('/')).sort((a,b)=>Number(b.isDir)-Number(a.isDir)||
+      (key==='size'?(desc?b.size-a.size:a.size-b.size):key==='modified'?(desc?b.modified-a.modified:a.modified-b.modified):
+       (a.name.toLowerCase()<b.name.toLowerCase()?-1:a.name.toLowerCase()>b.name.toLowerCase()?1:0)*(desc?-1:1))||
+      (a.name<b.name?-1:a.name>b.name?1:0)).map(f=>f.name);
+    const sorting=page.getByRole('combobox',{name:'媒体排序',exact:true});const direction=page.getByRole('button',{name:'切换排序方向',exact:true});
+    for(const key of ['name','modified','size']){
+      await sorting.selectOption(key);
+      for(const desc of [false,true]){
+        if((await direction.getAttribute('aria-pressed'))!==String(desc))await direction.click();
+        await waitState(names,actual=>JSON.stringify(actual)===JSON.stringify(expected(key,desc)),key+' 排序');
+      }
+    }
+    await navigate('总览');await navigate('媒体库');assert.equal(await sorting.inputValue(),'size');assert.equal(await direction.getAttribute('aria-pressed'),'true');
+    await page.setViewportSize({width:375,height:820});const layout=await inspectLayout(page);assert.deepEqual(layout.overflow,[]);await h.shot('storage-sort-narrow');
+    await page.setViewportSize({width:1280,height:900});await sorting.selectOption('name');await direction.click();
+  });
   await step('媒体库筛选、目录导航与真正的内嵌音频加载', async () => {
     await navigate('媒体库');
     await waitState(() => page.locator('.file-table tbody tr').count(), (n) => n === 4, '根目录文件');

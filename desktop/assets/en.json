@@ -724,5 +724,12 @@
   "本阶段进度": "Current stage progress",
   "正在读取源文件音视频与时长": "Reading source media and duration",
   "关闭应用代理时使用系统网络路由（包括 TUN），不继承环境代理；是否经过远端节点取决于系统分流规则。": "With the application proxy off, system routing (including TUN) is used, not proxy environment variables. The system routing rules determine the outbound node.",
-  "页面尚未恢复，请检查当前页面": "The page has not recovered. Inspect the current page."
+  "页面尚未恢复，请检查当前页面": "The page has not recovered. Inspect the current page.",
+  "媒体排序": "Media sort",
+  "切换排序方向": "Toggle sort direction",
+  "升序": "Ascending",
+  "降序": "Descending",
+  "无法初始化通知客户端": "Unable to initialize the notification client",
+  "平台检测队列已满，请稍后重试": "The platform check queue is full. Try again later.",
+  "平台冷却中，请等待后再检测": "The platform is cooling down. Wait before checking again."
 }

@@ -1,6 +1,6 @@
 //! Shared per-platform pacing, concurrency and cooldown for all requests.
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -58,6 +58,104 @@ struct GateState {
     next: Instant,
     blocked: Instant,
     failures: u32,
+    waiters: VecDeque<Waiter>,
+    next_ticket: u64,
+    priority_streak: usize,
+}
+const PRIORITY_BURST: usize = 3;
+const MAX_WAITERS: usize = 1024;
+const AGING: Duration = Duration::from_secs(30);
+struct Waiter {
+    id: u64,
+    priority: bool,
+    queued: Instant,
+}
+impl GateState {
+    fn selected(&self) -> Option<u64> {
+        let normal = self.waiters.iter().find(|w| !w.priority);
+        if let Some(normal) = normal {
+            if self.priority_streak >= PRIORITY_BURST
+                || (self.priority_streak > 0 && normal.queued.elapsed() >= AGING)
+            {
+                return Some(normal.id);
+            }
+        }
+        self.waiters
+            .iter()
+            .find(|w| w.priority)
+            .or(normal)
+            .map(|w| w.id)
+    }
+}
+pub(crate) struct PendingPermit {
+    gate: Arc<Gate>,
+    ticket: u64,
+}
+impl PendingPermit {
+    pub(crate) fn set_priority(&self, priority: bool) {
+        let mut state = self.gate.state.lock().expect("platform gate");
+        let changed = state
+            .waiters
+            .iter_mut()
+            .find(|w| w.id == self.ticket)
+            .is_some_and(|waiter| {
+                let changed = waiter.priority != priority;
+                waiter.priority = priority;
+                changed
+            });
+        drop(state);
+        if changed {
+            self.gate.changed.notify_waiters();
+        }
+    }
+    pub(crate) fn rank(&self) -> usize {
+        let state = self.gate.state.lock().expect("platform gate");
+        if state.selected() == Some(self.ticket) {
+            return 0;
+        }
+        state
+            .waiters
+            .iter()
+            .position(|w| w.id == self.ticket)
+            .map(|i| i + 1)
+            .unwrap_or(usize::MAX)
+    }
+    pub(crate) fn try_acquire(&self, maximum: usize, spacing: Duration) -> Option<Permit> {
+        let mut state = self.gate.state.lock().expect("platform gate");
+        let now = Instant::now();
+        if state.selected() != Some(self.ticket)
+            || state.blocked > now
+            || state.next > now
+            || state.active >= maximum.clamp(1, 16)
+        {
+            return None;
+        }
+        let index = state.waiters.iter().position(|w| w.id == self.ticket)?;
+        let waiter = state.waiters.remove(index)?;
+        state.priority_streak = if waiter.priority {
+            state.priority_streak.saturating_add(1).min(PRIORITY_BURST)
+        } else {
+            0
+        };
+        state.active += 1;
+        state.next = now + spacing;
+        drop(state);
+        self.gate.changed.notify_waiters();
+        Some(Permit {
+            gate: self.gate.clone(),
+        })
+    }
+}
+impl Drop for PendingPermit {
+    fn drop(&mut self) {
+        self.gate
+            .state
+            .lock()
+            .expect("platform gate")
+            .waiters
+            .retain(|w| w.id != self.ticket);
+        self.gate.changed.notify_waiters();
+    }
 }
 struct Gate {
     state: Mutex<GateState>,
@@ -89,6 +187,9 @@ impl Pacer {
                         next: Instant::now(),
                         blocked: Instant::now(),
                         failures: 0,
+                        waiters: VecDeque::new(),
+                        next_ticket: 0,
+                        priority_streak: 0,
                     }),
                     changed: Notify::new(),
                 })
@@ -121,22 +222,31 @@ impl Pacer {
             }
         }
     }
+    pub(crate) fn enqueue(&self, key: &str, priority: bool) -> Result<PendingPermit, String> {
+        let gate = self.gate(key);
+        let mut state = gate.state.lock().expect("platform gate");
+        if state.waiters.len() >= MAX_WAITERS {
+            return Err("平台检测队列已满，请稍后重试".into());
+        }
+        let ticket = state.next_ticket;
+        state.next_ticket = state.next_ticket.wrapping_add(1);
+        state.waiters.push_back(Waiter {
+            id: ticket,
+            priority,
+            queued: Instant::now(),
+        });
+        drop(state);
+        gate.changed.notify_waiters();
+        Ok(PendingPermit { gate, ticket })
+    }
+    #[cfg(test)]
     pub(crate) fn try_acquire(
         &self,
         key: &str,
         maximum: usize,
         spacing: Duration,
     ) -> Option<Permit> {
-        let gate = self.gate(key);
-        let mut state = gate.state.lock().expect("platform gate");
-        let now = Instant::now();
-        if state.blocked > now || state.next > now || state.active >= maximum.clamp(1, 16) {
-            return None;
-        }
-        state.active += 1;
-        state.next = now + spacing;
-        drop(state);
-        Some(Permit { gate })
+        self.enqueue(key, false).ok()?.try_acquire(maximum, spacing)
     }
     pub async fn acquire(
         &self,
@@ -145,32 +255,35 @@ impl Pacer {
         spacing: Duration,
         cancel: &CancellationToken,
     ) -> Result<Permit, String> {
-        let gate = self.gate(key);
+        if cancel.is_cancelled() {
+            return Err("检测已取消".into());
+        }
+        let pending = self.enqueue(key, true)?;
         loop {
             if cancel.is_cancelled() {
                 return Err("检测已取消".into());
             }
-            let notify = gate.changed.notified();
-            let wait = {
-                let mut state = gate.state.lock().expect("platform gate");
-                let now = Instant::now();
-                if state.blocked > now {
-                    return Err(format!(
-                        "平台冷却中，请在 {} 秒后重试",
-                        (state.blocked - now).as_secs() + 1
-                    ));
-                }
-                if state.active < maximum.clamp(1, 16) && state.next <= now {
-                    state.active += 1;
-                    state.next = now + spacing;
-                    return Ok(Permit { gate: gate.clone() });
-                }
-                state
-                    .next
-                    .saturating_duration_since(now)
-                    .max(Duration::from_millis(50))
-            };
-            tokio::select! {biased;_=cancel.cancelled()=>return Err("应用正在退出".into()),_=notify=>{},_=tokio::time::sleep(wait)=>{}}
+            let notified = pending.gate.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let gate = self.status(key, maximum);
+            if gate.reason == "cooldown" {
+                return Err("平台冷却中，请等待后再检测".into());
+            }
+            if let Some(permit) = pending.try_acquire(maximum, spacing) {
+                return Ok(permit);
+            }
+            let wait = gate
+                .ready_at
+                .filter(|at| *at > Instant::now())
+                .map(|at| at.saturating_duration_since(Instant::now()))
+                .unwrap_or(Duration::from_secs(1))
+                .max(Duration::from_millis(25));
+            tokio::select! {biased;
+                _=cancel.cancelled()=>return Err("检测已取消".into()),
+                _=&mut notified=>{},
+                _=tokio::time::sleep(wait)=>{},
+            }
         }
     }
     pub fn result(&self, key: &str, result: &Result<crate::resolver::StreamInfo, String>) {
@@ -207,6 +320,90 @@ impl Pacer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn priority_is_admitted_before_slots_but_normal_work_cannot_starve() {
+        let pacer = Pacer::default();
+        let normal = pacer.enqueue("a", false).unwrap();
+        let urgent: Vec<_> = (0..4).map(|_| pacer.enqueue("a", true).unwrap()).collect();
+        for ticket in urgent.iter().take(PRIORITY_BURST) {
+            assert!(normal.try_acquire(1, Duration::ZERO).is_none());
+            drop(ticket.try_acquire(1, Duration::ZERO).unwrap());
+        }
+        assert!(urgent[3].try_acquire(1, Duration::ZERO).is_none());
+        drop(normal.try_acquire(1, Duration::ZERO).unwrap());
+        drop(urgent[3].try_acquire(1, Duration::ZERO).unwrap());
+        let aged = pacer.enqueue("a", false).unwrap();
+        tokio::time::advance(AGING).await;
+        let newer = pacer.enqueue("a", true).unwrap();
+        assert!(newer.try_acquire(1, Duration::ZERO).is_none());
+        drop(aged.try_acquire(1, Duration::ZERO).unwrap());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_spacing_and_independent_platforms_share_the_same_queue() {
+        let pacer = Pacer::default();
+        let first = pacer.enqueue("a", false).unwrap();
+        let holder = first.try_acquire(1, Duration::from_secs(3)).unwrap();
+        let waiting = pacer.enqueue("a", true).unwrap();
+        assert!(waiting.try_acquire(1, Duration::ZERO).is_none());
+        drop(
+            pacer
+                .enqueue("b", true)
+                .unwrap()
+                .try_acquire(1, Duration::ZERO)
+                .unwrap(),
+        );
+        drop(holder);
+        assert!(waiting.try_acquire(1, Duration::ZERO).is_none());
+        drop(waiting);
+        tokio::time::advance(Duration::from_secs(3)).await;
+        let normal = pacer.enqueue("a", false).unwrap();
+        drop(normal.try_acquire(1, Duration::ZERO).unwrap());
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(pacer
+            .acquire("a", 1, Duration::ZERO, &cancel)
+            .await
+            .is_err());
+        assert!(pacer.gate("a").state.lock().unwrap().waiters.is_empty());
+    }
+    #[tokio::test]
+    async fn aborting_a_waiter_removes_its_ticket_without_consuming_a_slot() {
+        let pacer = Pacer::default();
+        let held = pacer
+            .enqueue("a", false)
+            .unwrap()
+            .try_acquire(1, Duration::ZERO)
+            .unwrap();
+        let cloned = pacer.clone();
+        let task = tokio::spawn(async move {
+            cloned
+                .acquire("a", 1, Duration::ZERO, &CancellationToken::new())
+                .await
+        });
+        for _ in 0..100 {
+            if !pacer.gate("a").state.lock().unwrap().waiters.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(pacer.gate("a").state.lock().unwrap().waiters.len(), 1);
+        task.abort();
+        let _ = task.await;
+        assert!(pacer.gate("a").state.lock().unwrap().waiters.is_empty());
+        drop(held);
+        let next = pacer.enqueue("a", false).unwrap();
+        assert!(next.try_acquire(1, Duration::ZERO).is_some());
+    }
+    #[test]
+    fn pending_queue_is_bounded_and_dropping_a_ticket_releases_capacity() {
+        let pacer = Pacer::default();
+        let mut tickets: Vec<_> = (0..MAX_WAITERS)
+            .map(|_| pacer.enqueue("a", false).unwrap())
+            .collect();
+        assert!(pacer.enqueue("a", true).is_err());
+        tickets.pop();
+        assert!(pacer.enqueue("a", true).is_ok());
+    }
     #[test]
     fn platforms_rotate_without_starving_the_third_platform() {
         let mut queue = FairQueue::default();

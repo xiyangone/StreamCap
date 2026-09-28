@@ -369,6 +369,8 @@ impl Scheduler {
         let mut interval = self.monitoring_interval().await;
         let mut deadlines: HashMap<String, CheckDeadline> = HashMap::new();
         let mut fair = crate::pacing::FairQueue::default();
+        let mut pending: HashMap<String, (u64, crate::pacing::PendingPermit)> = HashMap::new();
+        let mut urgent = HashSet::new();
         let mut running = tokio::task::JoinSet::<CheckCompletion>::new();
         loop {
             if self.stopping.is_cancelled() || *shutdown.borrow() || shutdown.has_changed().is_err()
@@ -401,6 +403,14 @@ impl Scheduler {
                 .map(|r| r.rec_id.clone())
                 .collect();
             deadlines.retain(|id, _| ids.contains(id));
+            urgent.retain(|id| ids.contains(id));
+            for (id, due) in &requested {
+                if due.instant <= Instant::now() {
+                    urgent.insert(id.clone());
+                } else {
+                    urgent.remove(id);
+                }
+            }
             for record in &records {
                 if record.monitor_status {
                     if let Some(due) = requested.get(&record.rec_id) {
@@ -515,7 +525,32 @@ impl Scheduler {
                     candidates.push((record, due, recovering));
                 }
             }
-            // Simulate the same platform turns for queue positions as for actual admission.
+            // Register before occupying global workers or platform slots, including normal work.
+            candidates.sort_by_key(|(record, due, _)| (due.instant, record.rec_id.clone()));
+            let eligible: HashMap<_, _> = candidates
+                .iter()
+                .map(|(record, _, _)| (record.rec_id.clone(), record.schedule_revision))
+                .collect();
+            pending.retain(|id, (revision, _)| eligible.get(id) == Some(revision));
+            for (record, _, recovering) in &candidates {
+                if let Some((_, ticket)) = pending.get(&record.rec_id) {
+                    ticket.set_priority(urgent.contains(&record.rec_id) || *recovering);
+                } else {
+                    if let Ok(ticket) = self.pacer.enqueue(
+                        record.platform_key.as_deref().unwrap_or("custom"),
+                        urgent.contains(&record.rec_id) || *recovering,
+                    ) {
+                        pending.insert(record.rec_id.clone(), (record.schedule_revision, ticket));
+                    }
+                }
+            }
+            // Cache ranks once per turn; rescanning a platform queue inside the ordering loop
+            // would make large task lists cubic rather than quadratic.
+            let ranks: HashMap<_, _> = pending
+                .iter()
+                .map(|(id, (_, ticket))| (id.clone(), ticket.rank()))
+                .collect();
+            // Platform turns and ticket rank decide admission; queued positions describe this pass.
             let mut projected = fair.clone();
             let mut ordered = Vec::new();
             while !candidates.is_empty() {
@@ -524,6 +559,7 @@ impl Scheduler {
                         let (r, due, _) = &candidates[i];
                         (
                             projected.rank(r.platform_key.as_deref().unwrap_or("custom")),
+                            ranks.get(&r.rec_id).copied().unwrap_or(usize::MAX),
                             due.instant,
                             r.rec_id.clone(),
                         )
@@ -538,10 +574,13 @@ impl Scheduler {
                 let key = record.platform_key.as_deref().unwrap_or("custom");
                 let gate = self.pacer.status(key, maximum);
                 let capacity = running.len() < AUTOMATIC_LIMIT;
-                let ready = gate.reason == "queue" && capacity;
+                let first = pending
+                    .get(&record.rec_id)
+                    .is_some_and(|(_, ticket)| ticket.rank() == 0);
+                let ready = gate.reason == "queue" && capacity && first;
                 if !ready {
                     position += 1;
-                    let reason = if gate.reason == "queue" {
+                    let reason = if gate.reason == "queue" && !capacity {
                         "capacity"
                     } else {
                         gate.reason
@@ -585,9 +624,14 @@ impl Scheduler {
                 let Ok(operation) = self.begin_check(&record.rec_id) else {
                     continue;
                 };
-                let Some(permit) = self.pacer.try_acquire(key, maximum, spacing) else {
+                let Some(permit) = pending
+                    .get(&record.rec_id)
+                    .and_then(|(_, ticket)| ticket.try_acquire(maximum, spacing))
+                else {
                     continue;
                 };
+                pending.remove(&record.rec_id);
+                urgent.remove(&record.rec_id);
                 fair.served(key);
                 if recovering {
                     self.recovery_requests
@@ -2314,6 +2358,62 @@ mod tests {
         for _ in 0..60 {
             tokio::task::yield_now().await;
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resumed_monitor_is_prioritized_before_a_busy_platform_slot() {
+        let root = tempfile::tempdir().unwrap();
+        let state = crate::api::bootstrap(Workspace::from_repo_root(root.path()))
+            .await
+            .unwrap();
+        state.config.write().await.update_user_config(serde_json::json!({"platform_request_interval":"0","platform_max_concurrent_requests":"1","loop_time_seconds":"4500"}).as_object().unwrap().clone()).unwrap();
+        let records = ["a-normal", "b-normal", "z-resumed"]
+            .into_iter()
+            .map(|id| {
+                let mut r =
+                    Recording::new(id.into(), format!("http://127.0.0.1:1/{id}.mp4"), id.into());
+                r.only_notify_no_record = Some(true);
+                r
+            })
+            .collect();
+        state.store.insert(records).await.unwrap();
+        let held = state
+            .scheduler
+            .pacer
+            .enqueue("custom", false)
+            .unwrap()
+            .try_acquire(1, Duration::ZERO)
+            .unwrap();
+        let guard = state.store.lifecycle_guard().await;
+        let (stop, rx) = tokio::sync::watch::channel(false);
+        let run = tokio::spawn(state.scheduler.clone().run(rx));
+        settle().await;
+        state.scheduler.request_monitoring(["z-resumed".into()]);
+        settle().await;
+        drop(held);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        settle().await;
+        assert_eq!(
+            state
+                .scheduler
+                .checks
+                .lock()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            ["z-resumed"]
+        );
+        drop(guard);
+        settle().await;
+        for _ in 0..4 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            settle().await;
+        }
+        assert!(state.store.all().await.iter().all(|r| r.is_live));
+        stop.send(true).unwrap();
+        run.await.unwrap();
+        crate::api::shutdown(&state).await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]

@@ -358,7 +358,17 @@ try {
   console.log(JSON.stringify(result));
   process.exit(0);
 } catch(error) {
-  await fs.writeFile(path.join(output,'ui-result.json'),JSON.stringify({passed:false,error:String(error),stack:error.stack,diagnostic,url:page?.url(),body:page?await page.locator('body').innerText().catch(()=>null):null},null,2));
+  const player = await page?.evaluate(() => {
+    const video=document.querySelector('video'), slider=document.querySelector('.seek-range');
+    return video ? {time:video.currentTime,duration:video.duration,paused:video.paused,seeking:video.seeking,
+      readyState:video.readyState,networkState:video.networkState,error:video.error?.code??null,
+      buffered:Array.from({length:video.buffered.length},(_,i)=>[video.buffered.start(i),video.buffered.end(i)]),
+      data:{...video.dataset},slider:slider?{value:slider.value,max:slider.max,rect:slider.getBoundingClientRect().toJSON()}:null,
+      state:document.querySelector('.media-preview')?.dataset.playerState,visibility:document.visibilityState} : null;
+  }).catch(()=>null);
+  const transport = await page?.evaluate(()=>window.__STREAMCAP_NATIVE_SMOKE__).catch(()=>null);
+  await page?.screenshot({path:path.join(output,'failure.png'),animations:'disabled'}).catch(()=>{});
+  await fs.writeFile(path.join(output,'ui-result.json'),JSON.stringify({passed:false,error:String(error),stack:error.stack,diagnostic,player,transport,url:page?.url(),body:page?await page.locator('body').innerText().catch(()=>null):null},null,2));
   console.error(String(error));process.exit(1);
 }
 '@

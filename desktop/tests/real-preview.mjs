@@ -84,6 +84,13 @@ try {
   await page.waitForFunction(()=>{const v=document.querySelector('video');return v?.videoWidth>0&&v.readyState>=2&&v.currentTime>.2;},null,{timeout:20000});
   const info=await page.locator('video').evaluate(v=>({duration:Number(v.dataset.timelineDuration)||v.duration,width:v.videoWidth,height:v.videoHeight,mode:v.dataset.playerMode,segmentLoads:Number(v.dataset.segmentLoads),bufferedSeconds:Array.from({length:v.buffered.length},(_,i)=>v.buffered.end(i)-v.buffered.start(i)).reduce((a,b)=>a+b,0)}));
   const result={file:relative(mediaRoot,file.file),sha256:file.sha256,firstFrameMs:Math.round(performance.now()-began),...info,seeks:[]};report.cases.push(result);
+  await page.locator('video').evaluate(video=>{
+    const trace=window.streamcapPlaybackTrace=[];
+    const snapshot=(event,extra={})=>{trace.push({event,at:performance.now(),time:video.currentTime,paused:video.paused,seeking:video.seeking,readyState:video.readyState,state:document.querySelector('.media-preview')?.dataset.playerState,data:{...video.dataset},...extra});if(trace.length>160)trace.shift();};
+    for(const name of ['play','playing','pause','seeking','seeked','waiting','ended','emptied'])video.addEventListener(name,()=>snapshot(name));
+    for(const name of ['play','pause']){const original=video[name];video[name]=function(...args){snapshot(name+'()', {stack:new Error().stack});return original.apply(this,args);};}
+    document.querySelector('.seek-play').addEventListener('click',()=>snapshot('play-button-click'));
+  });
   await modal.getByRole('button',{name:'暂停',exact:true}).click();const slider=modal.getByRole('slider',{name:'播放进度',exact:true});
   assert.equal(await page.locator('video').evaluate(v=>typeof v.requestVideoFrameCallback),'function','performance acceptance requires presentation callbacks');
   // Keep a real pointer path for geometry and input behavior; time decoding separately.
@@ -96,7 +103,7 @@ try {
   for(const fraction of [.75,.2,.9,.08,.53,.31,.83,.12,.67,.42,.96,.26,.62,.16,.88,.37,.72,.04,.47,.58]){
    const measurement=await measureSeek(info.duration*fraction);assert.equal(measurement.error,undefined,JSON.stringify(measurement));
    await page.waitForFunction(()=>!document.querySelector('.media-preview').classList.contains('is-seeking'));
-   assert.equal(await page.locator('video').evaluate(v=>v.paused),true);result.seeks.push(measurement);
+   assert.equal(await page.locator('video').evaluate(v=>v.paused),true,'paused intent changed at target '+measurement.target);result.seeks.push(measurement);
   }
   const latencies=result.seeks.map(s=>s.decodedFrameMs);
   result.seekSummary={count:latencies.length,p50Ms:percentile(latencies,.5),p95Ms:percentile(latencies,.95),maxMs:Math.max(...latencies)};
@@ -107,7 +114,8 @@ try {
  }
  assert.deepEqual(report.errors,[]);report.passed=true;
 }catch(e){
- report.failure=String(e);
+ report.failure=String(e);report.stack=e.stack;
+ report.playbackTrace=await page?.evaluate(()=>window.streamcapPlaybackTrace).catch(()=>null);
  report.playerFailure=await page?.evaluate(()=>{const v=document.querySelector('video');return v?{time:v.currentTime,duration:v.duration,paused:v.paused,seeking:v.seeking,readyState:v.readyState,networkState:v.networkState,width:v.videoWidth,height:v.videoHeight,error:v.error?.code??null,buffered:Array.from({length:v.buffered.length},(_,i)=>[v.buffered.start(i),v.buffered.end(i)]),data:{...v.dataset},state:document.querySelector('.media-preview')?.dataset.playerState,visibility:document.visibilityState}:null;}).catch(()=>null);
  await page?.screenshot({path:join(output,'failure.png')}).catch(()=>{});process.exitCode=1;
 }

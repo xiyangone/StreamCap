@@ -140,7 +140,7 @@ pub fn MediaPlayer(#[prop(into)] path: Signal<String>) -> impl IntoView {
 
 #[derive(Clone)]
 enum PreviewTarget {
-    Recording(Box<Recording>),
+    Recording(String),
     File(StorageItem),
 }
 
@@ -153,7 +153,7 @@ impl PreviewState {
     pub fn open_recording(self, recording: Recording) {
         self.minimized.set(false);
         self.target
-            .set(Some(PreviewTarget::Recording(Box::new(recording))));
+            .set(Some(PreviewTarget::Recording(recording.rec_id)));
     }
     pub fn open_file(self, file: StorageItem) {
         self.minimized.set(false);
@@ -179,16 +179,36 @@ pub fn PreviewHost() -> impl IntoView {
     let preview = preview_state();
     let state = gateway::app_state();
     let target = Signal::derive(move || match preview.target.get() {
-        Some(PreviewTarget::Recording(recording)) => Some(*recording),
+        Some(PreviewTarget::Recording(id)) => state.recording(&id),
         _ => None,
+    });
+    Effect::new(move |_| {
+        if let Some(PreviewTarget::Recording(id)) = preview.target.get() {
+            if state.recording(&id).is_none() && !state.loading.get() {
+                preview.close();
+            }
+        }
     });
     let files = RwSignal::new(Vec::<RecordingFile>::new());
     let playing = RwSignal::new(String::new());
+    Effect::new(move |_| {
+        if target.get().is_some_and(|rec| !rec.is_live) && playing.get().starts_with("live:") {
+            playing.set(String::new());
+        }
+    });
     let loading = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
     let revision = RwSignal::new(0_u32);
+    let request = StoredValue::new_local(None::<web_sys::AbortController>);
+    on_cleanup(move || {
+        request.with_value(|controller| {
+            if let Some(controller) = controller {
+                controller.abort();
+            }
+        })
+    });
     let target_key = Memo::new(move |_| match preview.target.get() {
-        Some(PreviewTarget::Recording(recording)) => format!("recording:{}", recording.rec_id),
+        Some(PreviewTarget::Recording(id)) => format!("recording:{id}"),
         Some(PreviewTarget::File(file)) => format!("file:{}", file.path),
         None => String::new(),
     });
@@ -205,6 +225,11 @@ pub fn PreviewHost() -> impl IntoView {
     });
     Effect::new(move |_| {
         let _ = target_key.get();
+        request.update_value(|controller| {
+            if let Some(controller) = controller.take() {
+                controller.abort();
+            }
+        });
         let current_id = target.get_untracked().map(|recording| recording.rec_id);
         let generation = revision.get_untracked().wrapping_add(1);
         revision.set(generation);
@@ -220,12 +245,26 @@ pub fn PreviewHost() -> impl IntoView {
         };
         loading.set(true);
         leptos::task::spawn_local(async move {
-            // One request per target; slow disks must not invalidate their own responses.
+            // One in-flight request per target. A request timeout must not cancel future polls.
             loop {
-                let result = gateway::fetch_recording_files(&rec_id).await;
-                if revision.try_get_untracked() != Some(generation) {
+                if revision.try_get_untracked() != Some(generation)
+                    || state.recording_untracked(&rec_id).is_none()
+                {
                     return;
                 }
+                let Ok(abort) = web_sys::AbortController::new() else {
+                    loading.set(false);
+                    error.set(Some(t("无法创建请求").into()));
+                    return;
+                };
+                request.set_value(Some(abort.clone()));
+                let result = gateway::fetch_recording_files(&rec_id, abort).await;
+                if revision.try_get_untracked() != Some(generation)
+                    || state.recording_untracked(&rec_id).is_none()
+                {
+                    return;
+                }
+                request.set_value(None);
                 match result {
                     Ok(result) => {
                         error.set(None);

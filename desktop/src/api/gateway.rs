@@ -1474,11 +1474,15 @@ pub fn video_url(path: &str) -> String {
     }
     format!("{base}/api/videos?path={}", encode(path))
 }
-pub async fn fetch_recording_files(id: &str) -> Result<RecordingFiles, String> {
-    call(
+pub async fn fetch_recording_files(
+    id: &str,
+    abort: web_sys::AbortController,
+) -> Result<RecordingFiles, String> {
+    call_controlled(
         "GET",
         &format!("/api/recordings/{}/files", encode(id)),
         None,
+        Some(abort),
     )
     .await
 }

@@ -136,6 +136,27 @@ try {
       await page.evaluate(()=>window.endPreview());assert.equal(await page.evaluate(()=>window.playerCount()),0);
     });
   }
+  await step('late media events cannot overwrite explicit pause or play intent',async()=>{
+    await page.evaluate(()=>window.beginPreview('sample.mp4'));
+    await page.waitForFunction(()=>{const v=document.querySelector('video');return v.currentTime>.2&&!v.paused;});
+    await page.getByRole('button',{name:'暂停',exact:true}).click();
+    const stalePlayLabel=await page.locator('video').evaluate(async v=>{
+      await new Promise(resolve=>setTimeout(resolve,50));
+      v.dispatchEvent(new Event('play'));v.dispatchEvent(new Event('playing'));
+      return document.querySelector('.seek-play').getAttribute('aria-label');
+    });
+    assert.equal(stalePlayLabel,'播放','delayed notifications cannot rewrite the last user command');
+    assert.equal(await page.locator('video').evaluate(v=>v.paused),true);
+    assert.equal(await page.getByRole('button',{name:'播放',exact:true}).count(),1,'a delayed play notification must not replace paused intent');
+    await page.evaluate(()=>{const r=document.querySelector('.seek-range');r.value='9';r.dispatchEvent(new Event('input',{bubbles:true}));r.dispatchEvent(new Event('change',{bubbles:true}));});
+    await page.waitForFunction(()=>!document.querySelector('.media-preview').classList.contains('is-seeking'));
+    assert.equal(await page.locator('video').evaluate(v=>v.paused),true,'seeking must preserve explicit pause');
+    await page.getByRole('button',{name:'播放',exact:true}).click();
+    await page.waitForFunction(()=>!document.querySelector('video').paused);
+    await page.locator('video').evaluate(v=>v.dispatchEvent(new Event('pause')));
+    assert.equal(await page.getByRole('button',{name:'暂停',exact:true}).count(),1,'a delayed pause notification must not replace play intent');
+    await page.evaluate(()=>window.endPreview());
+  });
   await step('growing TS distant scrubs coalesce work and display a frame before release', async()=>{
     growing=true;await page.evaluate(()=>window.beginPreview('sample.ts'));
     await page.waitForFunction(()=>{const v=document.querySelector('video');return v.readyState>=2&&Number(v.dataset.timelinePosition)>15.1;});

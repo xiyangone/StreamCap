@@ -516,6 +516,122 @@ impl KuaishouResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "explicit STREAMCAP_PROBE_CONFIG required; one saved monitored Kuaishou page, no login or recording"]
+    async fn selected_kuaishou_conflict_readonly_probe() {
+        use crate::platforms::http::PlatformHttp;
+        use serde_json::json;
+        use std::{path::PathBuf, time::Duration};
+        let dir = PathBuf::from(std::env::var("STREAMCAP_PROBE_CONFIG").expect("explicit profile"));
+        assert!(dir.is_absolute());
+        let names = ["recordings.json", "user_settings.json", "cookies.json"];
+        let before: Vec<_> = names
+            .iter()
+            .map(|name| std::fs::read(dir.join(name)).unwrap())
+            .collect();
+        let records: Value = serde_json::from_slice(&before[0]).unwrap();
+        let settings: Value = serde_json::from_slice(&before[1]).unwrap();
+        let cookies: Value = serde_json::from_slice(&before[2]).unwrap();
+        let selected = records
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .find(|(_, r)| r["platform_key"] == "kuaishou" && r["monitor_status"] == true);
+        let Some((index, record)) = selected else {
+            println!(
+                "KUAISHOU_CONFLICT_PROBE {}",
+                json!({"probeCompleted":false,"reason":"no monitored saved target"})
+            );
+            return;
+        };
+        let url = reqwest::Url::parse(record["url"].as_str().unwrap()).unwrap();
+        assert_eq!(url.host_str(), Some("live.kuaishou.com"));
+        assert_eq!(url.scheme(), "https");
+        let cookie = cookies["kuaishou"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty());
+        let proxy = if settings["enable_proxy"] == true {
+            Some(
+                settings["proxy_address"]
+                    .as_str()
+                    .filter(|s| !s.trim().is_empty())
+                    .expect("configured proxy required"),
+            )
+        } else {
+            None
+        };
+        let http =
+            PlatformHttp::new("kuaishou.com", proxy, cookie, Duration::from_secs(20)).unwrap();
+        let mut report = json!({"index":index,"requests":1,"cookieProvided":cookie.is_some(),"authentication":"not independently verified","transport":"unverified","businessReadable":false,"targetDataPresent":false,"conflictingSample":false});
+        match http.get(url.clone(), "https://live.kuaishou.com/").await {
+            Ok(page) => {
+                report["transport"] = json!("reachable");
+                if let Some(state) = crate::platforms::kuaishou_login::initial_state(&page) {
+                    let room = state
+                        .get("room")
+                        .or_else(|| state.pointer("/liveroom/playList/0"))
+                        .unwrap_or(&Value::Null);
+                    let expected = url
+                        .path()
+                        .trim_end_matches('/')
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or("");
+                    let identity =
+                        room.pointer("/author/id").and_then(Value::as_str) == Some(expected);
+                    report["targetDataPresent"] = json!(identity);
+                    let flag = room["isLiving"]
+                        .as_bool()
+                        .or_else(|| room.pointer("/liveStream/living").and_then(Value::as_bool));
+                    fn has_url(value: &Value) -> bool {
+                        match value {
+                            Value::Object(map) => {
+                                map.get("url").and_then(Value::as_str).is_some_and(|s| {
+                                    s.starts_with("https://") || s.starts_with("http://")
+                                }) || map.values().any(has_url)
+                            }
+                            Value::Array(items) => items.iter().any(has_url),
+                            _ => false,
+                        }
+                    }
+                    let streams = has_url(&room["liveStream"]);
+                    report["explicitLive"] = json!(flag);
+                    report["streamAddressPresent"] = json!(streams);
+                    report["conflictingSample"] = json!(identity && flag == Some(false) && streams);
+                }
+                match parse_page(&page, None) {
+                    Ok(info) => {
+                        report["businessReadable"] = json!(true);
+                        report["parsedLive"] = json!(info.is_live);
+                    }
+                    Err(error) => {
+                        report["accessState"] = json!(access_state(&error));
+                        report["parserError"] = json!(error);
+                    }
+                }
+            }
+            Err(error) => {
+                report["error"] = json!(error);
+            }
+        }
+        for (name, bytes) in names.iter().zip(before) {
+            assert_eq!(std::fs::read(dir.join(name)).unwrap(), bytes);
+        }
+        report["profileUnchanged"] = json!(true);
+        println!("KUAISHOU_CONFLICT_PROBE {report}");
+    }
+
+    #[test]
+    fn stream_addresses_alone_do_not_override_explicit_offline_or_access_failures() {
+        let mut room = serde_json::json!({"author":{"id":"fixture","name":"Fixture"},"isLiving":false,"liveStream":{"playUrls":{"h264":{"adaptationSet":{"representation":[{"url":"https://example.invalid/stale.flv"}]}}}}});
+        assert!(!parse_room(&room, None).unwrap().is_live);
+        room["isLiving"] = serde_json::json!(true);
+        assert!(parse_room(&room, None).unwrap().is_live);
+        room["errorType"] = serde_json::json!({"code":400002,"title":"请完成滑块验证"});
+        assert!(parse_room(&room, None).is_err());
+    }
     #[tokio::test]
     async fn verified_page_transport_does_not_replace_saved_identity_and_reset_discards_it() {
         let resolver = KuaishouResolver::default();

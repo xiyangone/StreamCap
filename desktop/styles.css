@@ -847,3 +847,13 @@ textarea.input { resize: vertical; line-height: 1.65; }
 .modal-minimized .media-preview:not(:fullscreen) .seek-button { width: 32px; min-width: 32px; height: 34px; }
 .modal-minimized .audio-art { min-height: 90px; padding: 16px; }
 @media(max-width:620px) { .modal.preview-shell.modal-minimized { right: 12px; bottom: 88px; } }
+
+/* Media sorting stays beside filters and wraps without blocking async folder sizes. */
+.file-filter-row { flex-wrap: wrap; }
+.file-sort-controls { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+.file-sort-controls .input { width: 110px; min-height: 36px; font-size: 12px; }
+.file-sort-controls .button { min-height: 36px; }
+.file-sort-controls > span { white-space: nowrap; }
+@media (max-width: 600px) {
+  .file-sort-controls { width: 100%; justify-content: flex-end; }
+}

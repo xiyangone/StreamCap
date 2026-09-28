@@ -107,6 +107,7 @@ export function attachMedia(video, apiOrigin, relativePath, onState, onCapture) 
     video.dataset.timelineDuration = String(total);
     video.dataset.seekTarget = String(scrubbing ? dragTarget : acceptedTarget ?? actual);
     video.dataset.scrubbing = String(scrubbing);
+    video.dataset.playbackIntent = wantedPlay ? 'play' : 'pause';
   };
   const animate = () => {
     animation = null;
@@ -119,7 +120,9 @@ export function attachMedia(video, apiOrigin, relativePath, onState, onCapture) 
     if (disposed || !wantedPlay || scrubbing) return;
     if (changing) { settle(); return; }
     const version = generation;
-    video.play().catch(error => {
+    video.play().then(() => {
+      if (!disposed && version === generation && (!wantedPlay || scrubbing)) video.pause();
+    }).catch(error => {
       if (!disposed && version === generation && error.name !== 'AbortError' && !scrubbing) {
         if (error.name !== 'NotAllowedError') { playbackFailure(); return; }
         wantedPlay = false; render(); update('ready', label('点击播放继续', 'Click Play to continue'));
@@ -454,9 +457,18 @@ export function attachMedia(video, apiOrigin, relativePath, onState, onCapture) 
   listen(video, 'progress', () => { renderBuffer(); settle(); });
   listen(video, 'loadeddata', settle); listen(video, 'seeked', settle); listen(video, 'canplay', settle);
   listen(video, 'canplaythrough', settle); listen(video, 'suspend', settle);
-  listen(video, 'play', () => { if (!changing && !scrubbing) wantedPlay = true; startAnimation(); render(); });
-  listen(video, 'pause', () => { if (!changing && !scrubbing && !video.ended) wantedPlay = false; render(); });
-  listen(video, 'playing', () => { settle(); if (!changing) update('playing'); startAnimation(); });
+  // Media events are asynchronous observations, not user commands. Internal pauses and
+  // queued play events can arrive after a seek settles or after the user pressed Pause.
+  // Only the shared controls change intent; stale events must not restart paused media.
+  listen(video, 'play', () => {
+    if (!wantedPlay || scrubbing) video.pause();
+    startAnimation(); render();
+  });
+  listen(video, 'pause', () => { if (video.paused && !changing) update('ready'); render(); });
+  listen(video, 'playing', () => {
+    if (!wantedPlay || scrubbing) video.pause();
+    settle(); if (!changing && !video.paused) update('playing'); startAnimation(); render();
+  });
   listen(video, 'waiting', () => {
     if (disposed || changing || scrubbing || !wantedPlay || video.ended || mode === 'live') return;
     changing = true; loadKind = 'buffer'; acceptedTarget = null; seekStarted = 0;

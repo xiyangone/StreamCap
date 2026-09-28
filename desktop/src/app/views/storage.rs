@@ -27,6 +27,76 @@ fn kind(item: &StorageItem) -> &'static str {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SortKey {
+    Name,
+    Modified,
+    Size,
+}
+impl SortKey {
+    fn parse(value: &str) -> Self {
+        match value {
+            "modified" => Self::Modified,
+            "size" => Self::Size,
+            _ => Self::Name,
+        }
+    }
+    fn value(self) -> &'static str {
+        match self {
+            Self::Name => "name",
+            Self::Modified => "modified",
+            Self::Size => "size",
+        }
+    }
+}
+fn sort_preference(value: &str) -> (SortKey, bool) {
+    match value.split_once(':') {
+        Some((key @ ("name" | "modified" | "size"), direction @ ("asc" | "desc"))) => {
+            (SortKey::parse(key), direction == "desc")
+        }
+        _ => (SortKey::Name, false),
+    }
+}
+fn stored_sort() -> (SortKey, bool) {
+    #[cfg(target_arch = "wasm32")]
+    if let Some(value) = web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .and_then(|storage| storage.get_item("streamcap.mediaSort").ok().flatten())
+    {
+        return sort_preference(&value);
+    }
+    sort_preference("")
+}
+fn sort_items(items: &mut [StorageItem], key: SortKey, descending: bool) {
+    items.sort_by(|a, b| {
+        let dirs = b.is_dir.cmp(&a.is_dir);
+        if dirs != std::cmp::Ordering::Equal {
+            return dirs;
+        }
+        let known = |item: &StorageItem| match key {
+            SortKey::Name => true,
+            SortKey::Size => item.size_known,
+            SortKey::Modified => item.modified.is_some_and(f64::is_finite),
+        };
+        let availability = known(b).cmp(&known(a));
+        if availability != std::cmp::Ordering::Equal {
+            return availability;
+        }
+        let order = match key {
+            SortKey::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+            SortKey::Size => a.size.cmp(&b.size),
+            SortKey::Modified => a
+                .modified
+                .unwrap_or_default()
+                .total_cmp(&b.modified.unwrap_or_default()),
+        };
+        let order = if descending { order.reverse() } else { order };
+        order
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+}
+
 #[component]
 pub fn StorageView() -> impl IntoView {
     let state = gateway::app_state();
@@ -46,6 +116,19 @@ pub fn StorageView() -> impl IntoView {
     let error = RwSignal::new(None::<String>);
     let keyword = RwSignal::new(String::new());
     let filter = RwSignal::new("all".to_string());
+    let (initial_sort, initial_descending) = stored_sort();
+    let sort = RwSignal::new(initial_sort);
+    let descending = RwSignal::new(initial_descending);
+    Effect::new(move |_| {
+        let preference = format!(
+            "{}:{}",
+            sort.get().value(),
+            if descending.get() { "desc" } else { "asc" }
+        );
+        if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+            let _ = storage.set_item("streamcap.mediaSort", &preference);
+        }
+    });
     let preview = preview_state();
     let deleting = RwSignal::new(None::<StorageItem>);
     let confirm = RwSignal::new(false);
@@ -140,14 +223,16 @@ pub fn StorageView() -> impl IntoView {
     let visible = move || {
         let text = keyword.get().trim().to_lowercase();
         let mode = filter.get();
-        listing
+        let mut items = listing
             .get()
             .items
             .into_iter()
             .filter(|item| {
                 (mode == "all" || kind(item) == mode) && item.name.to_lowercase().contains(&text)
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        sort_items(&mut items, sort.get(), descending.get());
+        items
     };
     let enter = Callback::new(move |item: StorageItem| {
         if item.is_dir {
@@ -198,7 +283,7 @@ pub fn StorageView() -> impl IntoView {
                 <div class="file-browser-toolbar"><nav class="file-breadcrumb" aria-label=t("媒体库路径")><button aria-label=t("返回媒体库根目录") on:click=move |_| subfolder.set(String::new())><Icon name="folder" size=17 />{t("媒体库")}</button>
                     {move || { let path = subfolder.get(); let mut prefix = String::new(); path.split('/').filter(|p| !p.is_empty()).map(|part| { if !prefix.is_empty() { prefix.push('/'); } prefix.push_str(part); let target = prefix.clone(); view! { <Icon name="chevron" size=13 /><button on:click=move |_| subfolder.set(target.clone())>{part.to_string()}</button> } }).collect_view() }}
                 </nav><label class="search-field compact"><Icon name="search" size=17 /><input aria-label=t("搜索文件") placeholder=t("搜索当前目录…") prop:value=move || keyword.get() on:input=move |e| keyword.set(event_target_value(&e)) /></label></div>
-                <div class="file-filter-row"><div class="mini-tabs" role="group" aria-label=t("文件类型")>{[("all",t("全部文件")),("video",t("视频")),("audio",t("音频")),("folder",t("文件夹"))].into_iter().map(|(value,label)| view! { <button class:active=move || filter.get() == value aria-pressed=move || (filter.get() == value).to_string() on:click=move |_| filter.set(value.into())>{label}</button> }).collect_view()}</div><span>{move || crate::tr_format!("{} 项", visible().len())}</span></div>
+                <div class="file-filter-row"><div class="mini-tabs" role="group" aria-label=t("文件类型")>{[("all",t("全部文件")),("video",t("视频")),("audio",t("音频")),("folder",t("文件夹"))].into_iter().map(|(value,label)| view! { <button class:active=move || filter.get() == value aria-pressed=move || (filter.get() == value).to_string() on:click=move |_| filter.set(value.into())>{label}</button> }).collect_view()}</div><div class="file-sort-controls"><select class="input" aria-label=t("媒体排序") prop:value=move || sort.get().value() on:change=move |e| sort.set(SortKey::parse(&event_target_value(&e)))><option value="name">{t("名称")}</option><option value="modified">{t("修改时间")}</option><option value="size">{t("大小")}</option></select><button class="button secondary small" type="button" aria-label=t("切换排序方向") aria-pressed=move || descending.get().to_string() on:click=move |_| descending.update(|value| *value = !*value)>{move || if descending.get() { t("降序") } else { t("升序") }}</button><span>{move || crate::tr_format!("{} 项", visible().len())}</span></div></div>
                 <Show when=move || loading.get()><div class="loading-state"><span class="spinner" />{t("正在读取文件…")}</div></Show>
                 <Show when=move || error.get().is_some()><div class="inline-error" role="alert"><Icon name="alert" /><p>{move || error.get().unwrap_or_default()}</p><button class="button secondary small" on:click=move |_| reload.update(|n| *n = n.wrapping_add(1))>{t("重试")}</button></div></Show>
                 <Show when=move || !loading.get() && error.get().is_none()>
@@ -220,5 +305,50 @@ pub fn StorageView() -> impl IntoView {
             <Show when=move || !state.media_jobs.get().is_empty()><section class="media-jobs glass" aria-label=t("媒体处理任务")><h3>{t("媒体处理")}</h3>{move || state.media_jobs.get().into_iter().rev().map(|job| { let percent=job.stage_percent; let progress=crate::app::labels::media_progress(&job,state.now.get()); view! { <div class="media-job-row" data-state=job.state.clone()><span class="media-job-source">{job.source}</span><strong>{crate::app::i18n::message(job.message)}</strong><span class="media-job-detail">{progress}</span>{percent.map(|percent|view!{<progress aria-label=t("本阶段进度") max="100" value=percent.to_string() />})}</div> } }).collect_view()}</section></Show>
         </div>
         <ConfirmDialog open=confirm title=t("移至回收站") confirm_text=t("移至回收站") busy_text=t("正在回收…") hint=t("可在系统回收站恢复。无法回收时，原文件会保留。") description=Signal::derive(move || deleting.get().map(|item| if item.is_dir { crate::tr_format!("将移至回收站：“{}”及其目录内容。",item.name) } else { crate::tr_format!("将移至回收站：“{}”（{}）。",item.name,human_size(item.size)) }).unwrap_or_default()) busy=busy on_confirm=remove />
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn item(name: &str, dir: bool, size: u64, known: bool, modified: Option<f64>) -> StorageItem {
+        StorageItem {
+            name: name.into(),
+            path: name.into(),
+            is_dir: dir,
+            size,
+            size_known: known,
+            size_error: None,
+            modified,
+        }
+    }
+    #[test]
+    fn sort_preferences_reject_dirty_storage() {
+        assert_eq!(sort_preference("size:desc"), (SortKey::Size, true));
+        for value in ["", "other:desc", "size:broken", "name", "name:desc:extra"] {
+            assert_eq!(sort_preference(value), (SortKey::Name, false));
+        }
+    }
+    #[test]
+    fn sorting_keeps_directories_first_and_unknown_values_last() {
+        let mut items = vec![
+            item("unknown", false, 0, false, None),
+            item("large", false, 30, true, Some(5.0)),
+            item("small", false, 10, true, Some(9.0)),
+            item("folder", true, 1, true, None),
+        ];
+        for desc in [false, true] {
+            sort_items(&mut items, SortKey::Size, desc);
+            assert_eq!(items[0].name, "folder");
+            assert_eq!(items[3].name, "unknown");
+            assert_eq!(items[1].name, if desc { "large" } else { "small" });
+        }
+        sort_items(&mut items, SortKey::Modified, true);
+        assert_eq!(items[1].name, "small");
+        assert_eq!(items[3].name, "unknown");
+        items[3].size = 50;
+        items[3].size_known = true;
+        sort_items(&mut items, SortKey::Size, true);
+        assert_eq!(items[1].name, "unknown");
     }
 }
