@@ -71,20 +71,58 @@ struct Waiter {
     queued: Instant,
 }
 impl GateState {
-    fn selected(&self) -> Option<u64> {
-        let normal = self.waiters.iter().find(|w| !w.priority);
+    fn next_waiter<'a>(
+        normal: Option<&'a Waiter>,
+        priority: Option<&'a Waiter>,
+        streak: usize,
+        now: Instant,
+    ) -> Option<&'a Waiter> {
         if let Some(normal) = normal {
-            if self.priority_streak >= PRIORITY_BURST
-                || (self.priority_streak > 0 && normal.queued.elapsed() >= AGING)
+            if streak >= PRIORITY_BURST
+                || (streak > 0 && now.saturating_duration_since(normal.queued) >= AGING)
             {
-                return Some(normal.id);
+                return Some(normal);
             }
         }
-        self.waiters
-            .iter()
-            .find(|w| w.priority)
-            .or(normal)
-            .map(|w| w.id)
+        priority.or(normal)
+    }
+    fn after_admission(streak: usize, priority: bool) -> usize {
+        if priority {
+            streak.saturating_add(1).min(PRIORITY_BURST)
+        } else {
+            0
+        }
+    }
+    fn selected(&self) -> Option<u64> {
+        Self::next_waiter(
+            self.waiters.iter().find(|w| !w.priority),
+            self.waiters.iter().find(|w| w.priority),
+            self.priority_streak,
+            Instant::now(),
+        )
+        .map(|w| w.id)
+    }
+    fn planned_ranks(&self) -> HashMap<u64, usize> {
+        let now = Instant::now();
+        let mut streak = self.priority_streak;
+        let mut normal = self.waiters.iter().filter(|w| !w.priority).peekable();
+        let mut priority = self.waiters.iter().filter(|w| w.priority).peekable();
+        let mut ranks = HashMap::with_capacity(self.waiters.len());
+        while let Some(waiter) = Self::next_waiter(
+            normal.peek().copied(),
+            priority.peek().copied(),
+            streak,
+            now,
+        ) {
+            ranks.insert(waiter.id, ranks.len());
+            streak = Self::after_admission(streak, waiter.priority);
+            if waiter.priority {
+                priority.next();
+            } else {
+                normal.next();
+            }
+        }
+        ranks
     }
 }
 pub(crate) struct PendingPermit {
@@ -107,6 +145,9 @@ impl PendingPermit {
         if changed {
             self.gate.changed.notify_waiters();
         }
+    }
+    pub(crate) fn rank_in(&self, snapshot: &HashMap<u64, usize>) -> usize {
+        snapshot.get(&self.ticket).copied().unwrap_or(usize::MAX)
     }
     pub(crate) fn rank(&self) -> usize {
         let state = self.gate.state.lock().expect("platform gate");
@@ -132,11 +173,7 @@ impl PendingPermit {
         }
         let index = state.waiters.iter().position(|w| w.id == self.ticket)?;
         let waiter = state.waiters.remove(index)?;
-        state.priority_streak = if waiter.priority {
-            state.priority_streak.saturating_add(1).min(PRIORITY_BURST)
-        } else {
-            0
-        };
+        state.priority_streak = GateState::after_admission(state.priority_streak, waiter.priority);
         state.active += 1;
         state.next = now + spacing;
         drop(state);
@@ -221,6 +258,13 @@ impl Pacer {
                 ready_at: Some(now),
             }
         }
+    }
+    pub(crate) fn queue_ranks(&self, key: &str) -> HashMap<u64, usize> {
+        self.gate(key)
+            .state
+            .lock()
+            .expect("platform gate")
+            .planned_ranks()
     }
     pub(crate) fn enqueue(&self, key: &str, priority: bool) -> Result<PendingPermit, String> {
         let gate = self.gate(key);
@@ -320,6 +364,36 @@ impl Pacer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn planned_ranks_match_actual_admission_for_priority_bursts_and_aging() {
+        for aged in [false, true] {
+            for priorities in [
+                [false, false, true, true, true, true],
+                [true, false, true, false, true, true],
+            ] {
+                let pacer = Pacer::default();
+                let tickets: Vec<_> = priorities
+                    .into_iter()
+                    .map(|p| pacer.enqueue("a", p).unwrap())
+                    .collect();
+                if aged {
+                    tokio::time::advance(AGING).await;
+                }
+                let ranks = pacer.queue_ranks("a");
+                let mut order: Vec<_> = tickets.iter().collect();
+                order.sort_by_key(|t| t.rank_in(&ranks));
+                for (expected, ticket) in order.into_iter().enumerate() {
+                    assert_eq!(ticket.rank_in(&ranks), expected);
+                    drop(
+                        ticket
+                            .try_acquire(1, Duration::ZERO)
+                            .expect("snapshot must match actual admission"),
+                    );
+                }
+            }
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn priority_is_admitted_before_slots_but_normal_work_cannot_starve() {
         let pacer = Pacer::default();

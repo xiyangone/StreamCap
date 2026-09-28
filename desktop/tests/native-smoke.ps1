@@ -1,6 +1,7 @@
 # Isolated full-Tauri lifecycle smoke. Never starts an installed executable or accesses its profile.
 param([string]$Executable = (Join-Path $PSScriptRoot '..\src-tauri\target\release\streamcap-tauri.exe'),[ValidateSet('Choice','Tray')][string]$ExitMode='Choice')
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'process-identity.ps1')
 $Executable = (Resolve-Path -LiteralPath $Executable).Path
 $desktop = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $targetRoot = [IO.Path]::GetFullPath((Join-Path $desktop 'src-tauri\target')) + [IO.Path]::DirectorySeparatorChar
@@ -27,31 +28,6 @@ $process = Start-Process -FilePath $Executable -ArgumentList $arguments -Working
 $owned = @{}
 $probeProcess = $null
 $rootIdentity = $null
-function Test-ProcessInstance($Left, $Right) {
-    return $null -ne $Left -and $null -ne $Right -and
-        $null -ne $Left.CreationDate -and $null -ne $Right.CreationDate -and
-        [int]$Left.ProcessId -eq [int]$Right.ProcessId -and
-        $Left.CreationDate.ToUniversalTime() -eq $Right.CreationDate.ToUniversalTime()
-}
-function Add-OwnedProcessSnapshot([object[]]$Snapshot, $Root, [hashtable]$Owned) {
-    $current = @{}
-    foreach ($p in $Snapshot) {$current[[int]$p.ProcessId] = $p}
-    do {
-        $changed = $false
-        foreach ($p in $Snapshot) {
-            if ([int]$p.ProcessId -eq [int]$Root.ProcessId -or $null -eq $p.CreationDate) {continue}
-            $parentId = [int]$p.ParentProcessId
-            $parent = if ($parentId -eq [int]$Root.ProcessId) {$Root} else {$Owned[$parentId]}
-            # Parent PIDs survive their original process and may refer to a newer, unrelated instance.
-            if (-not (Test-ProcessInstance $parent $current[$parentId])) {continue}
-            if ($p.CreationDate.ToUniversalTime() -lt $parent.CreationDate.ToUniversalTime()) {continue}
-            if (-not (Test-ProcessInstance $Owned[[int]$p.ProcessId] $p)) {
-                $Owned[[int]$p.ProcessId] = $p
-                $changed = $true
-            }
-        }
-    } while ($changed)
-}
 function Update-OwnedProcesses {
     $all = @(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CreationDate)
     Add-OwnedProcessSnapshot $all $rootIdentity $owned
@@ -84,6 +60,7 @@ try {
         Start-Sleep -Milliseconds 100
     }
     if (-not $debugOwner -or -not $owned.ContainsKey([int]$debugOwner.OwningProcess)) {throw 'Debug listener is not owned by this isolated application; refusing to attach'}
+    $debugIdentity=Get-OwnedWebViewListener $rootIdentity $debugPort
     $probe = @'
 import { chromium } from 'playwright';
 import assert from 'node:assert/strict';
@@ -410,7 +387,7 @@ try {
     if ($listening) {throw 'HTTP listener remained after application exit'}
     if (Get-NetTCPConnection -State Listen -LocalPort $debugPort -ErrorAction SilentlyContinue) {throw 'WebView2 debug listener remained after application exit'}
     $ui=Get-Content -LiteralPath (Join-Path $run 'ui-result.json') -Raw | ConvertFrom-Json
-    $result=[ordered]@{passed=$true;executable=$Executable;resolver='native';exitMode=$ExitMode;ownedChildNames=@($owned.Values.Name|Sort-Object -Unique);ownedProcessIdentities=@($owned.Values|Select-Object ProcessId,ParentProcessId,Name,CreationDate);ownedProcessesRemaining=$remaining.Count;apiListenerClosed=$true;webviewListenerClosed=$true;shutdown=$shutdown;ui=$ui;profile=$profile}
+    $result=[ordered]@{passed=$true;executable=$Executable;resolver='native';debugListenerOwnership=$debugIdentity;exitMode=$ExitMode;ownedChildNames=@($owned.Values.Name|Sort-Object -Unique);ownedProcessIdentities=@($owned.Values|Select-Object ProcessId,ParentProcessId,Name,CreationDate);ownedProcessesRemaining=$remaining.Count;apiListenerClosed=$true;webviewListenerClosed=$true;shutdown=$shutdown;ui=$ui;profile=$profile}
     $result | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $run 'result.json') -Encoding utf8
     $result | ConvertTo-Json -Depth 8
 } finally {

@@ -74,6 +74,7 @@ try {
         Write-Output "npm audit: $($report.metadata.vulnerabilities.total) vulnerabilities"
         if($code -ne 0){throw "npm dependency audit failed: exit $code; see npm-audit.json"}
     }
+    Step 'process-identity' {& (Join-Path $desktop 'tests/process-identity.ps1') -Mode SelfTest}
     Step 'browser-prerequisite' {& node --input-type=module -e 'import { chromium } from "playwright"; const browser = await chromium.launch({headless:true}); await browser.close();'}
     Step 'ffmpeg-prerequisite' {
         $env:STREAMCAP_TEST_PWSH=(Get-Command pwsh -ErrorAction Stop).Source

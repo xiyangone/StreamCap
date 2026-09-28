@@ -22,6 +22,7 @@ assert.equal(await hash(exe),args['expected-sha256'].toLowerCase());
 const inventory=async dir=>{const result=[];for(const entry of await readdir(dir,{withFileTypes:true})){if(entry.isSymbolicLink())continue;const file=join(dir,entry.name);if(entry.isDirectory())result.push(...await inventory(file));else if(entry.isFile()){const s=await stat(file);result.push({file,size:s.size,mtime:s.mtimeMs});}}return result;};
 const before=await inventory(mediaRoot);const selected=before.filter(f=>/\.(mp4|ts|flv|mkv)$/i.test(f.file)).sort((a,b)=>b.size-a.size).slice(0,2);assert.ok(selected.length,'No real recording found');for(const f of selected)f.sha256=await hash(f.file);
 const reserve=createServer();await new Promise(r=>reserve.listen(0,'127.0.0.1',r));const port=reserve.address().port;await new Promise(r=>reserve.close(r));
+const startedAfter=new Date().toISOString();
 const child=spawn(exe,['--data-dir',profile,'--api-port','0','--smoke-seconds','120'],{cwd:output,env:{...process.env,TEMP:tmp,TMP:tmp,WEBVIEW2_USER_DATA_FOLDER:join(profile,'webview'),WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS:'--remote-debugging-port='+port+' --remote-debugging-address=127.0.0.1'},windowsHide:true,stdio:'ignore'});
 let spawnError;child.on('error',e=>{spawnError=e;});
 const report={passed:false,acceptance:'presented frames, real pointer input and 20 target seeks per file',exe,pid:child.pid,actualMedia:true,productionProfileLoaded:false,output,cases:[],errors:[],requests:[]};let browser,page,base;
@@ -68,9 +69,15 @@ const measureContinuousDrag = async duration => {
 const percentile = (values,p) => [...values].sort((a,b)=>a-b)[Math.max(0,Math.ceil(values.length*p)-1)];
 try {
  const ready=await wait(async()=>JSON.parse(await readFile(join(profile,'ready.json'),'utf8')),Boolean,'candidate ready');assert.equal(ready.pid,child.pid);assert.equal(resolve(ready.dataDirectory),profile);base='http://'+ready.address;
+ // Verify the exact launched process and loopback WebView owner before any CDP request.
+ report.debugListenerOwnership=await wait(async()=>{
+  if(child.exitCode!==null)return null;
+  const value=await new Promise((yes,no)=>execFile(process.env.STREAMCAP_TEST_PWSH||'pwsh',
+   ['-NoProfile','-File',join(desktop,'tests','process-identity.ps1'),'-Mode','CheckListener','-RootPid',String(child.pid),'-CandidateExecutable',exe,'-StartedAfter',startedAfter,'-Port',String(port)],
+   {windowsHide:true},(error,stdout)=>error?no(error):yes(stdout)));
+  return JSON.parse(value);
+ },value=>value?.confirmed&&value.rootPid===child.pid&&value.port===port,'owned debug listener identity');
  await wait(async()=>{const r=await fetch('http://127.0.0.1:'+port+'/json/version');return r.ok;},Boolean,'owned debug listener');
- // Resolve listener ancestry before connecting; never attach a user's browser or another app.
- const ownership=await new Promise((yes,no)=>execFile(process.env.STREAMCAP_TEST_PWSH||'pwsh',['-NoProfile','-Command',"$ErrorActionPreference='Stop';$owner=(Get-NetTCPConnection -LocalPort "+port+" -State Listen|Select-Object -First 1).OwningProcess;$all=Get-CimInstance Win32_Process;$ids=@("+child.pid+");do{$count=$ids.Count;$ids+=@($all|Where-Object {$ids -contains $_.ParentProcessId}|Select-Object -ExpandProperty ProcessId);$ids=@($ids|Select-Object -Unique)}while($ids.Count -gt $count);Write-Output ($ids -contains $owner)"],{windowsHide:true},(e,out)=>e?no(e):yes(out.trim())));assert.equal(ownership,'True');
  const changed=await fetch(base+'/api/settings',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({userConfig:{live_save_path:mediaRoot,convert_to_mp4:false,delete_original:false,scheduled_shutdown_enabled:false,execute_custom_script:false}})});assert.equal(changed.status,200);
  assert.equal((await(await fetch(base+'/api/recordings')).json()).length,0);
  browser=await chromium.connectOverCDP('http://127.0.0.1:'+port);page=await wait(()=>browser.contexts().flatMap(c=>c.pages()).find(p=>p.url().includes('tauri.localhost')),Boolean,'main webview');page.setDefaultTimeout(12000);

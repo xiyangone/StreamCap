@@ -544,12 +544,21 @@ impl Scheduler {
                     }
                 }
             }
-            // Cache ranks once per turn; rescanning a platform queue inside the ordering loop
-            // would make large task lists cubic rather than quadratic.
-            let ranks: HashMap<_, _> = pending
-                .iter()
-                .map(|(id, (_, ticket))| (id.clone(), ticket.rank()))
-                .collect();
+            // Simulate the exact admission order once per platform, including manual waiters.
+            // A FIFO rank for all but the first priority ticket skips otherwise-ready work.
+            let mut snapshots = HashMap::new();
+            let mut ranks = HashMap::new();
+            for (record, _, _) in &candidates {
+                let key = record.platform_key.as_deref().unwrap_or("custom");
+                let snapshot = snapshots
+                    .entry(key.to_owned())
+                    .or_insert_with(|| self.pacer.queue_ranks(key));
+                let rank = pending
+                    .get(&record.rec_id)
+                    .map(|(_, ticket)| ticket.rank_in(snapshot))
+                    .unwrap_or(usize::MAX);
+                ranks.insert(record.rec_id.clone(), rank);
+            }
             // Platform turns and ticket rank decide admission; queued positions describe this pass.
             let mut projected = fair.clone();
             let mut ordered = Vec::new();
@@ -2414,6 +2423,64 @@ mod tests {
         stop.send(true).unwrap();
         run.await.unwrap();
         crate::api::shutdown(&state).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mixed_priority_queue_fills_available_slots_without_an_extra_tick() {
+        let root = tempfile::tempdir().unwrap();
+        let state = crate::api::bootstrap(Workspace::from_repo_root(root.path()))
+            .await
+            .unwrap();
+        state.config.write().await.update_user_config(serde_json::json!({"platform_request_interval":"0","platform_max_concurrent_requests":"16","loop_time_seconds":"4500"}).as_object().unwrap().clone()).unwrap();
+        let records = ["a-normal", "b-normal", "y-priority", "z-priority"]
+            .into_iter()
+            .map(|id| {
+                let mut record =
+                    Recording::new(id.into(), format!("http://127.0.0.1:1/{id}.mp4"), id.into());
+                record.only_notify_no_record = Some(true);
+                record
+            })
+            .collect();
+        state.store.insert(records).await.unwrap();
+        let held: Vec<_> = (0..16)
+            .map(|_| {
+                state
+                    .scheduler
+                    .pacer
+                    .enqueue("custom", false)
+                    .unwrap()
+                    .try_acquire(16, Duration::ZERO)
+                    .unwrap()
+            })
+            .collect();
+        let guard = state.store.lifecycle_guard().await;
+        let (stop, rx) = tokio::sync::watch::channel(false);
+        let run = tokio::spawn(state.scheduler.clone().run(rx));
+        settle().await;
+        drop(held);
+        state
+            .scheduler
+            .request_monitoring(["y-priority".into(), "z-priority".into()]);
+        settle().await;
+        let mut admitted = state
+            .scheduler
+            .checks
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        admitted.sort();
+        let capacity_filled = admitted.len() == AUTOMATIC_LIMIT;
+        drop(guard);
+        stop.send(true).unwrap();
+        run.await.unwrap();
+        crate::api::shutdown(&state).await.unwrap();
+        assert!(
+            capacity_filled,
+            "available global slot left idle: {admitted:?}"
+        );
+        assert_eq!(admitted, ["a-normal", "y-priority", "z-priority"]);
     }
 
     #[tokio::test(start_paused = true)]
