@@ -32,3 +32,5 @@ Thumbs.db
 *.log
 /StreamCap.exe
 /StreamCap.exe.sha256
+/StreamCap-deps-20260927.exe
+/StreamCap-deps-20260927.exe.sha256

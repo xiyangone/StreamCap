@@ -51,7 +51,7 @@ TS 与兼容格式支持按时间跳播，录制过程中也能回看已录部�
 rustup target add wasm32-unknown-unknown
 npm ci --cache .\build\npm-cache
 cargo install trunk --version 0.21.14 --locked --root .\target\tools
-cargo install wasm-bindgen-cli --version 0.2.128 --locked --root .\target\tools
+cargo install wasm-bindgen-cli --version 0.2.129 --locked --root .\target\tools
 cargo install cargo-audit --version 0.22.2 --locked --root .\target\tools
 cargo fetch --manifest-path Cargo.toml --locked
 cargo fetch --manifest-path core/Cargo.toml --locked

@@ -41,7 +41,7 @@ Install Rust 1.95.0 with MSVC/Windows SDK and Node.js 24. From the desktop direc
 rustup target add wasm32-unknown-unknown
 npm ci --cache .\build\npm-cache
 cargo install trunk --version 0.21.14 --locked --root .\target\tools
-cargo install wasm-bindgen-cli --version 0.2.128 --locked --root .\target\tools
+cargo install wasm-bindgen-cli --version 0.2.129 --locked --root .\target\tools
 cargo install cargo-audit --version 0.22.2 --locked --root .\target\tools
 cargo fetch --manifest-path Cargo.toml --locked
 cargo fetch --manifest-path core/Cargo.toml --locked

@@ -4,7 +4,7 @@ The only current release target is a Windows x64 StreamCap.exe. It embeds fronte
 
 From desktop, run npm run verify for the complete verification/build pipeline, or pwsh -NoProfile -File scripts/build-release.ps1 for a build only. The release script, npm build and the Tauri build hook share build-frontend.ps1, so they cannot silently package stale frontend assets.
 
-Dependencies must first be fetched with cargo fetch --locked for the frontend, core and src-tauri manifests. Builds use locked/offline mode. Required tools are Rust 1.95.0 with wasm32-unknown-unknown/MSVC/Windows SDK, Node.js 24, bundled mpegts.js 1.8.2, Trunk 0.21.14 and wasm-bindgen-cli 0.2.128. Install Trunk and wasm-bindgen into desktop/target/tools; the helper verifies the CLI version against the frontend Cargo.lock.
+Dependencies must first be fetched with cargo fetch --locked for the frontend, core and src-tauri manifests. Builds use locked/offline mode. Required tools are Rust 1.95.0 with wasm32-unknown-unknown/MSVC/Windows SDK, Node.js 24, bundled mpegts.js 1.8.2, Trunk 0.21.14 and wasm-bindgen-cli 0.2.129. Install Trunk and wasm-bindgen into desktop/target/tools; the helper verifies the CLI version against the frontend Cargo.lock.
 
 Output is a new desktop/src-tauri/target/native-noFF-* directory containing StreamCap.exe and StreamCap.exe.sha256. Existing release files are never overwritten; no installer is produced.
 
@@ -48,7 +48,7 @@ Native FLV downloads follow at most five safe redirects, reject HTTPS downgrade 
 
 Media metadata includes codec capability. Unsupported MP4 codecs use the existing bounded compatibility stream; a failed native decode switches at most once, and playback events cannot overwrite a decoding error. The full media-processing queue displays stage progress and elapsed time. Estimates describe a measured stage, not the entire queue. Source cleanup retains its existing validation.
 
-Native logs rotate at approximately 4 MiB, retaining the current file and four archives. Startup preserves history and rotation rejects links. Tauri is updated to 2.11.6. Dependency warnings remain visible, with separate Windows-target reachability evidence; unavailable upstream fixes are not claimed as resolved.
+Native logs rotate at approximately 4 MiB, retaining the current file and four archives. Startup preserves history and rotation rejects links. Tauri is updated to 2.12.0. Dependency warnings remain visible, with separate Windows-target reachability evidence; unavailable upstream fixes are not claimed as resolved.
 
 For explicit real testing, run scripts/verify-real.ps1 with -Executable (a SHA256-verified project candidate), -ProfileDirectory (read only), -MediaRoot (read only), and -MpvPath (project-local benchmark component). It samples at most seven monitored rooms, obeys per-platform pacing and stops restricted platforms. Credentials remain in memory. No login, CAPTCHA interaction, or user recording task is started. A real preview is bounded to 15 seconds or 512 KiB. An available FLV can additionally be tested through a local relay with one controlled interruption, at most two upstream requests and about 4 MiB per request, writing only isolated output. Optional -ProxyConfig reads local sing-box settings and records only matching test-process route decisions, never controller credentials.
 
@@ -68,3 +68,7 @@ Both verification scripts accept -ArtifactsDirectory pointing to a fresh project
 Committed room changes queue one paced check for monitored tasks, just like resuming monitoring. Cosmetic edits do not trigger extra platform requests. Normal checks retain the user interval: 4500 seconds means 75 minutes, not push-based detection. Paused, scheduled and notification-only behavior is preserved.
 
 Recording and library previews share one application-level panel. Minimize makes it a non-modal floating player that survives navigation; restore retains the decoder, position, pause and volume state. Closing releases preview resources without stopping recording. Native MP4 startup uses the actual first buffered timestamp rather than waiting at an unplayable zero timestamp.
+
+## 2026-09-27 dependency update batch
+
+This batch pins Tauri/API/CLI 2.12.0, tauri-build 2.7.0, dialog 2.8.0, notification 2.5.0, Leptos 0.8.21, Router 0.8.16, wasm-bindgen and its project CLI 0.2.129, js-sys/web-sys 0.3.106, and rquickjs 0.14.0. Transitive resolutions are recorded in the three Cargo.lock files. The reqwest 0.12 TLS path, user-directory behavior and monitoring policy are unchanged. Downloads use a project-local Cargo cache and tools stay in desktop/target/tools; system PATH is unchanged. New candidates require the complete verification gate without overwriting existing candidates or the running installation.

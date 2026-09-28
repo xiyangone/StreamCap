@@ -29,9 +29,9 @@ Other Rust and frontend dependencies retain their respective licenses; dependenc
 
 ## Windows API bindings
 
-The Windows Recycle Bin integration uses Microsoft's windows and windows-core Rust crates (0.61 series), licensed under MIT OR Apache-2.0. Source and license: https://github.com/microsoft/windows-rs . No Python recycler or permanent-delete fallback is distributed.
+The Windows Recycle Bin integration uses Microsoft's windows and windows-core Rust crates (0.61 series for the core; Tauri also uses the 0.62 series), licensed under MIT OR Apache-2.0. Source and license: https://github.com/microsoft/windows-rs . No Python recycler or permanent-delete fallback is distributed.
 
-## Tauri JavaScript API
+## Tauri JavaScript API 2.12.0
 
 Bundled JavaScript modules from @tauri-apps/api retain their MIT / Apache-2.0 licensing and copyright notices. Copyright 2019-2024 Tauri Programme within The Commons Conservancy. Source: https://github.com/tauri-apps/tauri . These are local frontend assets; no Node.js process is required at runtime.
 
@@ -246,13 +246,13 @@ Bundled from https://github.com/xqq/mpegts.js . Copyright xqq and contributors. 
 | Dependency | Version | License | Source |
 |---|---|---|---|
 | lettre | 0.11.23 | MIT | https://github.com/lettre/lettre |
-| rquickjs / QuickJS | 0.13.0 | MIT | https://github.com/DelSkayn/rquickjs |
+| rquickjs / QuickJS | 0.14.0 | MIT | https://github.com/DelSkayn/rquickjs |
 | wasmi | 2.0.0 | MIT OR Apache-2.0 | https://github.com/wasmi-labs/wasmi |
 | md5 | 0.8.1 | MIT OR Apache-2.0 | https://github.com/stainless-steel/md5 |
 | sha2 / aes / cbc | 0.11.0 / 0.9.3 / 0.2.1 | MIT OR Apache-2.0 | https://github.com/RustCrypto |
 | zip | 8.6.0 | MIT | https://github.com/zip-rs/zip2 |
 | png | 0.18.1 | MIT OR Apache-2.0 | https://github.com/image-rs/image-png |
-| tauri-plugin-dialog / notification | 2.7.3 / 2.4.0 | MIT OR Apache-2.0 | https://github.com/tauri-apps/plugins-workspace |
+| tauri-plugin-dialog / notification | 2.8.0 / 2.5.0 | MIT OR Apache-2.0 | https://github.com/tauri-apps/plugins-workspace |
 
 QuickJS and Wasmi are embedded, resource-limited protocol evaluators; no external JavaScript runtime is started. FFmpeg is not distributed in noFF. Explicit installation downloads a separately licensed Gyan FFmpeg package whose licensing is published at https://www.gyan.dev/ffmpeg/builds/ and https://ffmpeg.org/legal.html .
 
@@ -286,7 +286,7 @@ OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
-### rquickjs-0.13.0 — LICENSE
+### rquickjs-0.14.0 — LICENSE
 
 MIT License
 
@@ -311,7 +311,7 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-### rquickjs-sys-0.13.0 — quickjs/LICENSE
+### rquickjs-sys-0.14.0 — quickjs/LICENSE
 
 The MIT License (MIT)
 
@@ -531,7 +531,31 @@ OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
-### tauri-plugin-dialog-2.7.3 — LICENSE_MIT
+### tauri-plugin-dialog-2.8.0 — LICENSE_MIT
+
+MIT License
+
+Copyright (c) 2017 - Present Tauri Apps Contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+### tauri-plugin-notification-2.5.0 — LICENSE_MIT
 
 MIT License
 

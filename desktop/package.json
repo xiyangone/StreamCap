@@ -15,8 +15,8 @@
     "test:player": "node tests/player-regression.mjs"
   },
   "devDependencies": {
-    "@tauri-apps/api": "^2.11.1",
-    "@tauri-apps/cli": "^2",
+    "@tauri-apps/api": "^2.12.0",
+    "@tauri-apps/cli": "^2.12.0",
     "mpegts.js": "1.8.2",
     "playwright": "1.63.0"
   }

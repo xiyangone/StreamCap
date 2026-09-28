@@ -26,16 +26,43 @@ $environment = @{TEMP=$temp;TMP=$temp;WEBVIEW2_USER_DATA_FOLDER=(Join-Path $prof
 $process = Start-Process -FilePath $Executable -ArgumentList $arguments -WorkingDirectory $run -PassThru -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -Environment $environment
 $owned = @{}
 $probeProcess = $null
-function Update-OwnedProcesses {
-    $all = @(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath)
+$rootIdentity = $null
+function Test-ProcessInstance($Left, $Right) {
+    return $null -ne $Left -and $null -ne $Right -and
+        $null -ne $Left.CreationDate -and $null -ne $Right.CreationDate -and
+        [int]$Left.ProcessId -eq [int]$Right.ProcessId -and
+        $Left.CreationDate.ToUniversalTime() -eq $Right.CreationDate.ToUniversalTime()
+}
+function Add-OwnedProcessSnapshot([object[]]$Snapshot, $Root, [hashtable]$Owned) {
+    $current = @{}
+    foreach ($p in $Snapshot) {$current[[int]$p.ProcessId] = $p}
     do {
-        $count = $owned.Count
-        $parents = @([int]$process.Id) + @($owned.Keys)
-        foreach ($p in $all) {if ($parents -contains [int]$p.ParentProcessId) {$owned[[int]$p.ProcessId]=$p}}
-    } while ($count -ne $owned.Count)
+        $changed = $false
+        foreach ($p in $Snapshot) {
+            if ([int]$p.ProcessId -eq [int]$Root.ProcessId -or $null -eq $p.CreationDate) {continue}
+            $parentId = [int]$p.ParentProcessId
+            $parent = if ($parentId -eq [int]$Root.ProcessId) {$Root} else {$Owned[$parentId]}
+            # Parent PIDs survive their original process and may refer to a newer, unrelated instance.
+            if (-not (Test-ProcessInstance $parent $current[$parentId])) {continue}
+            if ($p.CreationDate.ToUniversalTime() -lt $parent.CreationDate.ToUniversalTime()) {continue}
+            if (-not (Test-ProcessInstance $Owned[[int]$p.ProcessId] $p)) {
+                $Owned[[int]$p.ProcessId] = $p
+                $changed = $true
+            }
+        }
+    } while ($changed)
+}
+function Update-OwnedProcesses {
+    $all = @(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CreationDate)
+    Add-OwnedProcessSnapshot $all $rootIdentity $owned
     if (@($owned.Values | Where-Object {$_.Name -match '^(python|pythonw|node|streamcap-resolver)(\.exe)?$'}).Count -gt 0) {throw 'External interpreter or resolver was started'}
 }
 try {
+    $rootIdentity = Get-CimInstance Win32_Process -Filter "ProcessId=$($process.Id)" | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CreationDate
+    if ($process.HasExited -or $null -eq $rootIdentity.CreationDate -or
+        [Math]::Abs(($rootIdentity.CreationDate.ToUniversalTime() - $process.StartTime.ToUniversalTime()).TotalSeconds) -gt 1) {
+        throw 'Cannot establish the candidate process identity'
+    }
     $readyFile = Join-Path $profile 'ready.json'
     $deadline = [DateTime]::UtcNow.AddSeconds(25)
     while (-not (Test-Path -LiteralPath $readyFile)) {
@@ -360,7 +387,9 @@ try {
     if (-not $shutdown.shutdownComplete -or $shutdown.activeRecordings -ne 0 -or $shutdown.pendingMediaJobs -ne 0 -or $shutdown.activePreviews -ne 0 -or $shutdown.verification.active -or $shutdown.verification.activeWorkers -ne 0) {throw 'Ordered shutdown incomplete'}
     $remaining = @()
     for ($i=0;$i -lt 30;$i++) {
-        $remaining=@($owned.Keys | Where-Object {Get-Process -Id $_ -ErrorAction SilentlyContinue})
+        $current = @{}
+        foreach ($p in @(Get-CimInstance Win32_Process | Select-Object ProcessId,CreationDate)) {$current[[int]$p.ProcessId]=$p}
+        $remaining=@($owned.Keys | Where-Object {Test-ProcessInstance $owned[$_] $current[$_]})
         if ($remaining.Count -eq 0) {break}
         Start-Sleep -Milliseconds 200
     }
@@ -371,7 +400,7 @@ try {
     if ($listening) {throw 'HTTP listener remained after application exit'}
     if (Get-NetTCPConnection -State Listen -LocalPort $debugPort -ErrorAction SilentlyContinue) {throw 'WebView2 debug listener remained after application exit'}
     $ui=Get-Content -LiteralPath (Join-Path $run 'ui-result.json') -Raw | ConvertFrom-Json
-    $result=[ordered]@{passed=$true;executable=$Executable;resolver='native';exitMode=$ExitMode;ownedChildNames=@($owned.Values.Name|Sort-Object -Unique);ownedProcessesRemaining=$remaining.Count;apiListenerClosed=$true;webviewListenerClosed=$true;shutdown=$shutdown;ui=$ui;profile=$profile}
+    $result=[ordered]@{passed=$true;executable=$Executable;resolver='native';exitMode=$ExitMode;ownedChildNames=@($owned.Values.Name|Sort-Object -Unique);ownedProcessIdentities=@($owned.Values|Select-Object ProcessId,ParentProcessId,Name,CreationDate);ownedProcessesRemaining=$remaining.Count;apiListenerClosed=$true;webviewListenerClosed=$true;shutdown=$shutdown;ui=$ui;profile=$profile}
     $result | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $run 'result.json') -Encoding utf8
     $result | ConvertTo-Json -Depth 8
 } finally {

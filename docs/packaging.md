@@ -25,7 +25,7 @@ pwsh -NoProfile -File .\scripts\build-release.ps1
 - Rust 1.95.0、wasm32-unknown-unknown、MSVC C++ 工具与 Windows SDK。
 - Node.js 24/npm 用于 Tauri API、锁定版本的 mpegts.js 本地资源和 Playwright；不会随 EXE 启动 Node。
 - FFmpeg 与同目录 ffprobe 用于生成隔离媒体夹具和校验转封装；noFF 成品不捆绑这两个工具。
-- Trunk 0.21.14、wasm-bindgen-cli 0.2.128 安装在 desktop/target/tools。升级 wasm-bindgen 库时必须同步项目本地 CLI，构建时会检查版本。
+- Trunk 0.21.14、wasm-bindgen-cli 0.2.129 安装在 desktop/target/tools。升级 wasm-bindgen 库时必须同步项目本地 CLI，构建时会检查版本。
 - cargo-audit 0.22.2 同样安装在 desktop/target/tools。首次审计联网更新 desktop/target/advisory-db，三份锁文件使用同一数据库版本；npm audit 也需要网络。审计 JSON 和数据库提交号保留在验收目录，已知漏洞阻断验收，维护状态警告单独保留，不自动忽略漏洞。
 - Playwright 浏览器默认使用 desktop/build/playwright，可通过进程级 PLAYWRIGHT_BROWSERS_PATH 明确指定。安装浏览器时使用相同路径；验收会先启动并关闭一次无页面的隔离 Chromium，缺少浏览器会明确失败。
 - Tauri 命令权限自动文件由 build.rs 生成，不手动维护；手写权限在 src-tauri/permissions/desktop.toml。
@@ -72,7 +72,7 @@ CI 统一使用 .github/workflows/test.yml，支持 push、PR 和 workflow_dispa
 - 文件预览先探测编码；不兼容 MP4 转入现有有界片段预览，而非另起一套播放器。原生播放解码失败只允许一次兼容切换，解码错误不会被自动播放提示覆盖。
 - 后处理保留全部待处理任务，阶段进度来自 FFmpeg 的媒体时间；探测阶段没有可计算百分比时明确显示未知。显示的是本阶段预计剩余时间，不冒充整个队列的完成时间。删源前的验证不减弱。
 - 原生日志每份约 4 MiB，当前文件加 4 份历史文件，启动不清空；轮转只处理固定日志文件名，拒绝链接。新增日志写入对明显凭据字段脱敏。
-- Tauri 更新到 2.11.6；依赖审计继续保留所有告警，另记录 Windows 目标依赖可达性，不使用 ignore 关闭告警。上游无替代版本的维护警告不声称已修复。
+- Tauri 更新到 2.12.0；依赖审计继续保留所有告警，另记录 Windows 目标依赖可达性，不使用 ignore 关闭告警。上游无替代版本的维护警告不声称已修复。
 
 ### 显式真实验收
 
@@ -102,3 +102,7 @@ pwsh -NoProfile -File .\scripts\verify-real.ps1 -Executable <项目内候选EXE�
 
 - 更换直播间后，已开启监控的任务保存成功即排入一次受平台限流约束的检测；恢复监控同样立即排队。普通改名不额外探测，暂停、定时窗口和仅通知模式仍有效。正常周期仍使用用户的检测间隔；4500 秒就是 75 分钟，不等于开播推送，未开播检测不能靠 SSE/WS 自动加速。
 - 录制与媒体库预览共用一个应用级播放面板。最小化后以非模态小窗继续播放，切换设置或任务页面不重建播放器；恢复保留位置、暂停及音量状态，关闭才释放预览资源，不停止后台录制。原生 MP4 起始时间非零时定位到首个实际缓冲时间，不通过放宽超时或生成完整代理规避。
+
+## 2026-09-27 依赖升级批次
+
+本批锁定 Tauri/API/CLI 2.12.0、tauri-build 2.7.0、dialog 2.8.0、notification 2.5.0、Leptos 0.8.21、Router 0.8.16、wasm-bindgen/项目 CLI 0.2.129、js-sys/web-sys 0.3.106 和 rquickjs 0.14.0。相关传递依赖以三份 Cargo.lock 为准，不同步升级 reqwest 0.12 的 TLS 路径、用户目录规则或监控策略。使用项目内 Cargo 下载缓存；工具安装到 desktop/target/tools，不改系统 PATH。每个新候选执行完整门禁，旧候选和运行版不覆盖。
