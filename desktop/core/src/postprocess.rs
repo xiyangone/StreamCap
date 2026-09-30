@@ -9,7 +9,7 @@ use serde_json::Value;
 use std::{
     io,
     path::{Path, PathBuf},
-    process::Stdio,
+    process::{Output, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -658,6 +658,7 @@ impl Postprocessor {
                 "同名 MP4 已存在，未覆盖",
             ));
         }
+        // Preserve TS discontinuities; normalize only the initial timestamp offset.
         let mut command = command(&ffmpeg);
         command
             .args([
@@ -670,6 +671,8 @@ impl Postprocessor {
                 "-stats_period",
                 "2",
                 "-n",
+                "-copyts",
+                "-start_at_zero",
                 "-protocol_whitelist",
                 "file",
                 "-f",
@@ -768,7 +771,7 @@ impl Postprocessor {
                     "null",
                     "-",
                 ]);
-            run_tool(
+            let decoded = run_tool(
                 verify,
                 &self.inner.stop,
                 true,
@@ -777,6 +780,14 @@ impl Postprocessor {
             )
             .await
             .map_err(|_| invalid("MP4 完整解码校验失败，源 TS 保留"))?;
+            // With -v error, diagnostics disqualify cleanup even when FFmpeg exits 0.
+            if decoded
+                .stderr
+                .iter()
+                .any(|byte| !byte.is_ascii_whitespace())
+            {
+                return Err(invalid("MP4 完整解码校验失败，源 TS 保留"));
+            }
         }
         let identity = storage::source_identity(&verified_output)?;
         drop(verified_output);
@@ -853,7 +864,9 @@ async fn wait_for_stall(advanced: Arc<Mutex<tokio::time::Instant>>, budget: Dura
     }
 }
 pub(crate) async fn run(command: Command, stop: &CancellationToken) -> io::Result<Vec<u8>> {
-    run_tool(command, stop, false, Duration::from_secs(600), None).await
+    run_tool(command, stop, false, Duration::from_secs(600), None)
+        .await
+        .map(|output| output.stdout)
 }
 async fn run_tool(
     mut command: Command,
@@ -861,7 +874,7 @@ async fn run_tool(
     progress: bool,
     budget: Duration,
     observer: Option<Arc<dyn Fn(u64) + Send + Sync>>,
-) -> io::Result<Vec<u8>> {
+) -> io::Result<Output> {
     let mut child = command.spawn()?;
     let stdout = child
         .stdout
@@ -916,7 +929,11 @@ async fn run_tool(
             status.code()
         )));
     }
-    Ok(stdout)
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 type MediaInfo = (Vec<(String, String, u64)>, Option<f64>);
 async fn probe(
@@ -948,7 +965,7 @@ async fn probe(
         None,
     )
     .await?;
-    let value: Value = serde_json::from_slice(&raw).map_err(io::Error::other)?;
+    let value: Value = serde_json::from_slice(&raw.stdout).map_err(io::Error::other)?;
     let mut streams: Vec<_> = value["streams"]
         .as_array()
         .into_iter()

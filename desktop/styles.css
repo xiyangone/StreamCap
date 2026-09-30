@@ -192,6 +192,8 @@ h3 { font-size: 14px; font-weight: 600; }
 .card-name { display: block; text-align: left; font-size: 15px; font-weight: 600; padding: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .card-name:hover { color: var(--accent); }
 .card-subtitle { color: var(--subtle); font-size: 10px; margin-top: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.card-recording-status { display: flex; align-items: center; gap: 6px; margin-top: 6px; color: var(--success); font-size: 12px; font-weight: 600; }
+.card-recording-status svg { flex-shrink: 0; }
 .card-recording-error { display: flex; align-items: flex-start; gap: 6px; color: var(--danger); font-size: 11px; line-height: 1.6; margin-top: 7px; }
 .card-recording-error > .icon { flex: 0 0 auto; margin-top: 2px; }
 .card-recording-error > span { min-width: 0; overflow-wrap: anywhere; }
@@ -680,6 +682,8 @@ textarea.input { resize: vertical; line-height: 1.65; }
 /* Preview and post-processing remain part of the existing media surface. */
 .player-message { display:flex; align-items:center; gap:8px; padding:10px 12px; font-size:12px; color:var(--muted); }
 .media-job-status { color:var(--muted); font-size:11px; line-height:1.6; margin-top:7px; overflow-wrap:anywhere; }
+.card-media-job { border-top: 1px solid var(--line); padding-top: 7px; }
+.card-media-job-source { display: block; color: var(--subtle); font-size: 10px; overflow-wrap: anywhere; }
 .media-jobs { margin-top:18px; padding:18px; }
 .media-jobs h3 { font-size:14px; margin-bottom:10px; }
 .media-job-row { display:flex; justify-content:space-between; gap:14px; padding:8px 0; border-top:1px solid var(--border); font-size:12px; }

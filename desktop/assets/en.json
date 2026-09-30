@@ -731,5 +731,8 @@
   "降序": "Descending",
   "无法初始化通知客户端": "Unable to initialize the notification client",
   "平台检测队列已满，请稍后重试": "The platform check queue is full. Try again later.",
-  "平台冷却中，请等待后再检测": "The platform is cooling down. Wait before checking again."
+  "平台冷却中，请等待后再检测": "The platform is cooling down. Wait before checking again.",
+  "耗时未知": "Elapsed time unknown",
+  "录后处理": "Post-processing",
+  "最近一次录后处理": "Latest post-processing"
 }

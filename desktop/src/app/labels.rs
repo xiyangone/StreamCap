@@ -228,6 +228,16 @@ pub fn recording_subtitle(record: &crate::api::gateway::Recording) -> String {
         })
 }
 
+pub fn recording_media_job<'a>(
+    record: &crate::api::gateway::Recording,
+    jobs: &'a [crate::api::gateway::MediaJob],
+) -> Option<&'a crate::api::gateway::MediaJob> {
+    jobs.iter()
+        .rev()
+        .find(|job| job.task_id.as_deref() == Some(record.rec_id.as_str()))
+        .filter(|job| !record.is_recording || job.state != "complete")
+}
+
 pub fn media_progress(job: &crate::api::gateway::MediaJob, now: i64) -> String {
     if job.state == "waiting" {
         return job
@@ -237,8 +247,11 @@ pub fn media_progress(job: &crate::api::gateway::MediaJob, now: i64) -> String {
     }
     let elapsed = job
         .started_at
-        .map(|start| job.finished_at.unwrap_or(now).saturating_sub(start).max(0) as f64)
-        .unwrap_or(job.elapsed_seconds as f64);
+        .zip(job.finished_at.or_else(|| job.pending().then_some(now)))
+        .map(|(start, end)| end.saturating_sub(start).max(0) as u64)
+        .or_else(|| (job.elapsed_seconds > 0).then_some(job.elapsed_seconds))
+        .map(|seconds| crate::tr_format!("耗时 {}", duration(seconds as f64)))
+        .unwrap_or_else(|| t("耗时未知").into());
     let progress = job
         .stage_percent
         .map(|percent| crate::tr_format!("本阶段 {}%", percent))
@@ -256,7 +269,7 @@ pub fn media_progress(job: &crate::api::gateway::MediaJob, now: i64) -> String {
     format!(
         "{} · {}{}",
         progress,
-        crate::tr_format!("耗时 {}", duration(elapsed)),
+        elapsed,
         if eta.is_empty() {
             String::new()
         } else {
@@ -404,6 +417,108 @@ pub fn monitoring_label(record: &crate::api::gateway::Recording) -> &'static str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn media_job(state: &str) -> crate::api::gateway::MediaJob {
+        serde_json::from_value(serde_json::json!({
+            "id": "job", "taskId": "task", "source": "old.ts", "output": "old.mp4",
+            "state": state, "message": "status"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn active_recording_hides_completed_history_without_reviving_older_failures() {
+        let mut record = crate::api::gateway::Recording {
+            rec_id: "task".into(),
+            is_recording: true,
+            ..Default::default()
+        };
+        let jobs = vec![media_job("failed"), media_job("complete")];
+        assert!(recording_media_job(&record, &jobs).is_none());
+        record.is_recording = false;
+        assert_eq!(
+            recording_media_job(&record, &jobs).unwrap().state,
+            "complete"
+        );
+    }
+
+    #[test]
+    fn active_recording_preserves_pending_and_unsuccessful_processing_results() {
+        let record = crate::api::gateway::Recording {
+            rec_id: "task".into(),
+            is_recording: true,
+            ..Default::default()
+        };
+        for state in [
+            "waiting",
+            "running",
+            "verifying",
+            "cleaning",
+            "failed",
+            "cleanupFailed",
+            "cancelled",
+        ] {
+            let jobs = vec![media_job(state)];
+            assert_eq!(recording_media_job(&record, &jobs).unwrap().state, state);
+        }
+    }
+
+    #[test]
+    fn processing_result_selection_is_scoped_to_the_task() {
+        let record = crate::api::gateway::Recording {
+            rec_id: "task".into(),
+            ..Default::default()
+        };
+        let mut unrelated = media_job("running");
+        unrelated.task_id = Some("another-task".into());
+        let jobs = vec![media_job("complete"), unrelated];
+        assert_eq!(
+            recording_media_job(&record, &jobs).unwrap().state,
+            "complete"
+        );
+        assert!(recording_media_job(&record, &jobs[1..]).is_none());
+        assert!(recording_media_job(&record, &[]).is_none());
+    }
+
+    #[test]
+    fn missing_processing_timing_is_unknown_not_zero() {
+        let job = media_job("complete");
+        assert_eq!(media_progress(&job, 200), "处理已结束 · 耗时未知");
+    }
+
+    #[test]
+    fn measured_zero_processing_time_remains_zero() {
+        let mut job = media_job("complete");
+        job.started_at = Some(100);
+        job.finished_at = Some(100);
+        assert_eq!(media_progress(&job, 200), "处理已结束 · 耗时 00:00:00");
+    }
+
+    #[test]
+    fn completed_processing_without_finish_time_does_not_keep_counting() {
+        let mut job = media_job("complete");
+        job.started_at = Some(100);
+        job.elapsed_seconds = 7;
+        assert_eq!(media_progress(&job, 200), "处理已结束 · 耗时 00:00:07");
+        assert_eq!(media_progress(&job, 900), media_progress(&job, 200));
+        job.elapsed_seconds = 0;
+        assert_eq!(media_progress(&job, 900), "处理已结束 · 耗时未知");
+    }
+
+    #[test]
+    fn pending_processing_uses_the_clock_and_measured_stage_progress() {
+        let mut job = media_job("running");
+        job.started_at = Some(100);
+        job.stage_percent = Some(25);
+        job.stage_eta_seconds = Some(30);
+        assert_eq!(
+            media_progress(&job, 112),
+            "本阶段 25% · 耗时 00:00:12 · 本阶段预计剩余 00:00:30"
+        );
+        job.state = "waiting".into();
+        job.queue_position = Some(2);
+        assert_eq!(media_progress(&job, 112), "等待处理 · 第 2 位");
+    }
     #[test]
     fn queue_labels_distinguish_a_deadline_from_an_execution_estimate() {
         use crate::api::gateway::Recording;

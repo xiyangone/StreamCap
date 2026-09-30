@@ -682,6 +682,101 @@ try {
     h.emit('update', record('fixture-5'));
     await visible(card('fixture-5').getByRole('button', { name: original.streamerName, exact: true }));
   });
+  await step('当前录制状态常驻显示，不被标题或空标题覆盖', async () => {
+    const item=record('fixture-5'), original=structuredClone(item);
+    try {
+      Object.assign(item,{isRecording:true,isLive:true,monitorStatus:true,recordingError:null,
+        checkError:null,verificationRequired:false,accessState:'',checkState:'idle'});
+      for(const title of ['你好',null,'','   ']) {
+        item.liveTitle=title;h.emit('update',item);
+        await visible(card(item.recId).locator('.card-recording-status'));
+        assert.equal(await card(item.recId).locator('.card-recording-status').innerText(),'正在录制');
+        if(title?.trim()) await waitState(()=>card(item.recId).locator('.card-subtitle').innerText(),v=>v===title,'独立直播标题');
+        else await waitState(()=>card(item.recId).locator('.card-subtitle').count(),n=>n===0,'空标题不占位');
+      }
+      item.monitorStatus=false;h.emit('update',item);
+      await visible(card(item.recId).getByText('监控已暂停',{exact:true}));
+      assert.equal(await card(item.recId).locator('.card-recording-status').innerText(),'正在录制');
+      await navigate('总览');await visible(card(item.recId).locator('.card-recording-status'));
+      await navigate('录制任务');
+      Object.assign(item,{isRecording:false,isLive:false,monitorStatus:true,liveTitle:null});h.emit('update',item);
+      await hidden(card(item.recId).locator('.card-recording-status'));
+      assert.equal(await card(item.recId).locator('.card-subtitle').count(),0);
+      assert.equal(await card(item.recId).locator('.badge').innerText(),'等待开播');
+    } finally {Object.assign(item,original);h.emit('update',item);}
+  });
+  await step('录制与录后处理分离，历史完成结果隐藏且处理来源明确', async () => {
+    const item=record('fixture-5'), original=structuredClone(item), originalJobs=structuredClone(state.mediaJobs);
+    const job={id:'status-history',taskId:item.recId,source:'历史目录/历史录像_2026-09-27.ts',
+      output:'历史目录/历史录像_2026-09-27.mp4',state:'complete',message:'MP4 已生成并校验，源 TS 已清理',
+      sourceRemoved:true,deleteOriginal:true,elapsedSeconds:0,startedAt:null,finishedAt:null};
+    try {
+      Object.assign(item,{isRecording:true,isLive:true,monitorStatus:true,liveTitle:'你好',recordingError:null,
+        checkError:null,verificationRequired:false,accessState:'',checkState:'idle'});h.emit('update',item);
+      await visible(card(item.recId).locator('.card-recording-status'));
+      state.mediaJobs.push(job);h.emit('mediaJob',job);
+      assert.equal(await card(item.recId).locator('.card-media-job').count(),0);
+      Object.assign(job,{state:'running',sourceRemoved:false,startedAt:Math.floor(Date.now()/1000)-12,
+        message:'正在读取源文件音视频与时长'});h.emit('mediaJob',job);
+      await visible(card(item.recId).locator('.card-media-job'));
+      assert.equal(await card(item.recId).locator('.card-media-job-source').innerText(),'录后处理 · 历史目录/历史录像_2026-09-27.ts');
+      assert.equal(await card(item.recId).locator('.card-media-job-source').getAttribute('title'),job.source);
+      assert.equal(await card(item.recId).locator('.card-recording-status').innerText(),'正在录制');
+      Object.assign(job,{state:'failed',finishedAt:Math.floor(Date.now()/1000),message:'转换失败，原 TS 保留'});h.emit('mediaJob',job);
+      await visible(card(item.recId).locator('.card-media-job[data-state=failed]'));
+      assert.equal(await card(item.recId).locator('.badge').innerText(),'录制中');
+      assert.equal(await card(item.recId).locator('.card-recording-error').count(),0);
+      for(const [width,list,dark] of [[1280,true,false],[1280,false,true],[420,true,true],[420,false,false]]) {
+        await page.setViewportSize({width,height:900});
+        if(await page.locator('html').getAttribute('data-theme')!==(dark?'dark':'light')) {
+          await page.getByRole('button',{name:dark?'切换到深色':'切换到浅色',exact:true}).click();
+          await waitTheme(page,dark?'dark':'light');
+        }
+        await page.getByRole('button',{name:list?'列表视图':'网格视图',exact:true}).click();
+        await card(item.recId).scrollIntoViewIfNeeded();
+        const layout=await card(item.recId).evaluate(el=>{const c=el.getBoundingClientRect();return {inside:[...el.querySelectorAll('.card-recording-status,.card-media-job')].every(n=>{const r=n.getBoundingClientRect();return r.x>=c.x&&r.right<=c.right+1;}),overflow:document.documentElement.scrollWidth>innerWidth+1};});
+        assert.equal(layout.inside,true);assert.equal(layout.overflow,false);
+        await h.shot('status-active-'+width+'-'+(list?'list':'grid'));
+      }
+      Object.assign(job,{state:'complete',startedAt:null,finishedAt:null,elapsedSeconds:0,
+        message:'MP4 已生成并校验，源 TS 已清理'});h.emit('mediaJob',job);
+      await hidden(card(item.recId).locator('.card-media-job'));
+      Object.assign(item,{isRecording:false,isLive:false,liveTitle:null});h.emit('update',item);
+      await visible(card(item.recId).locator('.card-media-job'));
+      assert.equal(await card(item.recId).locator('.card-media-job-source').innerText(),'最近一次录后处理 · 历史目录/历史录像_2026-09-27.ts');
+      assert.equal(await card(item.recId).locator('.media-job-detail').innerText(),'处理已结束 · 耗时未知');
+      assert.equal(await card(item.recId).locator('.badge').innerText(),'等待开播');
+      for(const width of [1280,420]) {
+        await page.setViewportSize({width,height:900});
+        for(const list of [true,false]) {
+          await page.getByRole('button',{name:list?'列表视图':'网格视图',exact:true}).click();
+          await card(item.recId).scrollIntoViewIfNeeded();
+          const layout=await card(item.recId).evaluate(el=>{const c=el.getBoundingClientRect(),m=el.querySelector('.card-media-job').getBoundingClientRect();return {inside:m.x>=c.x&&m.right<=c.right+1,overflow:document.documentElement.scrollWidth>innerWidth+1};});
+          assert.equal(layout.inside,true);assert.equal(layout.overflow,false);
+        }
+      }
+      await h.shot('status-history-narrow');
+    } finally {
+      Object.assign(item,original);state.mediaJobs=originalJobs;
+      await page.setViewportSize({width:1280,height:900});await go(page,h.base,'/recordings');
+    }
+  });
+  await step('媒体库区分未知耗时、实测零耗时和缺失结束时间', async () => {
+    const originalJobs=structuredClone(state.mediaJobs);
+    try {
+      const base={taskId:null,output:'history.mp4',state:'complete',message:'MP4 已生成并校验；原 TS 保留',
+        sourceRemoved:false,deleteOriginal:false,elapsedSeconds:0,startedAt:null,finishedAt:null};
+      state.mediaJobs=[{...base,id:'unknown-time',source:'unknown.ts'},
+        {...base,id:'zero-time',source:'zero.ts',startedAt:100,finishedAt:100},
+        {...base,id:'saved-time',source:'saved.ts',startedAt:100,elapsedSeconds:7}];
+      await go(page,h.base,'/storage');
+      const row=source=>page.locator('.media-job-row').filter({hasText:source}).locator('.media-job-detail');
+      await visible(row('unknown.ts'));
+      assert.equal(await row('unknown.ts').innerText(),'处理已结束 · 耗时未知');
+      assert.equal(await row('zero.ts').innerText(),'处理已结束 · 耗时 00:00:00');
+      assert.equal(await row('saved.ts').innerText(),'处理已结束 · 耗时 00:00:07');
+    } finally {state.mediaJobs=originalJobs;await go(page,h.base,'/recordings');}
+  });
   await step('录制、直播未录制和下播复核各归一类，旧直播状态不重复计数', async () => {
     const r=record('fixture-5'), original=structuredClone(r);
     const filter=name=>page.getByRole('button',{name:new RegExp('^'+name)});
@@ -1077,6 +1172,22 @@ try {
     await waitState(()=>page.locator('html').getAttribute('lang'),value=>value==='en','英文界面');await visible(page.getByRole('heading',{name:'Preferences',exact:true}));
     await page.keyboard.press('Control+3');await visible(page.getByRole('heading',{name:'Media library',exact:true}));await page.goto(h.base+'/');await visible(page.getByRole('heading',{name:'Media library',exact:true}));
     await page.keyboard.press('Control+2');await visible(card('fixture-2').getByRole('button',{name:record('fixture-2').streamerName,exact:true}));await h.shot('english-recordings');
+    await visible(page.locator('.card-recording-status').first());
+    assert.equal(await page.locator('.card-recording-status').first().innerText(),'Recording');
+    const languageJobs=structuredClone(state.mediaJobs);
+    try {
+      const job={id:'english-history',taskId:'fixture-2',source:'english-history.ts',output:'english-history.mp4',
+        state:'complete',message:'MP4 已生成并校验；原 TS 保留',sourceRemoved:false,deleteOriginal:false,
+        elapsedSeconds:0,startedAt:null,finishedAt:null};
+      state.mediaJobs.push(job);h.emit('mediaJob',job);
+      await visible(card('fixture-2').locator('.card-media-job'));
+      assert.equal(await card('fixture-2').locator('.card-media-job-source').innerText(),'Latest post-processing · english-history.ts');
+      assert.equal(await card('fixture-2').locator('.media-job-detail').innerText(),'Processing finished · Elapsed time unknown');
+      job.state='running';h.emit('mediaJob',job);
+      await visible(card('fixture-2').locator('.card-media-job[data-state=running]'));
+      assert.equal(await card('fixture-2').locator('.card-media-job-source').innerText(),'Post-processing · english-history.ts');
+      await h.shot('status-processing-english');
+    } finally {state.mediaJobs=languageJobs;await go(page,h.base,'/recordings');}
     await page.keyboard.press('Control+5');await page.getByRole('button',{name:'Check for updates',exact:true}).click();
     const release = page.getByRole('link', { name: apiContracts.updateCheck.release.tag_name, exact: true });
     await visible(release);assert.equal(await release.getAttribute('href'),apiContracts.updateCheck.release.html_url);assert.equal(requests('GET','/api/tools/update').length,1);

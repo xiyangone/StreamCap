@@ -2,7 +2,7 @@ use super::{ConfirmDialog, Icon};
 use crate::app::i18n::t;
 use crate::{
     api::gateway::{self, Recording},
-    app::labels::{duration, format_label, monitoring_label, quality_label},
+    app::labels::{duration, format_label, monitoring_label, quality_label, recording_media_job},
 };
 use leptos::prelude::*;
 
@@ -108,6 +108,9 @@ pub fn RecordingCard(
             </div>
             <div class="card-main">
                 <button class="card-name" title=t("查看录制信息") on:click=move |_| on_info.run(record.get_untracked())>{move || record.get().name()}</button>
+                <Show when=move || record.get().is_recording>
+                    <p class="card-recording-status" role="status"><Icon name="signal" size=14 /><span>{t("正在录制")}</span></p>
+                </Show>
                 <Show when=move || record.with(|r| r.live_title.as_ref().is_some_and(|title| !title.trim().is_empty()) || r.check_state == "rechecking" || (!r.is_recording && r.check_error.as_ref().is_some_and(|error| !error.is_empty())))>
                     <p class="card-subtitle" title=move || record.get().live_title.unwrap_or_default()>{move || crate::app::labels::recording_subtitle(&record.get())}</p>
                 </Show>
@@ -122,7 +125,16 @@ pub fn RecordingCard(
                 <Show when=move || record.get().recording_error.as_ref().is_some_and(|error| !error.is_empty())>
                     <p class="card-recording-error" role="status"><Icon name="alert" size=14 /><span>{move || crate::tr_format!("录制失败：{}", record.get().recording_error.unwrap_or_default())}</span></p>
                 </Show>
-                {move || state.media_jobs.with(|jobs| jobs.iter().rev().find(|j| j.task_id.as_deref() == Some(record.get().rec_id.as_str())).map(|j| view! { <p class="media-job-status" role="status">{crate::app::i18n::message(j.message.clone())}<span class="media-job-detail">{crate::app::labels::media_progress(j, state.now.get())}</span></p> }))}
+                {move || state.media_jobs.with(|jobs| record.with(|r| recording_media_job(r, jobs)).map(|job| {
+                    let heading = if job.pending() { t("录后处理") } else { t("最近一次录后处理") };
+                    view! {
+                        <div class="media-job-status card-media-job" role="status" data-state=job.state.clone()>
+                            <span class="card-media-job-source" title=job.source.clone()>{heading}{" · "}{job.source.clone()}</span>
+                            <span>{crate::app::i18n::message(job.message.clone())}</span>
+                            <span class="media-job-detail">{crate::app::labels::media_progress(job, state.now.get())}</span>
+                        </div>
+                    }
+                }))}
             </div>
             <div class="card-summary">
                 <div class="card-monitor-row"><span class:monitor-on=move || record.get().monitor_status><Icon name="eye" size=14 />{move || monitoring_label(&record.get())}</span></div>

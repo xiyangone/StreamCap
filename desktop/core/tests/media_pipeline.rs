@@ -768,6 +768,325 @@ async fn media_cleanup_is_opt_in_and_removes_only_validated_source() {
     api::shutdown(&state).await.unwrap();
 }
 #[tokio::test]
+#[ignore = "requires STREAMCAP_TEST_FFMPEG; synthetic timestamp gaps and nonzero origins only"]
+async fn media_remux_preserves_timestamp_gaps_and_normalizes_nonzero_origins() {
+    async fn timeline(path: &Path) -> serde_json::Value {
+        let output = command(&streamcap_core::paths::adjacent_ffprobe(&ffmpeg()).unwrap())
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "format=start_time,duration:stream=codec_type,codec_name,nb_read_packets",
+                "-count_packets",
+                "-of",
+                "json",
+            ])
+            .arg(path)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    }
+    fn packets(info: &serde_json::Value) -> Vec<(String, String, String)> {
+        let mut streams: Vec<_> = info["streams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|stream| {
+                (
+                    stream["codec_type"].as_str().unwrap().to_owned(),
+                    stream["codec_name"].as_str().unwrap().to_owned(),
+                    stream["nb_read_packets"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect();
+        streams.sort();
+        streams
+    }
+    for (origin, delete_original) in [("0", false), ("600", false), ("600", true)] {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state(directory.path(), false).await;
+        state
+            .config
+            .write()
+            .await
+            .update_user_config(
+                json!({"delete_original":delete_original})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )
+            .unwrap();
+        let root = directory.path().join("downloads");
+        let source = root.join("gap.ts");
+        let output = command(&ffmpeg())
+            .args([
+                "-v",
+                "error",
+                "-nostdin",
+                "-n",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=160x120:rate=10:duration=2",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=48000:duration=2",
+                "-vf",
+                r"setpts=PTS+gte(T\,1)*23/TB",
+                "-af",
+                r"asetpts=PTS+gte(T\,1)*23/TB",
+                "-fps_mode:v",
+                "passthrough",
+                "-c:v",
+                "libx264",
+                "-threads",
+                "2",
+                "-preset",
+                "ultrafast",
+                "-g",
+                "10",
+                "-c:a",
+                "aac",
+                "-output_ts_offset",
+                origin,
+                "-f",
+                "mpegts",
+            ])
+            .arg(&source)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let bytes = std::fs::read(&source).unwrap();
+        let before = timeline(&source).await;
+        let source_duration: f64 = before["format"]["duration"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            source_duration > 24.0,
+            "fixture must contain its 23-second gap"
+        );
+        if origin == "600" {
+            assert!(
+                before["format"]["start_time"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<f64>()
+                    .unwrap()
+                    > 600.0
+            );
+        }
+        state
+            .scheduler
+            .postprocess
+            .enqueue(root.clone(), "gap.ts", None)
+            .await
+            .unwrap();
+        wait_jobs(&state).await;
+        let job = &state.scheduler.postprocess.jobs()[0];
+        assert_eq!(
+            job.state,
+            MediaJobState::Complete,
+            "origin={origin}, cleanup={delete_original}: {}",
+            job.message
+        );
+        assert_eq!(job.source_removed, delete_original);
+        if delete_original {
+            assert!(!source.exists());
+        } else {
+            assert_eq!(std::fs::read(&source).unwrap(), bytes);
+        }
+        let after = timeline(&root.join("gap.mp4")).await;
+        assert_eq!(packets(&before), packets(&after));
+        let output_duration: f64 = after["format"]["duration"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((source_duration - output_duration).abs() < 0.1);
+        assert!(
+            after["format"]["start_time"]
+                .as_str()
+                .unwrap()
+                .parse::<f64>()
+                .unwrap()
+                .abs()
+                < 0.1
+        );
+        api::shutdown(&state).await.unwrap();
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires STREAMCAP_TEST_FFMPEG and rustc; injects decode diagnostics after a successful real decoder"]
+async fn media_cleanup_checks_decoder_errors_even_with_a_success_exit_code() {
+    let tools = tempfile::tempdir().unwrap();
+    let wrapper = tools.path().join(if cfg!(windows) {
+        "ffmpeg.exe"
+    } else {
+        "ffmpeg"
+    });
+    let source_file = tools.path().join("decoder_diagnostics.rs");
+    std::fs::write(
+        tools.path().join("real-ffmpeg.txt"),
+        ffmpeg().to_str().unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        &source_file,
+        r#"
+use std::io::Write;
+fn main() {
+    let root = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
+    let real = std::fs::read_to_string(root.join("real-ffmpeg.txt")).unwrap();
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    let decoding = args.windows(2).any(|pair| pair[0] == "-f" && pair[1] == "null");
+    let mut child = std::process::Command::new(real.trim());
+    child.args(&args);
+    #[cfg(windows)] {
+        use std::os::windows::process::CommandExt;
+        child.creation_flags(0x08000000);
+    }
+    let result = child.output().unwrap();
+    std::io::stdout().write_all(&result.stdout).unwrap();
+    std::io::stderr().write_all(&result.stderr).unwrap();
+    if decoding && result.status.success() {
+        assert!(result.stderr.is_empty(), "synthetic decoder must be clean before injection");
+        std::fs::write(root.join("decoded"), b"exit=0").unwrap();
+        std::io::stderr().write_all(&std::fs::read(root.join("diagnostics")).unwrap()).unwrap();
+    }
+    std::process::exit(result.status.code().unwrap_or(1));
+}
+"#,
+    )
+    .unwrap();
+    let compiled = command(Path::new("rustc"))
+        .arg("--crate-name")
+        .arg("decoder_diagnostics")
+        .arg(&source_file)
+        .arg("-o")
+        .arg(&wrapper)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    std::fs::copy(
+        streamcap_core::paths::adjacent_ffprobe(&ffmpeg()).unwrap(),
+        wrapper.with_file_name(if cfg!(windows) {
+            "ffprobe.exe"
+        } else {
+            "ffprobe"
+        }),
+    )
+    .unwrap();
+    let original = sample_ts("1.2").await;
+    for (name, diagnostics, should_fail) in [
+        ("clean", Vec::new(), false),
+        ("whitespace", b" \r\n\t".to_vec(), false),
+        (
+            "decode-error",
+            b"[h264] reference picture missing during reorder\n".to_vec(),
+            true,
+        ),
+        ("overflow", vec![b'x'; 65537], true),
+    ] {
+        std::fs::write(tools.path().join("diagnostics"), &diagnostics).unwrap();
+        std::fs::write(tools.path().join("decoded"), b"pending").unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = state(directory.path(), false).await;
+        state
+            .config
+            .write()
+            .await
+            .update_user_config(json!({"delete_original":true}).as_object().unwrap().clone())
+            .unwrap();
+        state.scheduler = Arc::new(Scheduler::new(
+            state.store.clone(),
+            state.engine.clone(),
+            state.config.clone(),
+            state.resolver.clone(),
+            Some(wrapper.clone()),
+            state.recording_enabled.clone(),
+        ));
+        let root = directory.path().join("downloads");
+        std::fs::write(root.join("decode.ts"), &original).unwrap();
+        std::fs::write(root.join("unrelated.ts"), b"untouched").unwrap();
+        state
+            .scheduler
+            .postprocess
+            .enqueue(root.clone(), "decode.ts", None)
+            .await
+            .unwrap();
+        wait_jobs(&state).await;
+        let job = &state.scheduler.postprocess.jobs()[0];
+        assert_eq!(
+            std::fs::read(tools.path().join("decoded")).unwrap(),
+            b"exit=0"
+        );
+        assert_eq!(
+            job.state,
+            if should_fail {
+                MediaJobState::Failed
+            } else {
+                MediaJobState::Complete
+            },
+            "case={name}: {}",
+            job.message
+        );
+        assert_eq!(job.source_removed, !should_fail, "case={name}");
+        assert_eq!(
+            root.join("decode.mp4").exists(),
+            !should_fail,
+            "case={name}"
+        );
+        if should_fail {
+            assert_eq!(std::fs::read(root.join("decode.ts")).unwrap(), original);
+            assert!(
+                job.message.contains("MP4 完整解码校验失败"),
+                "{}",
+                job.message
+            );
+            let mut entries: Vec<_> = std::fs::read_dir(&root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            entries.sort();
+            assert_eq!(
+                entries,
+                vec![
+                    std::ffi::OsString::from("decode.ts"),
+                    std::ffi::OsString::from("unrelated.ts")
+                ]
+            );
+        } else {
+            assert!(!root.join("decode.ts").exists());
+        }
+        assert_eq!(
+            std::fs::read(root.join("unrelated.ts")).unwrap(),
+            b"untouched"
+        );
+        api::shutdown(&state).await.unwrap();
+    }
+}
+
+#[tokio::test]
 #[ignore = "requires STREAMCAP_TEST_FFMPEG; generated broken input only"]
 async fn media_cleanup_never_deletes_after_failed_conversion() {
     let directory = tempfile::tempdir().unwrap();
