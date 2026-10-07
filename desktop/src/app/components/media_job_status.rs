@@ -54,11 +54,17 @@ pub fn MediaJobStatus(
             <div class=if compact { "media-job-status card-media-job" } else { "media-job-status media-job-row" }
                 data-job-id=move || job.with(|value| value.as_ref().map(|job| job.id.clone()).unwrap_or_default())
                 data-state=move || job.with(|value| value.as_ref().map(|job| job.state.clone()).unwrap_or_default())>
-                <span class=if compact { "card-media-job-source" } else { "media-job-source" } title=move || source.get()>
-                    {move || if compact { format!("{} · {}", if pending() { t("录后处理") } else { t("最近一次录后处理") }, source.get()) } else { source.get() }}
-                </span>
+                <Show when=move || !compact>
+                    <span class="media-job-source" title=move || source.get()>{move || source.get().rsplit('/').next().unwrap_or_default().to_string()}</span>
+                </Show>
                 <div class="media-job-heading" role="status">
-                    <span class="media-state-symbol" aria-hidden="true"><Icon name="file" size=15 /></span>
+                    <span class="media-state-symbol" aria-hidden="true">
+                        <Show when=move || attention() fallback=move || view! {
+                            <Show when=pending fallback=|| view! { <Icon name="check" size=14 /> }>
+                                <Icon name="refresh" size=14 />
+                            </Show>
+                        }><Icon name="alert" size=14 /></Show>
+                    </span>
                     <strong>{move || phase.get()}</strong>
                 </div>
                 <span class="media-job-detail">
@@ -72,12 +78,16 @@ pub fn MediaJobStatus(
                 </Show>
                 <details class="media-job-diagnostics">
                     <summary>{move || if attention() { t("查看处理原因") } else { t("处理详情") }}</summary>
+                    <div class="media-job-diagnostic-body">
                     <p>{move || job.with(|value| value.as_ref().map(|job| message(job.message.clone())).unwrap_or_default())}</p>
-                    <dl><div><dt>{t("源文件")}</dt><dd>{move || source.get()}</dd></div>
+                    <dl><div><dt>{t("源文件")}</dt><dd class=if compact { "card-media-job-source" } else { "" } title=move || source.get()>{move || source.get()}</dd></div>
                         <Show when=move || job.with(|value| value.as_ref().is_some_and(MediaJob::output_ready))>
                             <div><dt>{t("输出文件")}</dt><dd>{move || job.with(|value| value.as_ref().map(|job| job.output.clone()).unwrap_or_default())}</dd></div>
                         </Show>
                     </dl>
+                    <Show when=move || !pending()><p class="history-note">{t("此处为当次处理记录，不代表文件当前仍在原位置。")}</p></Show>
+                    <Show when=move || compact><a class="text-link" href="/storage">{t("查看处理记录")}<Icon name="arrow" size=14 /></a></Show>
+                    </div>
                 </details>
                 <Show when=move || !compact && job.with(|value| value.as_ref().is_some_and(|job| matches!(job.state.as_str(), "failed" | "cancelled")))>
                     <button class="button secondary small media-retry" type="button"

@@ -1,6 +1,6 @@
 use super::{
     edit_dialog::{RecordingDraft, RecordingFields},
-    Dialog, Icon,
+    Dialog, InlineNotice,
 };
 use crate::api::gateway;
 use crate::app::i18n::t;
@@ -60,7 +60,7 @@ pub fn BatchEditDialog(open: RwSignal<bool>, ids: RwSignal<Vec<String>>) -> impl
     };
     view! {
         <Dialog open=Signal::derive(move || open.get()) title=t("批量编辑任务") busy=busy on_close=Callback::new(move |_| open.set(false))>
-            <div class="scope-notice"><Icon name="shield" /><p>{move || crate::tr_format!("仅修改已选择的 {} 个任务，其他任务不受影响。", ids.get().len())}</p></div>
+            <InlineNotice icon="shield">{move || crate::tr_format!("仅修改已选择的 {} 个任务，其他任务不受影响。", ids.get().len())}</InlineNotice>
             <form on:submit=submit><fieldset disabled=move || busy.get()><RecordingFields draft=draft batch=true /></fieldset>
                 <Show when=move || error.get().is_some()><p class="field-error" role="alert">{move || error.get().unwrap_or_default()}</p></Show>
                 <footer class="modal-actions"><button class="button secondary" type="button" disabled=move || busy.get() on:click=move |_| open.set(false)>{t("取消")}</button><button class="button primary" type="submit" disabled=move || busy.get()>{move || if busy.get() { t("保存中…") } else { t("应用到所选任务") }}</button></footer>

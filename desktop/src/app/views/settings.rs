@@ -2,7 +2,7 @@ use crate::app::i18n::t;
 use crate::{
     api::{desktop, gateway},
     app::{
-        components::{ConfirmDialog, Icon, QrLoginDialog},
+        components::{ConfirmDialog, Icon, PageHeader, QrLoginDialog},
         labels::{platform_label, FORMAT_OPTIONS, PLATFORMS, QUALITY_OPTIONS},
     },
 };
@@ -299,9 +299,9 @@ pub fn SettingsView() -> impl IntoView {
     };
     view! {
         <div class="page settings-page">
-            <header class="page-header"><div><h1>{t("偏好设置")}</h1><p>{t("管理录制、文件处理和应用偏好。")}</p></div>
+            <PageHeader title=t("偏好设置") subtitle=t("配置录制、存储与应用行为。")>
                 <Show when=move || !changes.get().is_empty()><button class="button primary" disabled=move || busy.get() on:click=save><Icon name="check" size=17 />{move || if busy.get() { t("保存中…") } else { t("保存修改") }}</button></Show>
-            </header>
+            </PageHeader>
             <div class="settings-layout">
                 <nav class="settings-nav" aria-label=t("设置分类")>
                     {[(Tab::Recording,"video",t("录制与存储")),(Tab::Appearance,"sun",t("外观与窗口")),(Tab::Network,"signal",t("网络与检测")),(Tab::Accounts,"lock",t("平台登录")),(Tab::Automation,"clock",t("自动化与通知"))].into_iter().map(|(mode,icon,label)| view! {
@@ -312,7 +312,7 @@ pub fn SettingsView() -> impl IntoView {
                 <div class="settings-content">
                     <Show when=move || settings_error().is_some()><div class="inline-error" role="alert"><Icon name="alert" size=18 /><p>{move || settings_error().unwrap_or_default()}</p><Show when=move || changes.get().is_empty()><button class="button secondary small" on:click=reload_settings>{t("重试")}</button></Show></div></Show>
                     <Show when=move || tab.get() == Tab::Recording || tab.get() == Tab::Network || tab.get() == Tab::Automation>
-                        <Show when=move || !loading.get() && !draft.get().is_empty() fallback=move || view! { <div class="loading-state glass"><span class="spinner" />{t("正在读取设置…")}</div> }>
+                        <Show when=move || !loading.get() && !draft.get().is_empty() fallback=move || view! { <div class="loading-state"><span class="spinner" />{t("正在读取设置…")}</div> }>
                             <fieldset disabled=move || busy.get()>
                                 <Show when=move || tab.get() == Tab::Recording>
                                     <SettingsGroup title=t("录制偏好") subtitle=t("作为直播间的默认配置，可为单个任务单独覆盖。") icon="video">
@@ -368,7 +368,7 @@ pub fn SettingsView() -> impl IntoView {
                                   </SettingsGroup>
                                 </Show>
                             </fieldset>
-                            <Show when=move || !changes.get().is_empty()><div class="settings-savebar glass"><span><i class="unsaved-dot" />{t("有未保存的修改")}</span><button class="button secondary small" disabled=move || busy.get() on:click=move |_| { changes.set(Map::new()); error.set(None); }>{t("放弃修改")}</button><button class="button primary small" disabled=move || busy.get() on:click=save>{t("保存修改")}</button></div></Show>
+                            <Show when=move || !changes.get().is_empty()><div class="settings-savebar"><span><i class="unsaved-dot" />{t("有未保存的修改")}</span><button class="button secondary small" disabled=move || busy.get() on:click=move |_| { changes.set(Map::new()); error.set(None); }>{t("放弃修改")}</button><button class="button primary small" disabled=move || busy.get() on:click=save>{t("保存修改")}</button></div></Show>
                         </Show>
                     </Show>
                     <Show when=move || tab.get() == Tab::Appearance>
@@ -436,7 +436,7 @@ fn SettingsGroup(
     icon: &'static str,
     children: Children,
 ) -> impl IntoView {
-    view! { <section class="settings-group glass"><header class="settings-group-header"><span class="settings-group-icon"><Icon name=icon size=20 /></span><div><h2>{title}</h2><p>{subtitle}</p></div></header><div class="settings-group-body">{children()}</div></section> }
+    view! { <section class="settings-group"><header class="settings-group-header"><span class="settings-group-icon"><Icon name=icon size=20 /></span><div><h2>{title}</h2><p>{subtitle}</p></div></header><div class="settings-group-body">{children()}</div></section> }
 }
 #[component]
 fn SettingText(
@@ -567,7 +567,7 @@ fn AccountEditor(platform: RwSignal<String>) -> impl IntoView {
             let _ = busy.try_set(false);
         });
     };
-    view! {<details class="settings-group glass"><summary>{t("平台账号与访问令牌")}</summary><div class="settings-group-body"><p>{t("使用下方所选平台。已有密码和令牌不会回显，未修改的字段不会被覆盖。")}</p>{[("username",t("账号"),false),("password",t("密码"),true),("accessToken",t("访问令牌"),true),("accountType",t("账号类型"),false)].into_iter().map(|(key,label,secret)|view!{<label class="field"><span>{label}</span><input class="input" type=if secret{"password"}else{"text"} autocomplete="off" prop:value=move||draft.with(|m|m.get(key).and_then(Value::as_str).unwrap_or("").to_string()) placeholder=move||if (key=="password"&&has_password.get())||(key=="accessToken"&&has_token.get()){t("已保存；输入可替换")}else{""} on:input=move|e|{let value=Value::String(event_target_value(&e));draft.update(|m|{m.insert(key.into(),value.clone());});dirty.update(|m|{m.insert(key.into(),value);});}/></label>}).collect_view()}<button class="button secondary" type="button" disabled=move||busy.get()||dirty.get().is_empty() on:click=save>{t("保存平台账号")}</button></div></details>}
+    view! {<details class="settings-group"><summary>{t("平台账号与访问令牌")}</summary><div class="settings-group-body"><p>{t("使用下方所选平台。已有密码和令牌不会回显，未修改的字段不会被覆盖。")}</p>{[("username",t("账号"),false),("password",t("密码"),true),("accessToken",t("访问令牌"),true),("accountType",t("账号类型"),false)].into_iter().map(|(key,label,secret)|view!{<label class="field"><span>{label}</span><input class="input" type=if secret{"password"}else{"text"} autocomplete="off" prop:value=move||draft.with(|m|m.get(key).and_then(Value::as_str).unwrap_or("").to_string()) placeholder=move||if (key=="password"&&has_password.get())||(key=="accessToken"&&has_token.get()){t("已保存；输入可替换")}else{""} on:input=move|e|{let value=Value::String(event_target_value(&e));draft.update(|m|{m.insert(key.into(),value.clone());});dirty.update(|m|{m.insert(key.into(),value);});}/></label>}).collect_view()}<button class="button secondary" type="button" disabled=move||busy.get()||dirty.get().is_empty() on:click=save>{t("保存平台账号")}</button></div></details>}
 }
 #[component]
 fn ToolSettings() -> impl IntoView {

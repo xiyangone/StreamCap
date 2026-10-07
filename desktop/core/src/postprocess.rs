@@ -72,6 +72,22 @@ struct JournalRecord {
     input: RecoveryInput,
 }
 
+/// A retry belongs to a task only when both the canonical path and recorded
+/// file identity agree. Relative names alone are not unique across media roots.
+fn source_task_id<'a>(
+    source: &Path,
+    input: &RecoveryInput,
+    candidates: impl Iterator<Item = (&'a Path, &'a MediaJob, &'a RecoveryInput)>,
+) -> Option<String> {
+    let mut matches = candidates.filter_map(|(path, job, previous)| {
+        (path == source && previous.root == input.root && previous.identity == input.identity)
+            .then_some(job.task_id.as_deref())
+            .flatten()
+    });
+    let id = matches.next()?;
+    matches.all(|other| other == id).then(|| id.to_owned())
+}
+
 struct Input {
     root: PathBuf,
     relative: String,
@@ -237,6 +253,19 @@ impl Postprocessor {
             identity: storage::source_identity(&lease)?,
             options,
         };
+        let task_id = task_id.or_else(|| {
+            let jobs = self.inner.jobs.lock().expect("media jobs lock");
+            let recovery = self.inner.recovery.lock().expect("media recovery");
+            source_task_id(
+                &source,
+                &recovery_input,
+                jobs.iter().filter_map(|(path, job)| {
+                    recovery
+                        .get(&job.id)
+                        .map(|input| (path.as_path(), job, input))
+                }),
+            )
+        });
         let id = uuid::Uuid::new_v4().to_string();
         let temporary = source.with_file_name(format!(".streamcap-remux-{id}.mp4"));
         let reservation = self.inner.engine.reserve_media(vec![
@@ -383,7 +412,7 @@ impl Postprocessor {
         if bytes.len() > 2 * 1024 * 1024 {
             return Err(invalid("处理队列文件过大，未恢复"));
         }
-        let entries: Vec<JournalRecord> = serde_json::from_slice(&bytes)
+        let mut entries: Vec<JournalRecord> = serde_json::from_slice(&bytes)
             .map_err(|_| invalid("处理队列文件损坏，未改动媒体文件"))?;
         if entries.len() > 256 {
             return Err(invalid("处理队列条目过多，未恢复"));
@@ -417,6 +446,26 @@ impl Postprocessor {
             .enumerate()
             .map(|(index, source)| (source.clone(), index))
             .collect::<std::collections::HashMap<_, _>>();
+        // Reconnect historical manual attempts without guessing from room names
+        // or changing the result, cleanup choice, or recovery eligibility.
+        let associations = entries
+            .iter()
+            .zip(&source_paths)
+            .map(|(entry, source)| {
+                entry.job.task_id.clone().or_else(|| {
+                    source_task_id(
+                        source,
+                        &entry.input,
+                        entries.iter().zip(&source_paths).map(|(candidate, path)| {
+                            (path.as_path(), &candidate.job, &candidate.input)
+                        }),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        for (entry, task_id) in entries.iter_mut().zip(associations) {
+            entry.job.task_id = task_id;
+        }
         let mut resume = Vec::new();
         for (index, (mut entry, source)) in entries.into_iter().zip(source_paths).enumerate() {
             if entry.job.state.pending() || entry.job.state == MediaJobState::Cancelled {
@@ -1201,6 +1250,76 @@ mod tests {
                 },
             },
         }
+    }
+
+    #[tokio::test]
+    async fn manual_history_inherits_only_verified_source_task_identity() {
+        for variant in ["same", "other-root", "replaced-source", "ambiguous-task"] {
+            let (_directory, root, manager) = recovery_fixture();
+            let mut original = recovery_record(&root, "automatic", MediaJobState::Failed, true);
+            original.job.task_id = Some("room-task".into());
+            let mut retry = recovery_record(&root, "manual", MediaJobState::Complete, false);
+            if variant == "other-root" {
+                retry.input.root = root.join("other-root");
+            } else if variant == "replaced-source" {
+                retry.input.identity.modified += 1;
+            }
+            let mut entries = vec![original, retry];
+            if variant == "ambiguous-task" {
+                let mut another =
+                    recovery_record(&root, "another-task", MediaJobState::Failed, false);
+                another.job.task_id = Some("different-room".into());
+                entries.push(another);
+            }
+            std::fs::write(
+                &manager.inner.journal_path,
+                serde_json::to_vec(&entries).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(manager.recover().await.unwrap(), 0);
+            let jobs = manager.jobs();
+            let retry = jobs.iter().find(|job| job.id == "manual").unwrap();
+            assert_eq!(
+                retry.task_id.as_deref(),
+                (variant == "same").then_some("room-task"),
+                "{variant}"
+            );
+            assert_eq!(retry.state, MediaJobState::Complete);
+            assert!(!retry.delete_original);
+            assert!(!retry.source_removed);
+            assert_eq!(
+                std::fs::read(root.join("resume.ts")).unwrap(),
+                b"preserved source"
+            );
+            assert!(!root.join("resume.mp4").exists());
+            manager.shutdown(Duration::ZERO).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn new_manual_retry_inherits_task_but_not_automatic_cleanup() {
+        let (_directory, root, manager) = recovery_fixture();
+        let mut original = recovery_record(&root, "automatic", MediaJobState::Failed, true);
+        original.job.task_id = Some("room-task".into());
+        std::fs::write(
+            &manager.inner.journal_path,
+            serde_json::to_vec(&[original]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manager.recover().await.unwrap(), 0);
+        let slot = manager.inner.slot.clone().acquire_owned().await.unwrap();
+        let retry = manager
+            .enqueue_manual(root.clone(), "resume.ts", false)
+            .await
+            .unwrap();
+        assert_eq!(retry.task_id.as_deref(), Some("room-task"));
+        assert!(!retry.delete_original);
+        manager.shutdown(Duration::ZERO).await;
+        drop(slot);
+        assert_eq!(
+            std::fs::read(root.join("resume.ts")).unwrap(),
+            b"preserved source"
+        );
     }
 
     #[tokio::test]

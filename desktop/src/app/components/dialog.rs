@@ -55,7 +55,7 @@ pub fn Dialog(
         }
     });
     view! {
-        <dialog node_ref=element class=if wide { "modal modal-wide glass" } else { "modal glass" }
+        <dialog node_ref=element class=if wide { "modal modal-wide" } else { "modal" }
             class:preview-shell=minimized.is_some() class:modal-minimized=is_minimized
             aria-label=move || title.get() aria-modal=move || (!is_minimized()).to_string()
             on:keydown=move |event: leptos::ev::KeyboardEvent| {
@@ -74,7 +74,7 @@ pub fn Dialog(
                     if x < rect.left() || x > rect.right() || y < rect.top() || y > rect.bottom() { close(); }
                 }
             }>
-            <header class="modal-header"><div><span class="eyebrow">"STREAMCAP"</span><h2>{move || title.get()}</h2></div>
+            <header class="modal-header"><div class="modal-title"><h2>{move || title.get()}</h2></div>
                 <div class="modal-header-actions">
                 {minimized.map(|value| view! {
                     <button class="icon-button" type="button" aria-label=move || if value.get() { t("恢复预览") } else { t("最小化预览") } title=move || if value.get() { t("恢复预览") } else { t("最小化预览") } on:click=move |_| value.update(|mini| *mini = !*mini)>
@@ -104,9 +104,10 @@ pub fn ConfirmDialog(
 ) -> impl IntoView {
     view! {
         <Dialog open=Signal::derive(move || open.get()) title=title busy=busy on_close=Callback::new(move |_| open.set(false))>
-            <div class=if destructive {"confirm-symbol"} else {"confirm-symbol confirm-neutral"}><Icon name=icon size=26 /></div>
-            <p class="dialog-description">{move || description.get()}</p>
-            <p class="field-hint">{hint}</p>
+            <div class="confirm-layout">
+                <div class=if destructive {"confirm-symbol"} else {"confirm-symbol confirm-neutral"}><Icon name=icon size=24 /></div>
+                <div><p class="dialog-description">{move || description.get()}</p><p class="field-hint">{hint}</p></div>
+            </div>
             <footer class="modal-actions"><button class="button secondary" disabled=move || busy.get() on:click=move |_| open.set(false)>{t("取消")}</button>
                 <button class=if destructive {"button danger"} else {"button primary"} disabled=move || busy.get() on:click=move |_| on_confirm.run(())>{move || if busy.get() { busy_text } else { confirm_text }}</button>
             </footer>
@@ -120,5 +121,5 @@ pub fn EmptyState(
     title: &'static str,
     description: &'static str,
 ) -> impl IntoView {
-    view! { <div class="empty-state"><span class="empty-icon"><Icon name=icon size=30 /></span><h3>{title}</h3><p>{description}</p></div> }
+    view! { <div class="empty-state"><span class="empty-icon"><Icon name=icon size=24 /></span><div><h3>{title}</h3><p>{description}</p></div></div> }
 }

@@ -22,12 +22,17 @@ pub fn Toast() -> impl IntoView {
             });
         });
     });
+    on_cleanup(move || {
+        timer.update_value(|slot| {
+            slot.take();
+        })
+    });
     view! {
         <div class="toast-region" aria-live="polite" aria-atomic="true">
             <Show when=move || state.notice.get().is_some()>
-                <div class="toast glass" class:error=move || state.notice.get().is_some_and(|n| n.kind == NoticeKind::Error) role="status">
+                <div class="toast" class:error=move || state.notice.get().is_some_and(|n| n.kind == NoticeKind::Error) role="status">
                     <Show when=move || state.notice.get().is_some_and(|n| n.kind == NoticeKind::Error) fallback=|| view! { <Icon name="check" /> }><Icon name="alert" /></Show>
-                    <span>{move || state.notice.get().map(|n| n.message).unwrap_or_default()}</span>
+                    <div class="toast-content"><strong>{move || if state.notice.get().is_some_and(|n| n.kind == NoticeKind::Error) { t("操作未完成") } else { t("操作完成") }}</strong><span>{move || state.notice.get().map(|n| n.message).unwrap_or_default()}</span></div>
                     <button class="icon-button" aria-label=t("关闭提示") on:click=move |_| state.notice.set(None)><Icon name="close" size=16 /></button>
                 </div>
             </Show>

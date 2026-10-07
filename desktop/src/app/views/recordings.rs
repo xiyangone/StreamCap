@@ -4,7 +4,7 @@ use crate::{
     app::{
         components::{
             preview_state, AddRecordingDialog, BatchEditDialog, CardInfoDialog, ConfirmDialog,
-            EditRecordingDialog, EmptyState, Icon, RecordingCard,
+            EditRecordingDialog, EmptyState, Icon, PageHeader, RecordingCard,
         },
         labels::platform_label,
     },
@@ -257,8 +257,11 @@ pub fn RecordingsView() -> impl IntoView {
     });
     view! {
         <div class="page recordings-page">
-            <header class="page-header"><div><h1>{t("录制任务")}<span class="heading-count">{move || state.recording_list.with(Vec::len)}</span></h1><p>{t("新增直播间自动监控，开播后自动录制；单次录制用于手动操作。")}</p></div><div class="header-actions"><button class="button secondary" disabled=move || busy.get() on:click=refresh><Icon name="refresh" size=17 />{t("刷新列表")}</button><button class="button primary" on:click=move |_| add.set(true)><Icon name="plus" size=18 />{t("添加直播间")}</button></div></header>
-            <section class="task-toolbar glass" aria-label=t("任务筛选")>
+            <PageHeader title=t("录制任务") subtitle=t("管理直播间，跟踪录制与监控状态。")>
+                <button class="button secondary" disabled=move || busy.get() on:click=refresh><Icon name="refresh" size=16 />{t("刷新列表")}</button>
+                <button class="button primary" on:click=move |_| add.set(true)><Icon name="plus" size=17 />{t("添加直播间")}</button>
+            </PageHeader>
+            <section class="task-toolbar" aria-label=t("任务筛选")>
                 <div class="filter-tabs" role="group" aria-label=t("状态筛选")>
                     {[(Filter::All,t("全部")),(Filter::Attention,t("需关注")),(Filter::Recording,t("录制中")),(Filter::Live,t("直播未录制")),(Filter::Monitoring,t("等待开播")),(Filter::Paused,t("已暂停"))].into_iter().map(|(mode,label)| view! {
                         <button class="filter-tab" class:active=move || filter.get() == mode aria-pressed=move || (filter.get() == mode).to_string() on:click=move |_| filter.set(mode)>{label}<span>{move || state.recording_list.with(|items| items.iter().filter(|r| mode.matches(r.phase)).count())}</span></button>
@@ -274,9 +277,9 @@ pub fn RecordingsView() -> impl IntoView {
             <div class="results-line"><label class="select-all"><input type="checkbox" prop:checked=all_visible_selected disabled=move || visible.get().is_empty() on:change=select_visible /><span>{t("全选当前结果")}</span></label>
                 <Show when=move || { processing.get() > 0 }><a class="text-link processing-link" href="/storage"><Icon name="file" size=14 />{move || crate::tr_format!("{} 项录后处理", processing.get())}</a></Show>
                 <span>{move || crate::tr_format!("显示 {} 个直播间", visible.get().len())}</span></div>
-            <Show when=move || !selected.get().is_empty()><div class="batch-bar glass" role="region" aria-label=t("所选任务操作")><strong>{move || crate::tr_format!("已选 {} 项", selected.get().len())}</strong><button class="button secondary small" disabled=move || busy.get() || has_active_selection() || !state.status.get().ok title=t("录制中的任务须先停止") on:click=move |_| { batch_ids.set(selected.get_untracked()); batch_open.set(true); }><Icon name="edit" size=15 />{t("批量编辑")}</button><button class="button secondary small" disabled=move || busy.get() || !state.status.get().ok on:click=move |_| monitor_selected.run(true)>{t("开启监控")}</button><button class="button secondary small" disabled=move || busy.get() || !state.status.get().ok on:click=move |_| monitor_selected.run(false)>{t("暂停监控")}</button><button class="button ghost-danger small" disabled=move || busy.get() || has_active_selection() || !state.status.get().ok on:click=move |_| { delete_ids.set(selected.get_untracked()); delete_open.set(true); }><Icon name="trash" size=15 />{t("移除所选")}</button><button class="icon-button" aria-label=t("取消选择") on:click=move |_| selected.set(Vec::new())><Icon name="close" size=17 /></button></div></Show>
+            <Show when=move || !selected.get().is_empty()><div class="batch-bar" role="region" aria-label=t("所选任务操作")><strong>{move || crate::tr_format!("已选 {} 项", selected.get().len())}</strong><button class="button secondary small" disabled=move || busy.get() || has_active_selection() || !state.status.get().ok title=t("录制中的任务须先停止") on:click=move |_| { batch_ids.set(selected.get_untracked()); batch_open.set(true); }><Icon name="edit" size=15 />{t("批量编辑")}</button><button class="button secondary small" disabled=move || busy.get() || !state.status.get().ok on:click=move |_| monitor_selected.run(true)>{t("开启监控")}</button><button class="button secondary small" disabled=move || busy.get() || !state.status.get().ok on:click=move |_| monitor_selected.run(false)>{t("暂停监控")}</button><button class="button ghost-danger small" disabled=move || busy.get() || has_active_selection() || !state.status.get().ok on:click=move |_| { delete_ids.set(selected.get_untracked()); delete_open.set(true); }><Icon name="trash" size=15 />{t("移除所选")}</button><button class="icon-button" aria-label=t("取消选择") on:click=move |_| selected.set(Vec::new())><Icon name="close" size=17 /></button></div></Show>
             <Show when=move || state.loading.get()><div class="skeleton-grid" aria-label=t("加载任务")><div class="skeleton" /><div class="skeleton" /><div class="skeleton" /></div></Show>
-            <Show when=move || !state.loading.get() && visible.get().is_empty()><div class="glass empty-panel"><EmptyState icon="search" title=t("没有匹配的直播间") description=t("尝试调整搜索条件，或添加新的直播间。") /><button class="button secondary" on:click=move |_| { keyword.set(String::new()); platform.set(String::new()); filter.set(Filter::All); }>{t("清除筛选")}</button></div></Show>
+            <Show when=move || !state.loading.get() && visible.get().is_empty()><div class="empty-panel"><EmptyState icon="search" title=t("没有匹配的直播间") description=t("尝试调整搜索条件，或添加新的直播间。") /><button class="button secondary" on:click=move |_| { keyword.set(String::new()); platform.set(String::new()); filter.set(Filter::All); }>{t("清除筛选")}</button></div></Show>
             <div class="cards-grid" class:list-view=move || !state.grid_view.get()>
                 <For each=move || visible.get() key=|id| id.clone() children=move |id| state.recording_untracked(&id).map(|rec| view! { <RecordingCard recording=rec selectable=true selected=selected on_edit=Callback::new(move |r| editing.set(Some(r))) on_info=Callback::new(move |r| info.set(Some(r))) on_preview=Callback::new(move |r| preview.open_recording(r)) /> }) />
             </div>

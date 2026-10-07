@@ -1,4 +1,4 @@
-use super::{Dialog, EmptyState, Icon};
+use super::{Dialog, EmptyState, Icon, InlineNotice};
 use crate::app::i18n::t;
 use crate::{
     api::gateway::{self, Recording, RecordingFile, StorageItem},
@@ -129,7 +129,7 @@ pub fn MediaPlayer(#[prop(into)] path: Signal<String>) -> impl IntoView {
         <div class="media-preview" data-player-state=move || phase.get() data-path=move||path.get()>
             <Show when=supported fallback=|| view! { <EmptyState icon="file" title=t("此格式需要本地播放器") description=t("当前预览支持 TS、MP4 和常见网页媒体格式。原文件不受影响。") /> }>
                 <Show when=audio fallback=move || view! { <video node_ref=video class="video-player" controls playsinline preload="auto" aria-label=t("录制视频预览") /> }>
-                    <div class="audio-art"><Icon name="volume" size=46 /><span>"AUDIO RECORDING"</span></div>
+                    <div class="audio-art"><Icon name="volume" size=40 /><span>{t("音频录制")}</span></div>
                     <audio class="audio-player" controls preload="metadata" aria-label=t("录制音频预览") src=move || gateway::video_url(&path.get()) on:error=move |_| { phase.set("error".into()); message.set(t("无法播放此音频，原始文件未改动。").into()); } />
                 </Show>
             <Show when=move || !message.get().is_empty()><div class="player-message" class:player-error=move || phase.get() == "error" role="status"><Icon name="info" size=17 /><span>{move || message.get()}</span></div></Show>
@@ -339,7 +339,7 @@ pub fn PreviewHost() -> impl IntoView {
                 view! { <button role="listitem" class="preview-file" class:active=move || playing.get() == active_path on:click=move |_| playing.set(path.clone())><Icon name="file" size=17 /><span>{file.name}</span><small>{human_size(file.size)}<br />{crate::app::labels::modified_time(Some(file.modified))}</small></button> }
             }).collect_view()}</div>
             </Show>
-            <Show when=move || !media_message().is_empty()><p class="media-job-status" role="status">{media_message}</p></Show>
+            <Show when=move || !media_message().is_empty()><InlineNotice icon="history"><span role="status">{media_message}</span></InlineNotice></Show>
         </Dialog>
     }
 }

@@ -1,4 +1,4 @@
-use super::{Dialog, Icon};
+use super::{Dialog, Icon, InlineNotice};
 use crate::api::desktop;
 use crate::app::i18n::t;
 use leptos::prelude::*;
@@ -30,7 +30,7 @@ pub fn CloseDialog() -> impl IntoView {
     });
     view! {
         <Dialog open=Signal::derive(move||desktop.request.get().is_some()) title=t("关闭 StreamCap") on_close=Callback::new(move |_|choose.run("cancel")) busy=busy>
-            <p class="dialog-description">{move || { let request = desktop.request.get().unwrap_or_default(); crate::tr_format!("正在录制 {} 项，待处理媒体 {} 项。退出将停止录制并等待转 MP4；超时会保留 TS。托盘模式继续后台处理。", request.active_recordings, request.pending_media_jobs) }}</p>
+            <InlineNotice icon="activity">{move || { let request = desktop.request.get().unwrap_or_default(); crate::tr_format!("正在录制 {} 项，待处理媒体 {} 项。退出将停止录制并等待转 MP4；超时会保留 TS。托盘模式继续后台处理。", request.active_recordings, request.pending_media_jobs) }}</InlineNotice>
             <div class="close-options">
                 <button class="close-option" disabled=move||busy.get()||!desktop.request.get().is_some_and(|r|r.tray_available) on:click=move |_|choose.run("tray")><Icon name="tray" size=24 /><span><strong>{t("最小化到托盘")}</strong><small>{t("继续监控和录制，从托盘图标返回")}</small></span><Icon name="chevron" size=17 /></button>
                 <button class="close-option" disabled=move||busy.get() on:click=move |_|choose.run("exit")><Icon name="power" size=24 /><span><strong>{t("退出应用")}</strong><small>{t("停止监控，完成录制收尾并关闭程序")}</small></span><Icon name="chevron" size=17 /></button>

@@ -4,7 +4,7 @@ use crate::{
     app::{
         components::{
             preview_state, AddRecordingDialog, CardInfoDialog, EditRecordingDialog, EmptyState,
-            Icon, RecordingCard,
+            Icon, Metric, PageHeader, RecordingCard,
         },
         labels::{format_label, quality_label},
     },
@@ -109,52 +109,52 @@ pub fn HomeView() -> impl IntoView {
     };
     view! {
         <div class="page home-page">
-            <header class="page-header"><div><h1>{t("录制工作台")}</h1><p>{t("添加即监控，开播自动录制；在这里查看进度和异常。")}</p></div><button class="button primary" on:click=move |_| add.set(true)><Icon name="plus" size=18 />{t("添加直播间")}</button></header>
-            <div class="stats-strip glass">
-                <div class="stat-item"><span class="stat-icon blue"><Icon name="video" /></span><div><span class="stat-label">{t("全部直播间")}</span><strong>{move || state.recording_list.with(Vec::len)}</strong></div></div>
-                <div class="stat-item"><span class="stat-icon green"><Icon name="signal" /></span><div><span class="stat-label">{t("正在录制")}</span><strong>{active}<small>{t("路")}</small></strong></div></div>
-                <div class="stat-item"><span class="stat-icon cyan"><Icon name="eye" /></span><div><span class="stat-label">{t("等待开播")}</span><strong>{waiting}</strong></div></div>
-                <div class="stat-item"><span class="stat-icon attention"><Icon name="alert" /></span><div><span class="stat-label">{t("需关注")}</span><strong>{attention}</strong></div></div>
+            <PageHeader title=t("录制工作台") subtitle=t("录制、监控与媒体处理，一目了然。")>
+                <button class="button primary" on:click=move |_| add.set(true)><Icon name="plus" size=17 />{t("添加直播间")}</button>
+            </PageHeader>
+            <div class="stats-strip" aria-label=t("录制概况")>
+                <Metric label=t("全部直播间") icon="video" value=Signal::derive(move || state.recording_list.with(Vec::len).to_string()) />
+                <Metric label=t("正在录制") icon="activity" value=Signal::derive(move || active().to_string()) tone="success" />
+                <Metric label=t("等待开播") icon="clock" value=Signal::derive(move || waiting().to_string()) tone="accent" />
+                <Metric label=t("需关注") icon="alert" value=Signal::derive(move || attention().to_string()) tone="danger" />
             </div>
-            <div class="overview-grid workbench-overview">
-                <section class="capture-panel glass">
-                    <div class="capture-copy"><span class="live-label"><i class="status-dot" />{t("自动录制")}</span>
-                        <h2>{move || if active() > 0 { crate::tr_format!("{} 路直播，正在记录", active()) } else if live_idle() > 0 { t("直播已开播，当前未录制").into() } else if attention() > 0 { t("有任务需要确认状态").into() } else if waiting() > 0 { t("正在等待直播开播").into() } else { t("添加直播间，开始自动录制").into() }}</h2>
-                        <p>{move || if attention() > 0 { t("有需要处理的任务，请查看下方提示。") } else if live_idle() > 0 { t("请查看任务的录制与通知设置。") } else if waiting() > 0 || active() > 0 { t("监控已开启，无需逐个点击录制。") } else { t("新增直播间会自动开启监控。") }}</p>
-                        <div class="workbench-actions"><a class="button secondary small" href="/recordings">{t("管理直播间")}<Icon name="arrow" size=15 /></a><a class="text-link" href="/storage">{t("打开媒体库")}<Icon name="folder" size=15 /></a></div>
-                        <div class="workbench-service" role="status"><span class:healthy=move || state.status.get().ok><i class="status-dot" />{move || if state.status.get().ok { t("本地服务已连接") } else {t("本地服务未连接")}}</span><span class:unhealthy=move || !state.status.get().resolver_ready>{move || if state.status.get().resolver_ready {t("解析已就绪")} else {t("解析暂不可用")}}</span></div>
-                    </div>
-                </section>
-                <section class="health-panel glass recording-plan"><div class="section-heading compact"><h2>{t("当前录制方案")}</h2><a class="text-link" href="/settings">{t("调整设置")}<Icon name="chevron" size=14 /></a></div>
-                    <div class="health-row"><span>{t("画质与格式")}</span><strong>{move || format!("{} · {}", quality_label(Some(&state.setting("record_quality", "OD"))), format_label(Some(&state.setting("video_format", "TS"))))}</strong></div>
-                    <div class="health-row"><span>{t("检测间隔")}</span><strong>{move || crate::app::labels::interval_label(&state.setting("loop_time_seconds","300"))}</strong></div>
-                    <div class="health-row"><span>{t("录制后处理")}</span><strong>{postprocess}</strong></div>
-                </section>
-            </div>
-            <section class="queue-overview glass" aria-label=t("检测队列")>
-                <strong><Icon name="refresh" size=16 />{t("检测队列")}</strong>
-                <span>{t("检测中")}<b>{move || queue_counts.get()[0]}</b></span><span>{t("排队中")}<b>{move || queue_counts.get()[1]}</b></span>
-                <span>{t("断流恢复")}<b>{move || queue_counts.get()[2]}</b></span><span>{t("平台冷却中")}<b>{move || queue_counts.get()[3]}</b></span>
-                <a class="text-link" href="/recordings">{t("查看全部")}<Icon name="chevron" size=14 /></a>
-            </section>
-            <Show when=move || media_counts.get() != (0, 0)>
-                <a class="processing-summary glass" href="/storage">
-                    <span class="summary-icon"><Icon name="file" size=21 /></span>
-                    <div><strong>{t("媒体处理")}</strong><p>{move || crate::tr_format!("{} 项处理中 · {} 项需查看", media_counts.get().0, media_counts.get().1)}</p></div>
-                    <span class="text-link">{t("查看处理任务")}<Icon name="arrow" size=16 /></span>
-                </a>
-            </Show>
-            <section class="recent-section"><div class="section-heading"><div><h2>{t("优先关注")}<span class="count-pill">{move || state.recording_list.with(Vec::len)}</span></h2><p>{t("失败与正在录制的任务优先显示")}</p></div><a class="text-link" href="/recordings">{t("查看全部")}<Icon name="arrow" size=15 /></a></div>
-                <Show when=move || state.loading.get()><div class="skeleton-grid" aria-label=t("正在加载任务")><div class="skeleton" /><div class="skeleton" /><div class="skeleton" /></div></Show>
-                <Show when=move || !state.loading.get() && state.recording_list.with(Vec::is_empty)><div class="glass empty-panel"><EmptyState icon="video" title=t("你的直播间，从这里开始") description=t("添加第一个直播间，开启属于你的录制工作空间。") /><button class="button primary" on:click=move |_| add.set(true)><Icon name="plus" size=17 />{t("添加第一个直播间")}</button></div></Show>
-                <div class="cards-grid">
-                    <For each=move || recent.get() key=|id| id.clone() children=move |id| state.recording_untracked(&id).map(|rec| view! {
-                        <RecordingCard recording=rec on_edit=Callback::new(move |r| editing.set(Some(r))) on_info=Callback::new(move |r| info.set(Some(r))) on_preview=Callback::new(move |r| preview.open_recording(r)) />
-                    }) />
+            <div class="dashboard-layout">
+                <div class="dashboard-primary">
+                    <section class="recent-section">
+                        <div class="section-heading"><div><h2>{t("优先关注")}</h2><p>{t("失败与正在录制的任务优先显示")}</p></div><a class="text-link" href="/recordings">{t("查看全部")}<Icon name="arrow" size=15 /></a></div>
+                        <Show when=move || state.loading.get()><div class="skeleton-grid" aria-label=t("加载任务")><div class="skeleton" /><div class="skeleton" /></div></Show>
+                        <Show when=move || !state.loading.get() && recent.get().is_empty()><EmptyState icon="video" title=t("还没有直播间") description=t("添加直播间后，开播时会自动开始录制。") /></Show>
+                        <div class="cards-grid list-view home-tasks">
+                            <For each=move || recent.get() key=|id| id.clone() children=move |id| {
+                                let recording = state.recording(&id).unwrap_or_default();
+                                view! { <RecordingCard recording=recording on_edit=Callback::new(move |rec| editing.set(Some(rec))) on_info=Callback::new(move |rec| info.set(Some(rec))) on_preview=Callback::new(move |rec| preview.open_recording(rec)) /> }
+                            } />
+                        </div>
+                    </section>
+                    <Show when=move || media_counts.get() != (0, 0)>
+                        <a class="processing-summary" href="/storage"><span class="summary-icon"><Icon name="history" size=21 /></span><div><strong>{t("媒体处理")}</strong><p>{move || crate::tr_format!("{} 项处理中 · {} 项需查看", media_counts.get().0, media_counts.get().1)}</p></div><Icon name="arrow" size=17 /></a>
+                    </Show>
                 </div>
-            </section>
-            <footer class="page-footer"><span><Icon name="shield" size=14 />{t("录制文件保存在本地")}</span><span>{t("专注此刻，留存精彩")}</span></footer>
+                <aside class="dashboard-secondary" aria-label=t("录制运行信息")>
+                    <section class="runtime-panel panel">
+                        <div class="section-heading compact"><h2><Icon name="activity" size=16 />{t("自动录制")}</h2></div>
+                        <strong class="runtime-title">{move || if active() > 0 { crate::tr_format!("{} 路直播，正在记录", active()) } else if live_idle() > 0 { t("直播已开播，当前未录制").into() } else if attention() > 0 { t("有任务需要确认状态").into() } else if waiting() > 0 { t("正在等待直播开播").into() } else { t("添加直播间，开始自动录制").into() }}</strong>
+                        <p class="runtime-description">{move || if attention() > 0 { t("有需要处理的任务，请查看下方提示。") } else if live_idle() > 0 { t("请查看任务的录制与通知设置。") } else { t("监控已开启，无需逐个点击录制。") }}</p>
+                        <div class="workbench-service" role="status"><span class:healthy=move || state.status.get().ok><i class="status-dot" />{move || if state.status.get().ok { t("本地服务已连接") } else { t("本地服务未连接") }}</span><span class:unhealthy=move || !state.status.get().resolver_ready>{move || if state.status.get().resolver_ready { t("解析已就绪") } else { t("解析暂不可用") }}</span></div>
+                    </section>
+                    <section class="queue-overview panel" aria-label=t("检测队列")>
+                        <div class="section-heading compact"><h2><Icon name="refresh" size=16 />{t("检测队列")}</h2></div>
+                        <div class="queue-stat"><span>{t("检测中")}</span><b>{move || queue_counts.get()[0]}</b></div><div class="queue-stat"><span>{t("排队中")}</span><b>{move || queue_counts.get()[1]}</b></div>
+                        <div class="queue-stat"><span>{t("断流恢复")}</span><b>{move || queue_counts.get()[2]}</b></div><div class="queue-stat"><span>{t("平台冷却中")}</span><b>{move || queue_counts.get()[3]}</b></div>
+                    </section>
+                    <section class="recording-plan panel"><div class="section-heading compact"><h2>{t("当前录制方案")}</h2><a class="text-link" href="/settings" aria-label=t("调整设置")><Icon name="sliders" size=16 /></a></div>
+                        <div class="health-row"><span>{t("画质与格式")}</span><strong>{move || format!("{} · {}", quality_label(Some(&state.setting("record_quality", "OD"))), format_label(Some(&state.setting("video_format", "TS"))))}</strong></div>
+                        <div class="health-row"><span>{t("检测间隔")}</span><strong>{move || crate::app::labels::interval_label(&state.setting("loop_time_seconds","300"))}</strong></div>
+                        <div class="health-row"><span>{t("录制后处理")}</span><strong>{postprocess}</strong></div>
+                    </section>
+                </aside>
+            </div>
+            <AddRecordingDialog open=add /><EditRecordingDialog target=editing /><CardInfoDialog target=info />
         </div>
-        <AddRecordingDialog open=add /><EditRecordingDialog target=editing /><CardInfoDialog target=info />
     }
 }

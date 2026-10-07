@@ -83,7 +83,7 @@ fn Shell() -> impl IntoView {
         }
     });
     view! {
-        <div class="app-shell" class:native-desktop=desktop.available>
+        <div class="app-shell" class:native-desktop=desktop.available data-ui="workbench">
             <a class="skip-link" href="#main-content">{t("跳到主要内容")}</a>
             <navigation::Sidebar />
             <div class="main-area">
@@ -122,7 +122,7 @@ fn Topbar() -> impl IntoView {
     };
     view! {
         <header class="topbar">
-            <div class="titlebar-drag-zone" data-tauri-drag-region="deep"><div class="breadcrumbs"><strong>{title}</strong></div></div>
+            <div class="titlebar-drag-zone" data-tauri-drag-region="deep"><div class="breadcrumbs"><span class="breadcrumb-app">"StreamCap"</span><span class="breadcrumb-separator" aria-hidden="true">"/"</span><strong>{title}</strong></div></div>
             <div class="topbar-actions">
                 <Show when=move || { processing.get() > 0 }>
                     <a class="processing-indicator" href="/storage" title=t("查看媒体处理任务") aria-label=move || crate::tr_format!("{} 项处理中", processing.get())>

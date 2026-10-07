@@ -9,7 +9,7 @@ pub fn Sidebar() -> impl IntoView {
     let location = use_location();
     let state = gateway::app_state();
     view! {
-        <aside class="sidebar glass">
+        <aside class="sidebar">
             <A attr:class="sidebar-brand" href="/home" attr:aria-label=t("StreamCap 总览")>
                 <span class="brand-mark"><img src="/logo-mark.png" alt="" /></span>
                 <div><strong>"StreamCap"</strong><small>{t("本地直播录制")}</small></div>
@@ -27,7 +27,7 @@ pub fn Sidebar() -> impl IntoView {
                 }).collect_view()}
             </nav>
             <div class="sidebar-bottom">
-                <div class="workspace-card"><span class="workspace-icon"><Icon name="shield" size=18 /></span><div><strong>{t("本地工作空间")}</strong><p>{t("你的设备，你的内容")}</p></div></div>
+                <div class="workspace-card"><span class="workspace-icon"><Icon name="hard-drive" size=17 /></span><div><strong>{t("本地工作空间")}</strong><p>{move || if state.status.get().ok { t("本地服务已连接") } else { t("本地服务未连接") }}</p></div><i class="workspace-status" class:online=move || state.status.get().ok /></div>
                 <A href="/about" attr:aria-label=t("关于 StreamCap") attr:class=move || if location.pathname.get() == "/about" { "nav-item active" } else { "nav-item" }><Icon name="info" /><span>{t("关于 StreamCap")}</span><span class="version-label">{env!("CARGO_PKG_VERSION")}</span></A>
             </div>
         </aside>

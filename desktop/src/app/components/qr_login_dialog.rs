@@ -1,4 +1,4 @@
-use super::{Dialog, Icon};
+use super::{Dialog, Icon, InlineNotice};
 use crate::api::gateway::{self, QrSnapshot};
 use crate::app::i18n::t;
 use leptos::prelude::*;
@@ -147,7 +147,8 @@ pub fn QrLoginDialog(open: RwSignal<bool>, on_success: Callback<QrSnapshot>) -> 
     };
     view! {
         <Dialog open=Signal::derive(move||open.get()) title=t("快手扫码登录") on_close=Callback::new(move |_|open.set(false)) busy=busy>
-            <p class="dialog-description">{t("在快手 App 扫码并确认。账号验证完成后，点击保存登录信息。")}</p>
+            <ol class="login-steps" aria-label=t("登录步骤")><li class:active=move || matches!(phase().as_str(), "loading" | "waiting")>{t("扫描二维码")}</li><li class:active=move || matches!(phase().as_str(), "scanned" | "verifying")>{t("手机确认")}</li><li class:active=move || phase() == "success">{t("保存登录信息")}</li></ol>
+            <InlineNotice icon="lock">{t("在快手 App 扫码并确认。账号验证完成后，点击保存登录信息。")}</InlineNotice>
             <div class="qr-panel" class:qr-code-container=move||phase()=="waiting">
                 <Show when=move||phase()=="waiting"&&snapshot.get().is_some_and(|s|!s.image_base64.is_empty()) fallback=move||view!{
                     <div class="qr-stage" class:error=failed class:success=move||phase()=="success" role="status" aria-live="polite">

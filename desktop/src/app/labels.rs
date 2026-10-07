@@ -232,18 +232,28 @@ pub fn recording_media_job<'a>(
     record: &crate::api::gateway::Recording,
     jobs: &'a [crate::api::gateway::MediaJob],
 ) -> Option<&'a crate::api::gateway::MediaJob> {
-    let belongs = |job: &&crate::api::gateway::MediaJob| {
-        job.task_id.as_deref() == Some(record.rec_id.as_str())
-    };
-    jobs.iter()
-        .filter(belongs)
+    let latest_attempts = jobs
+        .iter()
+        .enumerate()
+        .filter(|(_, job)| job.task_id.as_deref() == Some(record.rec_id.as_str()))
+        .filter(|(index, job)| {
+            !jobs[index + 1..]
+                .iter()
+                .any(|newer| newer.task_id == job.task_id && newer.source == job.source)
+        })
+        .map(|(_, job)| job)
+        .collect::<Vec<_>>();
+    latest_attempts
+        .iter()
+        .copied()
         .find(|job| job.pending() && job.state != "waiting")
         .or_else(|| {
-            jobs.iter()
-                .filter(belongs)
+            latest_attempts
+                .iter()
+                .copied()
                 .find(|job| job.state == "waiting")
         })
-        .or_else(|| jobs.iter().rev().find(belongs))
+        .or_else(|| latest_attempts.last().copied())
         .filter(|job| !record.is_recording || job.state != "complete")
 }
 
@@ -258,6 +268,7 @@ pub fn media_phase(job: &crate::api::gateway::MediaJob) -> &'static str {
         "cleanupFailed" => "MP4 已生成 · 源文件保留",
         "complete" => "转换完成",
         "cancelled" => "已中断 · 源文件保留",
+        "failed" if job.message.contains("校验") => "校验未通过 · 未清理源文件",
         "failed" => "转换失败 · 源文件保留",
         _ => "媒体处理",
     })
@@ -286,6 +297,9 @@ pub fn media_progress(job: &crate::api::gateway::MediaJob, now: i64) -> String {
         .or_else(|| (job.elapsed_seconds > 0).then_some(job.elapsed_seconds))
         .map(|seconds| crate::tr_format!("耗时 {}", duration(seconds as f64)))
         .unwrap_or_else(|| t("耗时未知").into());
+    if !job.pending() {
+        return elapsed;
+    }
     let progress = job
         .stage_percent
         .map(|percent| crate::tr_format!("本阶段 {}%", percent))
@@ -520,11 +534,14 @@ mod tests {
             rec_id: "task".into(),
             ..Default::default()
         };
-        let jobs = vec![
+        let mut jobs = vec![
             media_job("running"),
             media_job("waiting"),
             media_job("complete"),
         ];
+        for (index, job) in jobs.iter_mut().enumerate() {
+            job.source = format!("segment-{index}.ts");
+        }
         assert_eq!(
             recording_media_job(&record, &jobs).unwrap().state,
             "running"
@@ -535,10 +552,44 @@ mod tests {
         );
         let mut queue = vec![media_job("waiting"), media_job("waiting")];
         queue[0].id = "first-segment".into();
+        queue[0].source = "first-segment.ts".into();
         assert_eq!(
             recording_media_job(&record, &queue).unwrap().id,
             "first-segment"
         );
+    }
+
+    #[test]
+    fn a_completed_retry_supersedes_stale_active_and_failed_attempts() {
+        let record = crate::api::gateway::Recording {
+            rec_id: "task".into(),
+            ..Default::default()
+        };
+        for state in ["failed", "running", "waiting", "cancelled"] {
+            let jobs = vec![media_job(state), media_job("complete")];
+            assert_eq!(
+                recording_media_job(&record, &jobs).unwrap().state,
+                "complete"
+            );
+        }
+        let jobs = vec![media_job("failed"), media_job("verifying")];
+        assert_eq!(
+            recording_media_job(&record, &jobs).unwrap().state,
+            "verifying"
+        );
+    }
+
+    #[test]
+    fn completed_history_does_not_show_stale_percentage_or_eta() {
+        let mut job = media_job("complete");
+        job.stage_percent = Some(100);
+        job.stage_eta_seconds = Some(12);
+        job.elapsed_seconds = 43;
+        let text = media_progress(&job, 0);
+        assert_eq!(text, "耗时 00:00:43");
+        job.state = "failed".into();
+        job.message = "MP4 完整解码校验失败".into();
+        assert_eq!(media_phase(&job), "校验未通过 · 未清理源文件");
     }
 
     #[test]
@@ -557,7 +608,7 @@ mod tests {
     #[test]
     fn missing_processing_timing_is_unknown_not_zero() {
         let job = media_job("complete");
-        assert_eq!(media_progress(&job, 200), "处理已结束 · 耗时未知");
+        assert_eq!(media_progress(&job, 200), "耗时未知");
     }
 
     #[test]
@@ -565,7 +616,7 @@ mod tests {
         let mut job = media_job("complete");
         job.started_at = Some(100);
         job.finished_at = Some(100);
-        assert_eq!(media_progress(&job, 200), "处理已结束 · 耗时 00:00:00");
+        assert_eq!(media_progress(&job, 200), "耗时 00:00:00");
     }
 
     #[test]
@@ -573,10 +624,10 @@ mod tests {
         let mut job = media_job("complete");
         job.started_at = Some(100);
         job.elapsed_seconds = 7;
-        assert_eq!(media_progress(&job, 200), "处理已结束 · 耗时 00:00:07");
+        assert_eq!(media_progress(&job, 200), "耗时 00:00:07");
         assert_eq!(media_progress(&job, 900), media_progress(&job, 200));
         job.elapsed_seconds = 0;
-        assert_eq!(media_progress(&job, 900), "处理已结束 · 耗时未知");
+        assert_eq!(media_progress(&job, 900), "耗时未知");
     }
 
     #[test]

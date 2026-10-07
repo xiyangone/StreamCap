@@ -1,4 +1,4 @@
-use super::Dialog;
+use super::{Dialog, FieldSection};
 use crate::app::i18n::t;
 use crate::{
     api::gateway::{self, Recording},
@@ -195,7 +195,7 @@ impl RecordingDraft {
 #[component]
 pub fn RecordingFields(draft: RecordingDraft, #[prop(optional)] batch: bool) -> impl IntoView {
     view! {
-        <div class="form-grid">
+        <FieldSection title=t("画质与格式")><div class="form-grid">
             <label class="field"><span>{t("清晰度")}</span><select class="input" prop:value=move || draft.quality.get() on:change=move |e| draft.quality.set(event_target_value(&e))>
                 {batch.then(|| view! { <option value=KEEP>{t("保持原值")}</option> })}<option value=GLOBAL>{t("跟随全局")}</option>
                 {QUALITY_OPTIONS.iter().map(|(code,label)| view! { <option value=*code>{*label}</option> }).collect_view()}
@@ -216,10 +216,10 @@ pub fn RecordingFields(draft: RecordingDraft, #[prop(optional)] batch: bool) -> 
                 <div class="field-tools"><button class="text-button" type="button" on:click=move |_| draft.bitrate.set(String::new())>{t("复制源流")}</button>{batch.then(|| view! { <button class="text-button" type="button" on:click=move |_| draft.bitrate.set(KEEP.into())>{t("保持原值")}</button> })}</div>
             </div>
 
-            <div class="full-width form-divider" />
+        </div></FieldSection><FieldSection title=t("监控与自动化")><div class="form-grid">
             {[(draft.schedule,t("定时录制"),false),(draft.push,t("任务通知"),false),(draft.notify_only,t("仅通知不录制"),true),(draft.direct,t("FLV 直下"),true)].into_iter().map(|(signal,label,inherited)|view!{<label class="field"><span>{label}</span><select class="input" prop:value=move||signal.get() on:change=move|e|signal.set(event_target_value(&e))><option value=KEEP>{t("保持原值")}</option>{inherited.then(||view!{<option value=GLOBAL>{t("跟随全局")}</option>})}<option value="true">{t("开启")}</option><option value="false">{t("关闭")}</option></select></label>}).collect_view()}
             {[(draft.starts,t("定时开始时间"),t("例如 08:00,23:00")),(draft.hours,t("对应监控小时数"),t("例如 2,3；跨午夜也有效"))].into_iter().map(|(signal,label,hint)|view!{<label class="field"><span>{label}</span><input class="input" placeholder=hint prop:value=move||{let value=signal.get();if value==KEEP{String::new()}else{value}} on:input=move|e|signal.set(event_target_value(&e))/><small>{hint}</small>{batch.then(||view!{<button type="button" class="text-button" on:click=move |_|signal.set(KEEP.into())>{t("保持原值")}</button>})}</label>}).collect_view()}
-        </div>
+        </div></FieldSection>
     }
 }
 
@@ -287,10 +287,10 @@ pub fn EditRecordingDialog(target: RwSignal<Option<Recording>>) -> impl IntoView
     view! {
         <Dialog open=Signal::derive(move || target.get().is_some()) title=t("编辑直播间") busy=busy on_close=Callback::new(move |_| target.set(None))>
             <p class="dialog-description">{t("为这个直播间单独设置录制偏好，也可保持跟随全局。")}</p>
-            <form on:submit=submit><fieldset disabled=move || busy.get()>
+            <form on:submit=submit><fieldset disabled=move || busy.get()><FieldSection title=t("直播间信息")>
                 <label class="field"><span>{t("主播名称")}</span><input class="input" autofocus prop:value=move || name.get() on:input=move |e| name.set(event_target_value(&e)) /></label>
                 <label class="field"><span>{t("直播间地址")}</span><input class="input" prop:value=move || url.get() on:input=move |e| url.set(event_target_value(&e)) /></label>
-                <div class="form-divider" />
+                </FieldSection>
                 <RecordingFields draft=draft />
             </fieldset>
             <Show when=move || error.get().is_some()><p class="field-error" role="alert">{move || error.get().unwrap_or_default()}</p></Show>

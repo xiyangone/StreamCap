@@ -475,6 +475,56 @@ async fn media_manual_conversion_preserves_ts_and_never_overwrites_mp4() {
 }
 
 #[tokio::test]
+#[ignore = "requires STREAMCAP_TEST_FFMPEG; synthetic retry and persisted task association"]
+async fn media_manual_retry_updates_the_original_task_without_inheriting_source_cleanup() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = state(directory.path(), false).await;
+    let root = directory.path().join("downloads").canonicalize().unwrap();
+    let bytes = sample_ts("2").await;
+    let source = root.join("retry.ts");
+    std::fs::write(&source, &bytes).unwrap();
+    let identity =
+        streamcap_core::storage::source_identity(&std::fs::File::open(&source).unwrap()).unwrap();
+    std::fs::write(
+        directory.path().join("config/media_jobs.json"),
+        serde_json::to_vec(&json!([{
+            "job": {
+                "id": "previous-attempt", "taskId": "recording-task",
+                "source": "retry.ts", "output": "retry.mp4", "state": "failed",
+                "deleteOriginal": true, "sourceRemoved": false,
+                "message": "MP4 完整解码校验失败"
+            },
+            "input": {
+                "root": root, "identity": identity,
+                "options": {"delete_original": true, "minimum_free_bytes": 0}
+            }
+        }]))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(state.scheduler.postprocess.recover().await.unwrap(), 0);
+    let retry = state
+        .scheduler
+        .postprocess
+        .enqueue_manual(root, "retry.ts", false)
+        .await
+        .unwrap();
+    assert_eq!(retry.task_id.as_deref(), Some("recording-task"));
+    assert!(!retry.delete_original);
+    wait_jobs(&state).await;
+    let jobs = state.scheduler.postprocess.jobs();
+    assert_eq!(jobs[0].state, MediaJobState::Failed);
+    let completed = jobs.iter().find(|job| job.id == retry.id).unwrap();
+    assert_eq!(completed.state, MediaJobState::Complete);
+    assert_eq!(completed.task_id.as_deref(), Some("recording-task"));
+    assert!(!completed.delete_original);
+    assert!(!completed.source_removed);
+    assert_eq!(std::fs::read(&source).unwrap(), bytes);
+    check_mp4(&source.with_extension("mp4")).await;
+    api::shutdown(&state).await.unwrap();
+}
+
+#[tokio::test]
 #[ignore = "requires STREAMCAP_TEST_FFMPEG; synthetic invalid TS only"]
 async fn media_failed_input_preserves_original_and_removes_only_own_temporary_file() {
     let directory = tempfile::tempdir().unwrap();

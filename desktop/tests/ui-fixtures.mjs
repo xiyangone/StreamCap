@@ -324,7 +324,9 @@ export async function createHarness(label, options = {}) {
         const active = state.mediaJobs.find(job => job.source === source && ['waiting','running','verifying','cleaning'].includes(job.state));
         if (active) { json(res, {job:active}); return; }
         if (state.files.some(f => f.path === output)) { json(res, {detail:'同名 MP4 已存在，未覆盖'},409); return; }
-        const job=seedMediaJob({source,output,deleteOriginal:body.deleteOriginal??false});state.mediaJobs.push(job);emit('mediaJob',job);json(res,{job});
+        const linkedTasks=[...new Set(state.mediaJobs.filter(job=>job.source===source&&job.taskId).map(job=>job.taskId))];
+        const taskId=linkedTasks.length===1?linkedTasks[0]:null;
+        const job=seedMediaJob({source,output,taskId,deleteOriginal:body.deleteOriginal??false});state.mediaJobs.push(job);emit('mediaJob',job);json(res,{job});
         setTimeout(()=>{job.state='running';job.startedAt=Math.floor(Date.now()/1000);job.stagePercent=35;job.message='正在无损转封装为 MP4';emit('mediaJob',job);},60);
         setTimeout(()=>{job.state='verifying';job.stagePercent=null;job.message='正在校验 MP4 音视频与时长';emit('mediaJob',job);},150);
         setTimeout(()=>{job.state='complete';job.stagePercent=100;job.finishedAt=Math.floor(Date.now()/1000);job.message='MP4 已生成并校验；原 TS 保留';state.files.push({name:output.split('/').at(-1),isDir:false,size:24000,path:output,modified:sampleDate});emit('mediaJob',job);},300);return;
@@ -456,9 +458,9 @@ export async function waitTheme(page, theme) {
     const body = getComputedStyle(document.body);
     const sidebar = document.querySelector('.sidebar');
     return document.documentElement.dataset.theme === expected
-      && body.backgroundColor === (dark ? 'rgb(17, 24, 33)' : 'rgb(244, 246, 250)')
-      && body.color === (dark ? 'rgb(236, 241, 251)' : 'rgb(25, 38, 61)')
-      && sidebar && getComputedStyle(sidebar).backgroundColor === (dark ? 'rgb(27, 37, 51)' : 'rgb(255, 255, 255)');
+      && body.backgroundColor === (dark ? 'rgb(17, 20, 25)' : 'rgb(246, 247, 249)')
+      && body.color === (dark ? 'rgb(237, 241, 246)' : 'rgb(32, 41, 56)')
+      && sidebar && getComputedStyle(sidebar).backgroundColor === (dark ? 'rgb(21, 25, 31)' : 'rgb(238, 241, 245)');
   }, theme);
 }
 
@@ -480,7 +482,7 @@ export async function inspectLayout(page) {
       return { width: bounds.width, height: bounds.height, top: bounds.top, left: bounds.left };
     };
     const content = document.querySelector('.content-area');
-    const panel = document.querySelector('.page .glass');
+    const panel = document.querySelector('.page :is(.stats-strip,.cards-grid.list-view,.recording-card,.file-browser,.settings-group-body,.about-detail)');
     const panelStyle = panel && getComputedStyle(panel);
     const overflow = Array.from(document.querySelectorAll('.page *')).filter((el) => {
       if (!el.getClientRects().length || ['svg', 'path', 'circle', 'rect', 'line', 'polyline', 'polygon', 'i'].includes(el.tagName.toLowerCase())) return false;

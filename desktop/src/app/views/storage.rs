@@ -2,7 +2,7 @@ use crate::app::i18n::t;
 use crate::{
     api::gateway::{self, StorageItem, StorageListing},
     app::{
-        components::{preview_state, ConfirmDialog, EmptyState, Icon, MediaJobStatus},
+        components::{preview_state, ConfirmDialog, EmptyState, Icon, MediaJobStatus, PageHeader},
         labels::{human_size, modified_time},
     },
 };
@@ -310,9 +310,9 @@ pub fn StorageView() -> impl IntoView {
     });
     view! {
         <div class="page storage-page">
-            <header class="page-header"><div><h1>{t("媒体库")}</h1><p>{t("浏览本地录像，预览或转换为 MP4。")}</p></div><button class="button secondary" disabled=move || loading.get() on:click=move |_| reload.update(|n| *n = n.wrapping_add(1))><Icon name="refresh" size=17 />{t("刷新文件")}</button></header>
-            <section class="library-summary glass"><span class="library-symbol"><Icon name="folder" size=30 /></span><div class="library-location"><small>{t("录制文件位置")}</small><strong class="break-anywhere">{move || if listing.get().root.is_empty() { t("正在读取…").into() } else { listing.get().root }}</strong></div><button class="icon-button" aria-label=t("复制录制根目录") disabled=move || listing.get().root.is_empty() on:click=move |_| copy_path.run(listing.get_untracked().root)><Icon name="copy" size=17 /></button><div class="library-size"><small>{t("当前目录大小")}</small><strong>{move || if listing.get().total_size_known { human_size(listing.get().total_size) } else if listing.with(|list|list.items.iter().any(|item|item.size_error.is_some())) { t("部分体积不可用").into() } else { t("体积计算中…").into() }}</strong></div></section>
-            <section class="file-browser glass">
+            <PageHeader title=t("媒体库") subtitle=t("浏览录像、预览内容，查看每一次处理记录。")><button class="button secondary" disabled=move || loading.get() on:click=move |_| reload.update(|n| *n = n.wrapping_add(1))><Icon name="refresh" size=16 />{t("刷新文件")}</button></PageHeader>
+            <section class="library-summary"><span class="library-symbol"><Icon name="folder" size=30 /></span><div class="library-location"><small>{t("录制文件位置")}</small><strong class="break-anywhere">{move || if listing.get().root.is_empty() { t("正在读取…").into() } else { listing.get().root }}</strong></div><button class="icon-button" aria-label=t("复制录制根目录") disabled=move || listing.get().root.is_empty() on:click=move |_| copy_path.run(listing.get_untracked().root)><Icon name="copy" size=17 /></button><div class="library-size"><small>{t("当前目录大小")}</small><strong>{move || if listing.get().total_size_known { human_size(listing.get().total_size) } else if listing.with(|list|list.items.iter().any(|item|item.size_error.is_some())) { t("部分体积不可用").into() } else { t("体积计算中…").into() }}</strong></div></section>
+            <div class="library-layout"><section class="file-browser">
                 <div class="file-browser-toolbar"><nav class="file-breadcrumb" aria-label=t("媒体库路径")><button aria-label=t("返回媒体库根目录") on:click=move |_| subfolder.set(String::new())><Icon name="folder" size=17 />{t("媒体库")}</button>
                     {move || { let path = subfolder.get(); let mut prefix = String::new(); path.split('/').filter(|p| !p.is_empty()).map(|part| { if !prefix.is_empty() { prefix.push('/'); } prefix.push_str(part); let target = prefix.clone(); view! { <Icon name="chevron" size=13 /><button on:click=move |_| subfolder.set(target.clone())>{part.to_string()}</button> } }).collect_view() }}
                 </nav><label class="search-field compact"><Icon name="search" size=17 /><input aria-label=t("搜索文件") placeholder=t("搜索当前目录…") prop:value=move || keyword.get() on:input=move |e| keyword.set(event_target_value(&e)) /></label></div>
@@ -336,7 +336,7 @@ pub fn StorageView() -> impl IntoView {
                 </Show>
             </section>
             <Show when=move || !active_jobs.get().is_empty() || !history_jobs.get().is_empty()>
-                <section class="media-jobs glass" aria-label=t("媒体处理任务")>
+                <section class="media-jobs" aria-label=t("媒体处理任务")>
                     <div class="section-heading compact"><div><h2>{t("媒体处理")}</h2><p>{t("正在处理的文件优先显示，原文件按转换设置保留。")}</p></div>
                         <span class="count-pill">{move || crate::tr_format!("{} 项处理中", active_jobs.get().len())}</span>
                     </div>
@@ -364,6 +364,7 @@ pub fn StorageView() -> impl IntoView {
                     </Show>
                 </section>
             </Show>
+            </div>
         </div>
         <ConfirmDialog open=confirm title=t("移至回收站") confirm_text=t("移至回收站") busy_text=t("正在回收…") hint=t("可在系统回收站恢复。无法回收时，原文件会保留。") description=Signal::derive(move || deleting.get().map(|item| if item.is_dir { crate::tr_format!("将移至回收站：“{}”及其目录内容。",item.name) } else { crate::tr_format!("将移至回收站：“{}”（{}）。",item.name,human_size(item.size)) }).unwrap_or_default()) busy=busy on_confirm=remove />
     }

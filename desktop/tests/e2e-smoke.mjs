@@ -200,7 +200,7 @@ try {
     await page.getByRole('button', { name: '切换到深色' }).click();
     await waitTheme(page, 'dark');
     const bg = await page.locator('body').evaluate((e) => getComputedStyle(e).backgroundColor);
-    assert.equal(bg, 'rgb(17, 24, 33)');
+    assert.equal(bg, 'rgb(17, 20, 25)');
     await h.shot('02-home-dark');
     await page.getByRole('button', { name: '切换到浅色' }).click();
     await waitTheme(page, 'light');
@@ -572,7 +572,7 @@ try {
     await attentionTab.click();assert.equal(await page.locator('.recording-card').count(),attentionCount);
     await visible(card('fixture-5'));
     await navigate('总览');
-    assert.equal(await page.locator('.stat-item').filter({hasText:'需关注'}).locator('strong').innerText(),String(attentionCount));
+    assert.equal(await page.locator('.metric').filter({hasText:'需关注'}).locator('strong').innerText(),String(attentionCount));
     await visible(page.getByText('有需要处理的任务，请查看下方提示。',{exact:true}));
     assert.equal(await page.locator('.recording-card').first().getAttribute('data-rec-id'),'fixture-5');
     await navigate('录制任务');
@@ -611,7 +611,10 @@ try {
         assert.equal(layout.floating,0);assert.equal(layout.overflow,false);
         for(const button of layout.buttons) assert.ok(button.left>=layout.card.left&&button.right<=layout.card.right+1,'操作按钮不越过卡片');
         for(const group of [layout.primary,layout.tools]) assert.ok(Math.max(...group.map(r=>r.cy))-Math.min(...group.map(r=>r.cy))<=1,'同组按钮中线对齐');
-        if(list&&width===1280)assert.ok(Math.max(...layout.buttons.map(r=>r.cy))-Math.min(...layout.buttons.map(r=>r.cy))<=1,'宽屏列表全部按钮同一中线');
+        if(list&&width===1280) {
+          assert.ok(Math.max(...layout.primary.map(r=>r.bottom))<=Math.min(...layout.tools.map(r=>r.top)),'主操作与辅助工具明确分组、不重叠');
+          assert.ok(Math.abs(Math.max(...layout.primary.map(r=>r.right))-Math.max(...layout.tools.map(r=>r.right)))<=1,'两组操作右侧对齐');
+        }
         await h.shot('actions-'+width+'-'+(list?'list':'grid'));
       }
     }
@@ -695,13 +698,13 @@ try {
       for(const title of ['你好',null,'','   ']) {
         item.liveTitle=title;h.emit('update',item);
         await visible(card(item.recId).locator('.card-recording-status'));
-        assert.equal(await card(item.recId).locator('.card-recording-status').innerText(),'正在录制');
+        assert.equal(await card(item.recId).locator('.card-recording-status').innerText(),'录制中');
         if(title?.trim()) await waitState(()=>card(item.recId).locator('.card-subtitle').innerText(),v=>v===title,'独立直播标题');
         else await waitState(()=>card(item.recId).locator('.card-subtitle').count(),n=>n===0,'空标题不占位');
       }
       item.monitorStatus=false;h.emit('update',item);
       await visible(card(item.recId).getByText('监控已暂停',{exact:true}));
-      assert.equal(await card(item.recId).locator('.card-recording-status').innerText(),'正在录制');
+      assert.equal(await card(item.recId).locator('.card-recording-status').innerText(),'录制中');
       await navigate('总览');await visible(card(item.recId).locator('.card-recording-status'));
       await navigate('录制任务');
       Object.assign(item,{isRecording:false,isLive:false,monitorStatus:true,liveTitle:null});h.emit('update',item);
@@ -724,9 +727,9 @@ try {
       Object.assign(job,{state:'running',sourceRemoved:false,startedAt:Math.floor(Date.now()/1000)-12,
         message:'正在读取源文件音视频与时长'});h.emit('mediaJob',job);
       await visible(card(item.recId).locator('.card-media-job'));
-      assert.equal(await card(item.recId).locator('.card-media-job-source').innerText(),'录后处理 · 历史目录/历史录像_2026-09-27.ts');
+      assert.equal(await card(item.recId).locator('.card-media-job-source').textContent(),'历史目录/历史录像_2026-09-27.ts');
       assert.equal(await card(item.recId).locator('.card-media-job-source').getAttribute('title'),job.source);
-      assert.equal(await card(item.recId).locator('.card-recording-status').innerText(),'正在录制');
+      assert.equal(await card(item.recId).locator('.card-recording-status').innerText(),'录制中');
       Object.assign(job,{state:'failed',finishedAt:Math.floor(Date.now()/1000),message:'转换失败，原 TS 保留'});h.emit('mediaJob',job);
       await visible(card(item.recId).locator('.card-media-job[data-state=failed]'));
       assert.equal(await card(item.recId).locator('.badge').innerText(),'录制中');
@@ -748,8 +751,8 @@ try {
       await hidden(card(item.recId).locator('.card-media-job'));
       Object.assign(item,{isRecording:false,isLive:false,liveTitle:null});h.emit('update',item);
       await visible(card(item.recId).locator('.card-media-job'));
-      assert.equal(await card(item.recId).locator('.card-media-job-source').innerText(),'最近一次录后处理 · 历史目录/历史录像_2026-09-27.ts');
-      assert.equal(await card(item.recId).locator('.media-job-detail').innerText(),'处理已结束 · 耗时未知');
+      assert.equal(await card(item.recId).locator('.card-media-job-source').textContent(),'历史目录/历史录像_2026-09-27.ts');
+      assert.equal(await card(item.recId).locator('.media-job-detail').innerText(),'耗时未知');
       assert.equal(await card(item.recId).locator('.badge').innerText(),'等待开播');
       for(const width of [1280,420]) {
         await page.setViewportSize({width,height:900});
@@ -777,9 +780,9 @@ try {
       await go(page,h.base,'/storage');
       const row=source=>page.locator('.media-job-row').filter({hasText:source}).locator('.media-job-detail');
       await visible(row('unknown.ts'));
-      assert.equal(await row('unknown.ts').innerText(),'处理已结束 · 耗时未知');
-      assert.equal(await row('zero.ts').innerText(),'处理已结束 · 耗时 00:00:00');
-      assert.equal(await row('saved.ts').innerText(),'处理已结束 · 耗时 00:00:07');
+      assert.equal(await row('unknown.ts').innerText(),'耗时未知');
+      assert.equal(await row('zero.ts').innerText(),'耗时 00:00:00');
+      assert.equal(await row('saved.ts').innerText(),'耗时 00:00:07');
     } finally {state.mediaJobs=originalJobs;await go(page,h.base,'/recordings');}
   });
   await step('录制、直播未录制和下播复核各归一类，旧直播状态不重复计数', async () => {
@@ -1095,6 +1098,38 @@ try {
       await h.shot('processing-safe-retry');
     } finally {state.mediaJobs=jobs;state.files=files;await go(page,h.base,'/storage');}
   });
+  await step('同源手动重试成功后任务不再展示旧失败，历史记录仍可追溯', async () => {
+    const jobs=structuredClone(state.mediaJobs), files=structuredClone(state.files);
+    const item=record('fixture-5'), original=structuredClone(item);
+    try {
+      Object.assign(item,{isRecording:false,isLive:false,monitorStatus:true,checkError:null,recordingError:null,verificationRequired:false});
+      const source='task-retry.ts';
+      state.files.push({name:source,path:source,isDir:false,size:4096});
+      const failed=seedMediaJob({taskId:item.recId,source,output:'task-retry.mp4',state:'failed',deleteOriginal:true,message:'MP4 完整解码校验失败'});
+      const other=seedMediaJob({taskId:'fixture-6',source:'other/task-retry.ts',state:'failed',message:'unrelated failure'});
+      state.mediaJobs=[failed,other];
+      await go(page,h.base,'/recordings');
+      const compact=card(item.recId).locator('.card-media-job');
+      await visible(compact);
+      assert.equal(await compact.getAttribute('data-job-id'),failed.id);
+      assert.equal(await compact.locator('.card-media-job-source').isVisible(),false,'路径不再占据卡片主体');
+      assert.equal(await compact.locator('.media-job-heading').innerText(),'校验未通过 · 未清理源文件');
+      await navigate('媒体库');
+      const row=page.locator('.media-job-row[data-job-id="'+failed.id+'"]');
+      await row.getByRole('button',{name:'保留 TS 重试',exact:true}).click();
+      await waitState(()=>state.mediaJobs.at(-1)?.state,v=>v==='complete','手动重试成功');
+      const latest=state.mediaJobs.at(-1);
+      assert.equal(latest.taskId,item.recId);
+      assert.equal(latest.deleteOriginal,false);
+      await navigate('录制任务');
+      await waitState(()=>compact.getAttribute('data-job-id'),id=>id===latest.id,'任务显示最新成功结果');
+      assert.equal(await compact.getAttribute('data-state'),'complete');
+      assert.equal(await card('fixture-6').locator('.card-media-job').getAttribute('data-job-id'),other.id);
+      assert.equal(state.mediaJobs.find(job=>job.id===failed.id).state,'failed','不改写旧记录的结果');
+      assert.ok(state.files.some(file=>file.path===source),'手动重试不删源');
+      await h.shot('task-retry-reconciled');
+    } finally {state.mediaJobs=jobs;state.files=files;Object.assign(item,original);await go(page,h.base,'/storage');}
+  });
   await step('历史队列满额替换时仍刷新新 MP4 且保留活动任务', async () => {
     const jobs=structuredClone(state.mediaJobs), files=structuredClone(state.files);
     try {
@@ -1269,11 +1304,11 @@ try {
         elapsedSeconds:0,startedAt:null,finishedAt:null};
       state.mediaJobs.push(job);h.emit('mediaJob',job);
       await visible(card('fixture-2').locator('.card-media-job'));
-      assert.equal(await card('fixture-2').locator('.card-media-job-source').innerText(),'Latest post-processing · english-history.ts');
-      assert.equal(await card('fixture-2').locator('.media-job-detail').innerText(),'Processing finished · Elapsed time unknown');
+      assert.equal(await card('fixture-2').locator('.card-media-job-source').textContent(),'english-history.ts');
+      assert.equal(await card('fixture-2').locator('.media-job-detail').innerText(),'Elapsed time unknown');
       job.state='running';h.emit('mediaJob',job);
       await visible(card('fixture-2').locator('.card-media-job[data-state=running]'));
-      assert.equal(await card('fixture-2').locator('.card-media-job-source').innerText(),'Post-processing · english-history.ts');
+      assert.equal(await card('fixture-2').locator('.card-media-job-source').textContent(),'english-history.ts');
       await h.shot('status-processing-english');
     } finally {state.mediaJobs=languageJobs;await go(page,h.base,'/recordings');}
     await page.keyboard.press('Control+5');await page.getByRole('button',{name:'Check for updates',exact:true}).click();
