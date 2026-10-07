@@ -10,10 +10,10 @@ pub fn Sidebar() -> impl IntoView {
     let state = gateway::app_state();
     view! {
         <aside class="sidebar glass">
-            <a class="sidebar-brand" href="/home" aria-label=t("StreamCap 总览")>
+            <A attr:class="sidebar-brand" href="/home" attr:aria-label=t("StreamCap 总览")>
                 <span class="brand-mark"><img src="/logo-mark.png" alt="" /></span>
-                <div><strong>"StreamCap"</strong><small>"LIVE RECORDING"</small></div>
-            </a>
+                <div><strong>"StreamCap"</strong><small>{t("本地直播录制")}</small></div>
+            </A>
             <span class="nav-label">{t("工作空间")}</span>
             <nav class="nav-primary" aria-label=t("主导航")>
                 {[("home", t("总览"), "/home"), ("video", t("录制任务"), "/recordings"), ("folder", t("媒体库"), "/storage"), ("settings", t("偏好设置"), "/settings")].into_iter().map(|(icon,label,href)| {

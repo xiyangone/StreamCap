@@ -1581,6 +1581,55 @@ impl MediaJob {
             "waiting" | "running" | "verifying" | "cleaning"
         )
     }
+    pub fn needs_attention(&self) -> bool {
+        matches!(
+            self.state.as_str(),
+            "failed" | "cleanupFailed" | "cancelled"
+        )
+    }
+    pub fn output_ready(&self) -> bool {
+        matches!(self.state.as_str(), "complete" | "cleanupFailed")
+    }
+}
+
+fn upsert_media_job(jobs: &mut Vec<MediaJob>, job: MediaJob) {
+    if let Some(existing) = jobs.iter_mut().find(|item| item.id == job.id) {
+        *existing = job;
+        return;
+    }
+    while jobs.len() >= 256 {
+        let Some(index) = jobs.iter().position(|item| !item.pending()) else {
+            break;
+        };
+        jobs.remove(index);
+    }
+    jobs.push(job);
+}
+
+#[cfg(test)]
+mod media_job_tests {
+    use super::*;
+
+    #[test]
+    fn history_eviction_never_hides_a_running_or_queued_job() {
+        let job = |id: usize, state: &str| {
+            serde_json::from_value(json!({
+                "id":id.to_string(), "state":state, "taskId":null,
+                "source":"sample.ts", "output":"sample.mp4", "message":""
+            }))
+            .unwrap()
+        };
+        let mut jobs = vec![job(0, "running"), job(1, "waiting")];
+        jobs.extend((2..256).map(|id| job(id, "complete")));
+        upsert_media_job(&mut jobs, job(256, "waiting"));
+        assert_eq!(jobs.len(), 256);
+        assert_eq!(jobs[0].id, "0");
+        assert_eq!(jobs[1].id, "1");
+        assert!(!jobs.iter().any(|item| item.id == "2"));
+        upsert_media_job(&mut jobs, job(0, "complete"));
+        assert_eq!(jobs.len(), 256);
+        assert!(jobs[0].output_ready());
+    }
 }
 #[derive(Deserialize)]
 struct MediaJobs {
@@ -1727,16 +1776,7 @@ pub fn subscribe_events(state: AppState) -> Option<EventConnection> {
                                 sync.observe(job.id.clone(), Some(job.clone()))
                             });
                             state.media_jobs.update(|jobs| {
-                                if let Some(existing) =
-                                    jobs.iter_mut().find(|item| item.id == job.id)
-                                {
-                                    *existing = job;
-                                } else {
-                                    if jobs.len() >= 256 {
-                                        jobs.remove(0);
-                                    }
-                                    jobs.push(job);
-                                }
+                                upsert_media_job(jobs, job);
                             });
                         }
                     }

@@ -2,7 +2,7 @@ use crate::app::i18n::t;
 use crate::{
     api::gateway::{self, StorageItem, StorageListing},
     app::{
-        components::{preview_state, ConfirmDialog, EmptyState, Icon},
+        components::{preview_state, ConfirmDialog, EmptyState, Icon, MediaJobStatus},
         labels::{human_size, modified_time},
     },
 };
@@ -25,6 +25,13 @@ fn kind(item: &StorageItem) -> &'static str {
         "mp4" | "ts" | "flv" | "mkv" | "mov" | "webm" | "nut" => "video",
         _ => "file",
     }
+}
+
+fn completed_output_keys(jobs: &[gateway::MediaJob]) -> Vec<(String, String, bool)> {
+    jobs.iter()
+        .filter(|job| job.output_ready())
+        .map(|job| (job.id.clone(), job.output.clone(), job.source_removed))
+        .collect()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -133,11 +140,37 @@ pub fn StorageView() -> impl IntoView {
     let deleting = RwSignal::new(None::<StorageItem>);
     let confirm = RwSignal::new(false);
     let busy = RwSignal::new(false);
-    let completed_jobs = Memo::new(move |_| {
+    let completed_jobs =
+        Memo::new(move |_| state.media_jobs.with(|jobs| completed_output_keys(jobs)));
+    let show_all_history = RwSignal::new(false);
+    let active_jobs = Memo::new(move |_| {
         state.media_jobs.with(|jobs| {
             jobs.iter()
-                .filter(|j| matches!(j.state.as_str(), "complete" | "cleanupFailed"))
-                .count()
+                .filter(|job| job.pending() && job.state != "waiting")
+                .chain(jobs.iter().filter(|job| job.state == "waiting"))
+                .map(|job| job.id.clone())
+                .collect::<Vec<_>>()
+        })
+    });
+    let history_jobs = Memo::new(move |_| {
+        state.media_jobs.with(|jobs| {
+            jobs.iter()
+                .rev()
+                .filter(|job| !job.pending())
+                .map(|job| job.id.clone())
+                .collect::<Vec<_>>()
+        })
+    });
+    let visible_history = Memo::new(move |_| {
+        history_jobs.with(|ids| {
+            ids.iter()
+                .take(if show_all_history.get() {
+                    usize::MAX
+                } else {
+                    8
+                })
+                .cloned()
+                .collect::<Vec<_>>()
         })
     });
     Effect::new(move |_| {
@@ -277,7 +310,7 @@ pub fn StorageView() -> impl IntoView {
     });
     view! {
         <div class="page storage-page">
-            <header class="page-header"><div><span class="eyebrow">"YOUR LOCAL ARCHIVE"</span><h1>{t("媒体库")}</h1><p>{t("每一次录制，都值得好好收藏。")}</p></div><button class="button secondary" disabled=move || loading.get() on:click=move |_| reload.update(|n| *n = n.wrapping_add(1))><Icon name="refresh" size=17 />{t("刷新文件")}</button></header>
+            <header class="page-header"><div><h1>{t("媒体库")}</h1><p>{t("浏览本地录像，预览或转换为 MP4。")}</p></div><button class="button secondary" disabled=move || loading.get() on:click=move |_| reload.update(|n| *n = n.wrapping_add(1))><Icon name="refresh" size=17 />{t("刷新文件")}</button></header>
             <section class="library-summary glass"><span class="library-symbol"><Icon name="folder" size=30 /></span><div class="library-location"><small>{t("录制文件位置")}</small><strong class="break-anywhere">{move || if listing.get().root.is_empty() { t("正在读取…").into() } else { listing.get().root }}</strong></div><button class="icon-button" aria-label=t("复制录制根目录") disabled=move || listing.get().root.is_empty() on:click=move |_| copy_path.run(listing.get_untracked().root)><Icon name="copy" size=17 /></button><div class="library-size"><small>{t("当前目录大小")}</small><strong>{move || if listing.get().total_size_known { human_size(listing.get().total_size) } else if listing.with(|list|list.items.iter().any(|item|item.size_error.is_some())) { t("部分体积不可用").into() } else { t("体积计算中…").into() }}</strong></div></section>
             <section class="file-browser glass">
                 <div class="file-browser-toolbar"><nav class="file-breadcrumb" aria-label=t("媒体库路径")><button aria-label=t("返回媒体库根目录") on:click=move |_| subfolder.set(String::new())><Icon name="folder" size=17 />{t("媒体库")}</button>
@@ -302,7 +335,35 @@ pub fn StorageView() -> impl IntoView {
                     </Show>
                 </Show>
             </section>
-            <Show when=move || !state.media_jobs.get().is_empty()><section class="media-jobs glass" aria-label=t("媒体处理任务")><h3>{t("媒体处理")}</h3>{move || state.media_jobs.get().into_iter().rev().map(|job| { let percent=job.stage_percent; let progress=crate::app::labels::media_progress(&job,state.now.get()); view! { <div class="media-job-row" data-state=job.state.clone()><span class="media-job-source">{job.source}</span><strong>{crate::app::i18n::message(job.message)}</strong><span class="media-job-detail">{progress}</span>{percent.map(|percent|view!{<progress aria-label=t("本阶段进度") max="100" value=percent.to_string() />})}</div> } }).collect_view()}</section></Show>
+            <Show when=move || !active_jobs.get().is_empty() || !history_jobs.get().is_empty()>
+                <section class="media-jobs glass" aria-label=t("媒体处理任务")>
+                    <div class="section-heading compact"><div><h2>{t("媒体处理")}</h2><p>{t("正在处理的文件优先显示，原文件按转换设置保留。")}</p></div>
+                        <span class="count-pill">{move || crate::tr_format!("{} 项处理中", active_jobs.get().len())}</span>
+                    </div>
+                    <div class="media-active-jobs">
+                        <For each=move || active_jobs.get() key=|id| id.clone() children=move |id| {
+                            let job = Memo::new(move |_| state.media_jobs.with(|jobs| jobs.iter().find(|job| job.id == id).cloned()));
+                            view! { <MediaJobStatus job=job /> }
+                        } />
+                    </div>
+                    <Show when=move || !history_jobs.get().is_empty()>
+                        <details class="media-history" open>
+                            <summary>{t("处理记录")}<span class="count-pill">{move || history_jobs.get().len()}</span></summary>
+                            <For each=move || visible_history.get() key=|id| id.clone() children=move |id| {
+                                let job = Memo::new(move |_| state.media_jobs.with(|jobs| jobs.iter().find(|job| job.id == id).cloned()));
+                                view! { <MediaJobStatus job=job /> }
+                            } />
+                            <Show when=move || { history_jobs.get().len() > 8 }>
+                                <button class="button secondary small history-toggle" type="button"
+                                    aria-expanded=move || show_all_history.get().to_string()
+                                    on:click=move |_| show_all_history.update(|show| *show = !*show)>
+                                    {move || if show_all_history.get() { t("收起较早记录") } else { t("展开全部记录") }}
+                                </button>
+                            </Show>
+                        </details>
+                    </Show>
+                </section>
+            </Show>
         </div>
         <ConfirmDialog open=confirm title=t("移至回收站") confirm_text=t("移至回收站") busy_text=t("正在回收…") hint=t("可在系统回收站恢复。无法回收时，原文件会保留。") description=Signal::derive(move || deleting.get().map(|item| if item.is_dir { crate::tr_format!("将移至回收站：“{}”及其目录内容。",item.name) } else { crate::tr_format!("将移至回收站：“{}”（{}）。",item.name,human_size(item.size)) }).unwrap_or_default()) busy=busy on_confirm=remove />
     }
@@ -311,6 +372,28 @@ pub fn StorageView() -> impl IntoView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_new_output_refreshes_the_library_even_when_history_count_is_unchanged() {
+        let job = |id: &str| {
+            serde_json::from_value(serde_json::json!({
+                "id":id,"taskId":null,"source":"source.ts","output":"output.mp4",
+                "state":"complete","message":"","sourceRemoved":false
+            }))
+            .unwrap()
+        };
+        let before = vec![job("previous")];
+        let after = vec![job("latest")];
+        assert_ne!(
+            completed_output_keys(&before),
+            completed_output_keys(&after)
+        );
+        let mut cleaning = after.clone();
+        cleaning[0].source_removed = true;
+        assert_ne!(
+            completed_output_keys(&after),
+            completed_output_keys(&cleaning)
+        );
+    }
     fn item(name: &str, dir: bool, size: u64, known: bool, modified: Option<f64>) -> StorageItem {
         StorageItem {
             name: name.into(),

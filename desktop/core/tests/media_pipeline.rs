@@ -1058,6 +1058,15 @@ fn main() {
         );
         if should_fail {
             assert_eq!(std::fs::read(root.join("decode.ts")).unwrap(), original);
+            if name == "decode-error" {
+                assert!(
+                    job.message
+                        .contains("reference picture missing during reorder"),
+                    "decoder details must survive the stage error: {}",
+                    job.message
+                );
+                assert_eq!(job.message.matches("原 TS 保留").count(), 1);
+            }
             assert!(
                 job.message.contains("MP4 完整解码校验失败"),
                 "{}",
@@ -1363,6 +1372,17 @@ async fn media_recovery_keeps_the_original_cleanup_preference() {
     state.scheduler.postprocess.shutdown(Duration::ZERO).await;
     assert!(directory.join("resume.ts").is_file());
     assert!(!directory.join("resume.mp4").exists());
+    let journal = Workspace::from_repo_root(root.path())
+        .config_dir()
+        .join("media_jobs.json");
+    let mut history: Vec<serde_json::Value> =
+        serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+    let mut superseded = history[0].clone();
+    superseded["job"]["id"] = json!("superseded-cleanup-attempt");
+    superseded["job"]["deleteOriginal"] = json!(true);
+    superseded["input"]["options"]["delete_original"] = json!(true);
+    history.insert(0, superseded);
+    std::fs::write(&journal, serde_json::to_vec(&history).unwrap()).unwrap();
     state
         .config
         .write()
@@ -1519,6 +1539,88 @@ async fn media_added_room_starts_without_manual_record_action() {
     assert_eq!(
         state.config.read().await.get_i64("loop_time_seconds", 0),
         4500
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires STREAMCAP_TEST_FFMPEG; notification-only manual start uses synthesized local media"]
+async fn media_notify_only_still_allows_manual_recording_without_changing_settings() {
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = Workspace::from_repo_root(directory.path());
+    let state = state(directory.path(), true).await;
+    let fixture = source(sample_ts("12").await).await;
+    let mut record = Recording::new("notify-only".into(), fixture.url.clone(), "Manual".into());
+    record.platform_key = Some("custom".into());
+    record.record_format = Some("TS".into());
+    record.only_notify_no_record = Some(true);
+    state.store.insert(vec![record]).await.unwrap();
+    let mut settings_before: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(workspace.recordings_path()).unwrap()).unwrap();
+    assert!(matches!(
+        state.scheduler.check("notify-only".into()).await.unwrap(),
+        streamcap_core::scheduler::CheckOutcome::NotifyOnly
+    ));
+    assert!(!state.store.get("notify-only").await.unwrap().is_recording);
+    assert!(recordings(directory.path()).is_empty());
+    let server = Server::start(
+        state.clone(),
+        ServerOptions {
+            port: 0,
+            monitoring: false,
+        },
+    )
+    .await
+    .unwrap();
+    let response = reqwest::Client::new()
+        .post(format!(
+            "http://{}/api/recordings/notify-only/start",
+            server.address()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    tokio::time::timeout(Duration::from_secs(8), async {
+        while !recordings(directory.path())
+            .iter()
+            .any(|path| std::fs::metadata(path).is_ok_and(|file| file.len() > 1880))
+        {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .expect("manual start must write actual media, not just change UI state");
+    server.shutdown().await.unwrap();
+    let jobs = state.scheduler.postprocess.jobs();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].state, MediaJobState::Complete);
+    check_mp4(&directory.path().join("downloads").join(&jobs[0].output)).await;
+    assert_eq!(
+        state
+            .store
+            .get("notify-only")
+            .await
+            .unwrap()
+            .only_notify_no_record,
+        Some(true)
+    );
+    let mut settings_after: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(workspace.recordings_path()).unwrap()).unwrap();
+    assert_eq!(
+        settings_after[0]["recording_dir"],
+        json!(directory.path().join("downloads"))
+    );
+    assert!(settings_after[0]["last_duration"]
+        .as_f64()
+        .is_some_and(|n| n > 0.0));
+    for snapshot in [&mut settings_before, &mut settings_after] {
+        let record = snapshot[0].as_object_mut().unwrap();
+        record.remove("recording_dir");
+        record.remove("last_duration");
+    }
+    assert_eq!(
+        settings_after, settings_before,
+        "only recording history may change; notification-only and all other task settings must remain intact"
     );
 }
 

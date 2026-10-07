@@ -12,6 +12,16 @@ const desktop = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const apiContracts = JSON.parse(await readFile(join(desktop, 'tests/api-contracts.json'), 'utf8'));
 const dist = join(desktop, 'dist');
 const apiOrigin = 'http://127.0.0.1:6059';
+let mediaSequence = 0;
+export function seedMediaJob(overrides = {}) {
+  return {
+    id: `media-fixture-${++mediaSequence}`, taskId: null,
+    source: 'fixture.ts', output: 'fixture.mp4', state: 'waiting',
+    message: '等待转 MP4；原 TS 保留', deleteOriginal: false, sourceRemoved: false,
+    stagePercent: null, stageEtaSeconds: null, startedAt: null, finishedAt: null,
+    elapsedSeconds: 0, queuePosition: null, ...overrides,
+  };
+}
 const defaults = {
   language: 'zh_CN', record_quality: 'OD', video_format: 'TS', video_segment_time: '1800',
   generate_time_subtitle_file: false, scheduled_shutdown_enabled: false, scheduled_shutdown_time: '23:00', execute_custom_script: false, custom_script_command: '', system_notification_enabled: false, stream_start_notification_enabled: false, stream_end_notification_enabled: false,
@@ -310,9 +320,14 @@ export async function createHarness(label, options = {}) {
       if (path === '/api/media/info') { const file = url.searchParams.get('path') || ''; json(res, { format: file.split('.').at(-1), nativeCompatible:!file.endsWith('.ts'), compatibilityAvailable:true, isRecording: state.previewLive, durationSeconds: 6, seekable: true, size: file.endsWith('.ts') ? (await tsBytes()).length : 16044 }); return; }
       if (path === '/api/media/remux') {
         const source = body.path; const output = source.replace(/\.ts$/i, '.mp4');
+        if (!state.files.some(f => f.path === source && !f.isDir)) { json(res, {detail:'源 TS 不存在'},404); return; }
+        const active = state.mediaJobs.find(job => job.source === source && ['waiting','running','verifying','cleaning'].includes(job.state));
+        if (active) { json(res, {job:active}); return; }
         if (state.files.some(f => f.path === output)) { json(res, {detail:'同名 MP4 已存在，未覆盖'},409); return; }
-        const job={id:'job-'+(state.mediaJobs.length+1),taskId:null,source,output,deleteOriginal:body.deleteOriginal??false,sourceRemoved:false,state:'waiting',message:'等待转 MP4；原 TS 保留'};state.mediaJobs.push(job);emit('mediaJob',job);json(res,{job});
-        setTimeout(()=>{job.state='complete';job.message='MP4 已生成并校验；原 TS 保留';state.files.push({name:output.split('/').at(-1),isDir:false,size:24000,path:output,modified:sampleDate});emit('mediaJob',job);},300);return;
+        const job=seedMediaJob({source,output,deleteOriginal:body.deleteOriginal??false});state.mediaJobs.push(job);emit('mediaJob',job);json(res,{job});
+        setTimeout(()=>{job.state='running';job.startedAt=Math.floor(Date.now()/1000);job.stagePercent=35;job.message='正在无损转封装为 MP4';emit('mediaJob',job);},60);
+        setTimeout(()=>{job.state='verifying';job.stagePercent=null;job.message='正在校验 MP4 音视频与时长';emit('mediaJob',job);},150);
+        setTimeout(()=>{job.state='complete';job.stagePercent=100;job.finishedAt=Math.floor(Date.now()/1000);job.message='MP4 已生成并校验；原 TS 保留';state.files.push({name:output.split('/').at(-1),isDir:false,size:24000,path:output,modified:sampleDate});emit('mediaJob',job);},300);return;
       }
       if (path === '/api/media/transcode' || /^\/api\/recordings\/[^/]+\/preview$/.test(path)) {
         const start = Number(url.searchParams.get('start') || 0);
@@ -441,9 +456,9 @@ export async function waitTheme(page, theme) {
     const body = getComputedStyle(document.body);
     const sidebar = document.querySelector('.sidebar');
     return document.documentElement.dataset.theme === expected
-      && body.backgroundColor === (dark ? 'rgb(16, 23, 37)' : 'rgb(240, 244, 250)')
+      && body.backgroundColor === (dark ? 'rgb(17, 24, 33)' : 'rgb(244, 246, 250)')
       && body.color === (dark ? 'rgb(236, 241, 251)' : 'rgb(25, 38, 61)')
-      && sidebar && getComputedStyle(sidebar).backgroundColor === (dark ? 'rgba(27, 37, 56, 0.85)' : 'rgba(255, 255, 255, 0.82)');
+      && sidebar && getComputedStyle(sidebar).backgroundColor === (dark ? 'rgb(27, 37, 51)' : 'rgb(255, 255, 255)');
   }, theme);
 }
 
@@ -465,6 +480,8 @@ export async function inspectLayout(page) {
       return { width: bounds.width, height: bounds.height, top: bounds.top, left: bounds.left };
     };
     const content = document.querySelector('.content-area');
+    const panel = document.querySelector('.page .glass');
+    const panelStyle = panel && getComputedStyle(panel);
     const overflow = Array.from(document.querySelectorAll('.page *')).filter((el) => {
       if (!el.getClientRects().length || ['svg', 'path', 'circle', 'rect', 'line', 'polyline', 'polygon', 'i'].includes(el.tagName.toLowerCase())) return false;
       if (el.closest('[aria-hidden="true"]') || el.closest('.table-container') || el.closest('.filter-tabs')) return false;
@@ -476,7 +493,15 @@ export async function inspectLayout(page) {
       shell: rect('.app-shell'), sidebar: rect('.sidebar'), heading: rect('h1'),
       bodyOverflow: document.documentElement.scrollWidth > innerWidth,
       contentOverflow: !!content && content.scrollWidth > content.clientWidth + 2,
-      overflow, glass: getComputedStyle(document.querySelector('.glass')).backdropFilter,
+      overflow,
+      surface: panelStyle && {
+        background: panelStyle.backgroundColor,
+        border: panelStyle.borderTopStyle,
+        borderWidth: parseFloat(panelStyle.borderTopWidth),
+        radius: parseFloat(panelStyle.borderTopLeftRadius),
+        backdrop: panelStyle.backdropFilter,
+      },
+      baseFontSize: parseFloat(getComputedStyle(document.documentElement).fontSize),
       dialogs: document.querySelectorAll('dialog[open]').length,
     };
   });

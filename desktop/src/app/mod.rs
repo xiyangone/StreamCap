@@ -108,6 +108,11 @@ fn Topbar() -> impl IntoView {
     let state = gateway::app_state();
     let desktop = desktop::state();
     let location = use_location();
+    let processing = Memo::new(move |_| {
+        state
+            .media_jobs
+            .with(|jobs| jobs.iter().filter(|job| job.pending()).count())
+    });
     let title = move || match location.pathname.get().as_str() {
         "/recordings" => t("录制任务"),
         "/storage" => t("媒体库"),
@@ -119,6 +124,11 @@ fn Topbar() -> impl IntoView {
         <header class="topbar">
             <div class="titlebar-drag-zone" data-tauri-drag-region="deep"><div class="breadcrumbs"><strong>{title}</strong></div></div>
             <div class="topbar-actions">
+                <Show when=move || { processing.get() > 0 }>
+                    <a class="processing-indicator" href="/storage" title=t("查看媒体处理任务") aria-label=move || crate::tr_format!("{} 项处理中", processing.get())>
+                        <Icon name="file" size=14 /><span>{move || crate::tr_format!("{} 项处理中", processing.get())}</span>
+                    </a>
+                </Show>
                 <span class="sync-status" class:online=move||state.status.get().ok&&state.events_connected.get() title=t("任务状态由本机自动更新，不涉及云同步")><i class="status-dot" />{move||if !state.status.get().ok{t("本地服务连接中")}else if state.events_connected.get(){t("本地实时更新")}else{t("正在重连")}}</span>
                 <button class="icon-button theme-toggle" title=t("切换明暗主题") aria-label=move||if state.is_dark(){t("切换到浅色")}else{t("切换到深色")} on:click=move |_|{state.theme.set(if state.is_dark(){"light".into()}else{"dark".into()});gateway::save_appearance(state);}>
                     <Show when=move||state.is_dark() fallback=||view!{<Icon name="moon"/>}><Icon name="sun"/></Show>

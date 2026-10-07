@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { apiContracts, createHarness, eventually, go, hidden, inspectLayout, seedRecordings, streamPreviewFixture, visible, waitTheme } from './ui-fixtures.mjs';
+import { apiContracts, createHarness, eventually, go, hidden, inspectLayout, seedMediaJob, seedRecordings, streamPreviewFixture, visible, waitTheme } from './ui-fixtures.mjs';
 
 const h = await createHarness('interaction');
 const { page, state } = h;
@@ -64,7 +64,12 @@ try {
     await waitState(() => page.locator('.recording-card').count(), (n) => n === 6, '初始任务数量');
     await visible(page.getByText('本地实时更新', { exact: true }));
     const layout = await inspectLayout(page);
-    assert.equal(layout.dialogs, 0); assert.ok(layout.glass.includes('blur'));
+    assert.equal(layout.dialogs, 0);
+    assert.equal(layout.surface.background, 'rgb(255, 255, 255)');
+    assert.equal(layout.surface.border, 'solid');
+    assert.ok(layout.surface.borderWidth >= 1 && layout.surface.radius >= 8);
+    assert.equal(layout.surface.backdrop, 'none');
+    assert.equal(layout.baseFontSize, 14);
     await h.shot('01-home-light');
   });
   await step('快手冷却和登录受限仍保留人工检查入口', async () => {
@@ -195,7 +200,7 @@ try {
     await page.getByRole('button', { name: '切换到深色' }).click();
     await waitTheme(page, 'dark');
     const bg = await page.locator('body').evaluate((e) => getComputedStyle(e).backgroundColor);
-    assert.equal(bg, 'rgb(16, 23, 37)');
+    assert.equal(bg, 'rgb(17, 24, 33)');
     await h.shot('02-home-dark');
     await page.getByRole('button', { name: '切换到浅色' }).click();
     await waitTheme(page, 'light');
@@ -1021,6 +1026,89 @@ try {
       assert.equal(await page.getByRole('progressbar',{name:'本阶段进度',exact:true}).getAttribute('value'),'37');
       await h.shot('full-media-queue');
     } finally {state.mediaJobs=original;h.emit('resync',{});}
+  });
+  await step('当前转换不被后续分段遮住，进度更新保留详情节点', async () => {
+    const originalJobs=structuredClone(state.mediaJobs);
+    try {
+      const active=seedMediaJob({id:'active-segment',taskId:'fixture-5',source:'active.ts',state:'running',message:'正在无损转封装为 MP4',stagePercent:37,startedAt:Math.floor(Date.now()/1000)-10});
+      const waiting=seedMediaJob({id:'next-segment',taskId:'fixture-5',source:'next.ts',queuePosition:1});
+      state.mediaJobs=[...originalJobs,active,waiting];
+      await go(page,h.base,'/recordings');
+      const status=card('fixture-5').locator('.card-media-job');
+      await waitState(()=>status.getAttribute('data-job-id'),id=>id===active.id,'显示活动分段');
+      await status.locator('summary').click();
+      await status.evaluate(el=>el.setAttribute('data-instance-check','retained'));
+      active.stagePercent=61;h.emit('mediaJob',active);
+      await waitState(()=>status.locator('progress').getAttribute('value'),v=>v==='61','帧进度更新');
+      assert.equal(await status.getAttribute('data-instance-check'),'retained');
+      assert.equal(await status.locator('details').getAttribute('open'),'');
+      Object.assign(active,{state:'complete',finishedAt:Math.floor(Date.now()/1000)});h.emit('mediaJob',active);
+      await waitState(()=>status.getAttribute('data-job-id'),id=>id===waiting.id,'显示队列首个分段');
+      await h.shot('processing-segment-priority');
+    } finally {state.mediaJobs=originalJobs;await go(page,h.base,'/storage');}
+  });
+  await step('活动队列优先，历史按需展开且秒级时钟不重建历史', async () => {
+    const original=structuredClone(state.mediaJobs);
+    try {
+      const active=seedMediaJob({id:'stable-active',state:'verifying',message:'正在校验 MP4 完整性',source:'active.ts',startedAt:Math.floor(Date.now()/1000)-10,stagePercent:45});
+      const history=Array.from({length:18},(_,i)=>seedMediaJob({id:'history-'+i,source:`history-${i}.ts`,state:'complete',message:'MP4 已生成并校验；原 TS 保留',startedAt:100,finishedAt:105}));
+      state.mediaJobs=[active,...history];
+      await go(page,h.base,'/storage');
+      const current=page.locator('.media-active-jobs .media-job-row').first();
+      await visible(current);
+      assert.equal(await current.getAttribute('data-job-id'),active.id);
+      assert.equal(await page.locator('.media-history .media-job-row').count(),8);
+      const latest=page.locator('.media-history .media-job-row').first();
+      await latest.evaluate(el=>el.setAttribute('data-instance-check','retained'));
+      const clock=await current.locator('.media-job-detail').innerText();
+      await waitState(()=>current.locator('.media-job-detail').innerText(),text=>text!==clock,'处理计时刷新');
+      assert.equal(await latest.getAttribute('data-instance-check'),'retained');
+      active.stagePercent=58;h.emit('mediaJob',active);
+      await waitState(()=>current.locator('progress').getAttribute('value'),v=>v==='58','校验进度刷新');
+      assert.equal(await latest.getAttribute('data-instance-check'),'retained');
+      await page.getByRole('button',{name:'展开全部记录',exact:true}).click();
+      assert.equal(await page.locator('.media-history .media-job-row').count(),18);
+      await page.getByRole('button',{name:'收起较早记录',exact:true}).click();
+      assert.equal(await page.locator('.media-history .media-job-row').count(),8);
+      await h.shot('processing-active-and-history');
+    } finally {state.mediaJobs=original;await go(page,h.base,'/storage');}
+  });
+  await step('失败原因可展开，重试不删源且不重复提交', async () => {
+    const jobs=structuredClone(state.mediaJobs), files=structuredClone(state.files);
+    try {
+      state.files.push({name:'retry-fixture.ts',path:'retry-fixture.ts',isDir:false,size:4096});
+      const failed=seedMediaJob({source:'retry-fixture.ts',output:'retry-fixture.mp4',state:'failed',message:'MP4 完整解码校验失败：reference picture missing；原 TS 保留'});
+      state.mediaJobs=[failed];
+      await go(page,h.base,'/storage');
+      const row=page.locator('.media-job-row[data-state=failed]');
+      await row.locator('summary').click();
+      await visible(row.getByText(/reference picture missing/));
+      const before=requests('POST','/api/media/remux').length;
+      await row.getByRole('button',{name:'保留 TS 重试',exact:true}).click();
+      await waitState(()=>state.mediaJobs.at(-1)?.state,v=>v==='complete','保留源文件重试完成');
+      const writes=requests('POST','/api/media/remux').slice(before);
+      assert.equal(writes.length,1);
+      assert.equal(writes[0].body.path,'retry-fixture.ts');
+      assert.notEqual(writes[0].body.deleteOriginal,true);
+      assert.ok(state.files.some(file=>file.path==='retry-fixture.ts'));
+      await visible(page.getByRole('button',{name:/^retry-fixture.mp4/}));
+      await h.shot('processing-safe-retry');
+    } finally {state.mediaJobs=jobs;state.files=files;await go(page,h.base,'/storage');}
+  });
+  await step('历史队列满额替换时仍刷新新 MP4 且保留活动任务', async () => {
+    const jobs=structuredClone(state.mediaJobs), files=structuredClone(state.files);
+    try {
+      const active=seedMediaJob({id:'keep-running',source:'running.ts',state:'running'});
+      const history=Array.from({length:255},(_,i)=>seedMediaJob({id:'rollover-'+i,source:`rollover-${i}.ts`,state:'complete'}));
+      state.mediaJobs=[active,...history];
+      await go(page,h.base,'/storage');
+      await visible(page.locator('.media-active-jobs [data-job-id=keep-running]'));
+      const fresh=seedMediaJob({id:'new-published-output',source:'new-source.ts',output:'new-output.mp4',state:'complete'});
+      state.files.push({name:'new-output.mp4',path:'new-output.mp4',isDir:false,size:2048});
+      state.mediaJobs.splice(1,1);state.mediaJobs.push(fresh);h.emit('mediaJob',fresh);
+      await visible(page.getByRole('button',{name:/^new-output.mp4/}));
+      await visible(page.locator('.media-active-jobs [data-job-id=keep-running]'));
+    } finally {state.mediaJobs=jobs;state.files=files;await go(page,h.base,'/storage');}
   });
   await step('异步预览期间切页，不访问已销毁信号', async () => {
     await navigate('录制任务');

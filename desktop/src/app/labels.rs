@@ -232,10 +232,44 @@ pub fn recording_media_job<'a>(
     record: &crate::api::gateway::Recording,
     jobs: &'a [crate::api::gateway::MediaJob],
 ) -> Option<&'a crate::api::gateway::MediaJob> {
+    let belongs = |job: &&crate::api::gateway::MediaJob| {
+        job.task_id.as_deref() == Some(record.rec_id.as_str())
+    };
+    jobs.iter()
+        .filter(belongs)
+        .find(|job| job.pending() && job.state != "waiting")
+        .or_else(|| {
+            jobs.iter()
+                .filter(belongs)
+                .find(|job| job.state == "waiting")
+        })
+        .or_else(|| jobs.iter().rev().find(belongs))
+        .filter(|job| !record.is_recording || job.state != "complete")
+}
+
+pub fn media_phase(job: &crate::api::gateway::MediaJob) -> &'static str {
+    t(match job.state.as_str() {
+        "waiting" => "等待转换",
+        "running" if job.message.contains("读取源文件") => "读取源文件",
+        "running" => "转封装 MP4",
+        "verifying" if job.message.contains("完整性") => "完整性校验",
+        "verifying" => "核对音视频",
+        "cleaning" => "清理源文件",
+        "cleanupFailed" => "MP4 已生成 · 源文件保留",
+        "complete" => "转换完成",
+        "cancelled" => "已中断 · 源文件保留",
+        "failed" => "转换失败 · 源文件保留",
+        _ => "媒体处理",
+    })
+}
+
+pub fn media_attention_count(jobs: &[crate::api::gateway::MediaJob]) -> usize {
+    let mut seen = std::collections::HashSet::new();
     jobs.iter()
         .rev()
-        .find(|job| job.task_id.as_deref() == Some(record.rec_id.as_str()))
-        .filter(|job| !record.is_recording || job.state != "complete")
+        .filter(|job| seen.insert(job.source.as_str()))
+        .filter(|job| job.needs_attention())
+        .count()
 }
 
 pub fn media_progress(job: &crate::api::gateway::MediaJob, now: i64) -> String {
@@ -478,6 +512,46 @@ mod tests {
         );
         assert!(recording_media_job(&record, &jobs[1..]).is_none());
         assert!(recording_media_job(&record, &[]).is_none());
+    }
+
+    #[test]
+    fn current_processing_wins_over_newer_queued_segments_and_history() {
+        let record = crate::api::gateway::Recording {
+            rec_id: "task".into(),
+            ..Default::default()
+        };
+        let jobs = vec![
+            media_job("running"),
+            media_job("waiting"),
+            media_job("complete"),
+        ];
+        assert_eq!(
+            recording_media_job(&record, &jobs).unwrap().state,
+            "running"
+        );
+        assert_eq!(
+            recording_media_job(&record, &jobs[1..]).unwrap().state,
+            "waiting"
+        );
+        let mut queue = vec![media_job("waiting"), media_job("waiting")];
+        queue[0].id = "first-segment".into();
+        assert_eq!(
+            recording_media_job(&record, &queue).unwrap().id,
+            "first-segment"
+        );
+    }
+
+    #[test]
+    fn successful_or_pending_retry_supersedes_the_old_processing_alert() {
+        assert_eq!(media_attention_count(&[media_job("failed")]), 1);
+        assert_eq!(
+            media_attention_count(&[media_job("failed"), media_job("complete")]),
+            0
+        );
+        assert_eq!(
+            media_attention_count(&[media_job("cancelled"), media_job("waiting")]),
+            0
+        );
     }
 
     #[test]

@@ -18,6 +18,14 @@ pub fn HomeView() -> impl IntoView {
     let editing = RwSignal::new(None::<Recording>);
     let info = RwSignal::new(None::<Recording>);
     let preview = preview_state();
+    let media_counts = Memo::new(move |_| {
+        state.media_jobs.with(|jobs| {
+            (
+                jobs.iter().filter(|job| job.pending()).count(),
+                crate::app::labels::media_attention_count(jobs),
+            )
+        })
+    });
     let active = move || {
         state.recording_list.with(|items| {
             items
@@ -129,6 +137,13 @@ pub fn HomeView() -> impl IntoView {
                 <span>{t("断流恢复")}<b>{move || queue_counts.get()[2]}</b></span><span>{t("平台冷却中")}<b>{move || queue_counts.get()[3]}</b></span>
                 <a class="text-link" href="/recordings">{t("查看全部")}<Icon name="chevron" size=14 /></a>
             </section>
+            <Show when=move || media_counts.get() != (0, 0)>
+                <a class="processing-summary glass" href="/storage">
+                    <span class="summary-icon"><Icon name="file" size=21 /></span>
+                    <div><strong>{t("媒体处理")}</strong><p>{move || crate::tr_format!("{} 项处理中 · {} 项需查看", media_counts.get().0, media_counts.get().1)}</p></div>
+                    <span class="text-link">{t("查看处理任务")}<Icon name="arrow" size=16 /></span>
+                </a>
+            </Show>
             <section class="recent-section"><div class="section-heading"><div><h2>{t("优先关注")}<span class="count-pill">{move || state.recording_list.with(Vec::len)}</span></h2><p>{t("失败与正在录制的任务优先显示")}</p></div><a class="text-link" href="/recordings">{t("查看全部")}<Icon name="arrow" size=15 /></a></div>
                 <Show when=move || state.loading.get()><div class="skeleton-grid" aria-label=t("正在加载任务")><div class="skeleton" /><div class="skeleton" /><div class="skeleton" /></div></Show>
                 <Show when=move || !state.loading.get() && state.recording_list.with(Vec::is_empty)><div class="glass empty-panel"><EmptyState icon="video" title=t("你的直播间，从这里开始") description=t("添加第一个直播间，开启属于你的录制工作空间。") /><button class="button primary" on:click=move |_| add.set(true)><Icon name="plus" size=17 />{t("添加第一个直播间")}</button></div></Show>

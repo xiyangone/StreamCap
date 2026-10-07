@@ -12,7 +12,7 @@ use std::{
     process::{Output, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, LazyLock, Mutex,
     },
     time::Duration,
 };
@@ -396,29 +396,54 @@ impl Postprocessor {
             .recordings_root()
             .canonicalize()
             .ok();
+        let source_paths = entries
+            .iter()
+            .map(|entry| {
+                let relative = storage::relative_path(&entry.job.source)?;
+                storage::relative_path(&entry.job.output)?;
+                if !entry.input.root.is_absolute() {
+                    return Err(invalid("处理队列目录无效"));
+                }
+                // Keep missing-file history, but identify existing sources through
+                // the same link-safe canonical path used when enqueueing them.
+                Ok(
+                    storage::checked_target(&entry.input.root, &entry.job.source, false)
+                        .unwrap_or_else(|_| entry.input.root.join(relative)),
+                )
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let latest_attempts = source_paths
+            .iter()
+            .enumerate()
+            .map(|(index, source)| (source.clone(), index))
+            .collect::<std::collections::HashMap<_, _>>();
         let mut resume = Vec::new();
-        for mut entry in entries {
-            storage::relative_path(&entry.job.source)?;
-            storage::relative_path(&entry.job.output)?;
-            if !entry.input.root.is_absolute() {
-                return Err(invalid("处理队列目录无效"));
-            }
-            let source = entry.input.root.join(&entry.job.source);
+        for (index, (mut entry, source)) in entries.into_iter().zip(source_paths).enumerate() {
             if entry.job.state.pending() || entry.job.state == MediaJobState::Cancelled {
                 entry.job.state = MediaJobState::Cancelled;
                 entry.job.message = "上次处理已中断，源文件未自动清理".into();
-                let identity =
-                    storage::open_conversion_source(&entry.input.root, &entry.job.source)
-                        .and_then(|file| storage::source_identity(&file));
-                if current_root.as_ref() == Some(&entry.input.root)
-                    && identity.is_ok_and(|id| id == entry.input.identity)
-                    && !entry.input.root.join(&entry.job.output).exists()
-                {
-                    resume.push((entry.input.clone(), entry.job.clone()));
-                } else if entry.input.root.join(&entry.job.output).exists() {
-                    entry.job.state = MediaJobState::CleanupFailed;
-                    entry.job.message =
-                        "上次处理已中断，已有 MP4 待核对；未重复转换或清理源文件".into();
+                if latest_attempts.get(&source) != Some(&index) {
+                    // A newer retry or terminal result supersedes this attempt,
+                    // including its source-cleanup preference.
+                    entry.job.message = "已有更新的处理记录，未自动恢复该中断任务".into();
+                } else {
+                    let identity =
+                        storage::open_conversion_source(&entry.input.root, &entry.job.source)
+                            .and_then(|file| storage::source_identity(&file));
+                    let output_exists =
+                        std::fs::symlink_metadata(entry.input.root.join(&entry.job.output)).is_ok();
+                    if current_root.as_ref() == Some(&entry.input.root)
+                        && identity.is_ok_and(|id| id == entry.input.identity)
+                        && !output_exists
+                    {
+                        resume.push((entry.input.clone(), entry.job.clone()));
+                    } else if output_exists {
+                        // Existence is not evidence of verified publication. In
+                        // particular, never expose an unrelated MP4 as ready.
+                        entry.job.state = MediaJobState::Failed;
+                        entry.job.message =
+                            "中断任务的同名 MP4 需人工核对；未自动恢复或删除文件".into();
+                    }
                 }
             }
             self.inner
@@ -454,15 +479,25 @@ impl Postprocessor {
         &self,
         id: &str,
         duration: Option<f64>,
-    ) -> Option<Arc<dyn Fn(u64) + Send + Sync>> {
-        let duration = duration.filter(|n| n.is_finite() && *n > 0.0)?;
+        video_packets: Option<u64>,
+    ) -> Option<ProgressObserver> {
+        let duration = duration.filter(|n| n.is_finite() && *n > 0.0);
+        let video_packets = video_packets.filter(|n| *n > 0);
+        if duration.is_none() && video_packets.is_none() {
+            return None;
+        }
         let owner = self.clone();
         let id = id.to_owned();
         let began = std::time::Instant::now();
-        Some(Arc::new(move |micros| {
-            let seconds = micros as f64 / 1_000_000.0;
+        Some(Arc::new(move |progress| {
+            // With -copyts, FFmpeg's out_time can stay at zero or exclude an
+            // initial interval. A single parsed video packet corresponds to a
+            // frame, so prefer the measured frame count for that common case.
+            let Some(fraction) = stage_fraction(progress, duration, video_packets) else {
+                return;
+            };
             let elapsed = began.elapsed().as_secs_f64();
-            let percent = ((seconds / duration * 100.0).clamp(0.0, 99.0)) as u8;
+            let percent = (fraction * 100.0).clamp(0.0, 99.0) as u8;
             let changed = owner
                 .inner
                 .jobs
@@ -475,9 +510,9 @@ impl Postprocessor {
                         return None;
                     }
                     job.stage_percent = Some(percent);
-                    job.stage_eta_seconds = if elapsed >= 1.0 && seconds > 0.0 && percent >= 5 {
+                    job.stage_eta_seconds = if elapsed >= 1.0 && fraction > 0.0 && percent >= 5 {
                         Some(
-                            ((duration - seconds).max(0.0) * elapsed / seconds)
+                            ((1.0 - fraction).max(0.0) * elapsed / fraction)
                                 .ceil()
                                 .min(86400.0) as u64,
                         )
@@ -537,6 +572,15 @@ impl Postprocessor {
                 log::warn!("媒体队列状态保存失败: {error}");
             }
             self.publish(&job);
+            // Queue positions change when a worker starts or finishes, not on
+            // every progress tick. Keep SSE-only clients consistent with GET.
+            for waiting in self
+                .jobs()
+                .into_iter()
+                .filter(|queued| queued.state == MediaJobState::Waiting)
+            {
+                self.publish(&waiting);
+            }
         }
     }
     async fn execute(&self, id: String, mut input: Input) {
@@ -619,6 +663,7 @@ impl Postprocessor {
                 );
             }
             Err(error) => {
+                log::warn!("转 MP4 失败 [{}]: {error}", input.relative);
                 self.transition(&id, MediaJobState::Failed, format!("{error}；原 TS 保留"));
                 self.inner
                     .store
@@ -650,7 +695,10 @@ impl Postprocessor {
         if current != input.source {
             return Err(invalid("源文件位置已改变"));
         }
-        let source_info = probe(&ffprobe, &input.source, "mpegts", &self.inner.stop).await?;
+        let source_info = probe(&ffprobe, &input.source, "mpegts", &self.inner.stop)
+            .await
+            .map_err(|error| stage_error("源 TS 读取失败", error))?;
+        let video_packets = single_video_packets(&source_info);
         self.transition(id, MediaJobState::Running, "正在无损转封装为 MP4");
         if std::fs::symlink_metadata(&input.output).is_ok() {
             return Err(io::Error::new(
@@ -698,10 +746,10 @@ impl Postprocessor {
             &self.inner.stop,
             true,
             media_idle_budget(before.len()),
-            self.progress_reporter(id, source_info.1),
+            self.progress_reporter(id, source_info.1, video_packets),
         )
         .await
-        .map_err(|error| io::Error::other(format!("FFmpeg 转封装未完成: {error}")))?;
+        .map_err(|error| stage_error("FFmpeg 转封装未完成", error))?;
         let temporary_relative = input
             .temporary
             .strip_prefix(input.root.canonicalize()?)
@@ -715,13 +763,17 @@ impl Postprocessor {
         // Keep the exact output immutable throughout probing and full decoding.
         let verified_output = storage::open_conversion_source(&input.root, &temporary_relative)?;
         self.transition(id, MediaJobState::Verifying, "正在校验 MP4 音视频与时长");
-        let output_info = probe(&ffprobe, &input.temporary, "mov", &self.inner.stop).await?;
+        let output_info = probe(&ffprobe, &input.temporary, "mov", &self.inner.stop)
+            .await
+            .map_err(|error| stage_error("MP4 读取校验失败", error))?;
         if source_info.0 != output_info.0 {
             return Err(invalid("MP4 音视频轨道校验不一致"));
         }
         if let (Some(a), Some(b)) = (source_info.1, output_info.1) {
             if (a - b).abs() > 1.0_f64.max(a * 0.001) {
-                return Err(invalid("MP4 时长校验不一致"));
+                return Err(invalid(&format!(
+                    "MP4 时长校验不一致（源 TS {a:.3} 秒，MP4 {b:.3} 秒）"
+                )));
             }
         }
         if input
@@ -738,7 +790,7 @@ impl Postprocessor {
             return Err(io::Error::new(io::ErrorKind::Interrupted, "已取消"));
         }
         if input.options.delete_original {
-            self.transition(id, MediaJobState::Running, "正在校验 MP4 完整性");
+            self.transition(id, MediaJobState::Verifying, "正在校验 MP4 完整性");
             let mut verify = self::command(&ffmpeg);
             verify
                 .args([
@@ -776,18 +828,24 @@ impl Postprocessor {
                 &self.inner.stop,
                 true,
                 media_idle_budget(before.len()),
-                self.progress_reporter(id, source_info.1),
+                self.progress_reporter(id, output_info.1, video_packets),
             )
             .await
-            .map_err(|_| invalid("MP4 完整解码校验失败，源 TS 保留"))?;
+            .map_err(|error| stage_error("MP4 完整解码校验失败", error))?;
             // With -v error, diagnostics disqualify cleanup even when FFmpeg exits 0.
             if decoded
                 .stderr
                 .iter()
                 .any(|byte| !byte.is_ascii_whitespace())
             {
-                return Err(invalid("MP4 完整解码校验失败，源 TS 保留"));
+                return Err(invalid(&format!(
+                    "MP4 完整解码校验失败：{}",
+                    diagnostic_summary(&decoded.stderr)
+                )));
             }
+        }
+        if self.inner.stop.is_cancelled() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "发布前已取消"));
         }
         let identity = storage::source_identity(&verified_output)?;
         drop(verified_output);
@@ -839,6 +897,75 @@ fn media_idle_budget(bytes: u64) -> Duration {
 fn probe_budget(bytes: u64) -> Duration {
     Duration::from_secs((600 + bytes / (1024 * 1024)).min(7200))
 }
+fn stage_error(stage: &str, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("{stage}：{error}"))
+}
+fn diagnostic_summary(bytes: &[u8]) -> String {
+    static PRIVATE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+            r#"(?i)\b(?:https?|rtmps?|rtsp|socks5h?)://[^\s"'<>]+|(?:authorization|cookie|token|secret|password|api[-_]?key)\s*[:=][^\r\n]*"#,
+        )
+        .expect("media diagnostic redaction")
+    });
+    let text = String::from_utf8_lossy(bytes);
+    let redacted = PRIVATE.replace_all(&text, "[已隐藏敏感信息]");
+    redacted
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(4)
+        .collect::<Vec<_>>()
+        .join(" · ")
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(768)
+        .collect()
+}
+#[derive(Clone, Copy, Default)]
+struct ToolProgress {
+    micros: u64,
+    frames: u64,
+    bytes: u64,
+}
+impl ToolProgress {
+    fn observe(&mut self, line: &str) -> bool {
+        let Some((key, value)) = line.split_once('=') else {
+            return false;
+        };
+        let Ok(value) = value.trim().parse::<u64>() else {
+            return false;
+        };
+        let field = match key {
+            "out_time_us" => &mut self.micros,
+            "frame" => &mut self.frames,
+            "total_size" => &mut self.bytes,
+            _ => return false,
+        };
+        if value <= *field {
+            return false;
+        }
+        *field = value;
+        true
+    }
+}
+type ProgressObserver = Arc<dyn Fn(ToolProgress) + Send + Sync>;
+fn stage_fraction(
+    progress: ToolProgress,
+    duration: Option<f64>,
+    video_packets: Option<u64>,
+) -> Option<f64> {
+    if let Some(packets) = video_packets.filter(|n| *n > 0) {
+        return (progress.frames > 0).then_some(progress.frames as f64 / packets as f64);
+    }
+    duration
+        .filter(|seconds| seconds.is_finite() && *seconds > 0.0 && progress.micros > 0)
+        .map(|seconds| progress.micros as f64 / 1_000_000.0 / seconds)
+}
+fn single_video_packets(info: &MediaInfo) -> Option<u64> {
+    let mut videos = info.0.iter().filter(|(kind, _, _)| kind == "video");
+    let packets = videos.next()?.2;
+    (videos.next().is_none() && packets > 0).then_some(packets)
+}
 async fn drain_bounded(
     mut reader: impl tokio::io::AsyncRead + Unpin,
     limit: usize,
@@ -873,7 +1000,7 @@ async fn run_tool(
     stop: &CancellationToken,
     progress: bool,
     budget: Duration,
-    observer: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+    observer: Option<ProgressObserver>,
 ) -> io::Result<Output> {
     let mut child = command.spawn()?;
     let stdout = child
@@ -892,41 +1019,57 @@ async fn run_tool(
         }
         use tokio::io::{AsyncBufReadExt, BufReader};
         let mut lines = BufReader::new(stdout).lines();
-        let mut previous = 0;
+        let mut measured = ToolProgress::default();
+        let mut changed = false;
         while let Some(line) = lines.next_line().await? {
-            if let Some(value) = line
-                .strip_prefix("out_time_us=")
-                .and_then(|n| n.trim().parse::<u64>().ok())
-            {
-                if value > previous {
-                    previous = value;
-                    if let Some(observer) = &observer {
-                        observer(value);
-                    }
-                    *reader_progress.lock().expect("media progress") = tokio::time::Instant::now();
+            if measured.observe(&line) {
+                changed = true;
+                *reader_progress.lock().expect("media progress") = tokio::time::Instant::now();
+            }
+            if line.starts_with("progress=") && changed {
+                if let Some(observer) = &observer {
+                    observer(measured);
                 }
+                changed = false;
             }
         }
         Ok(Vec::new())
     });
     let err = tokio::spawn(drain_bounded(stderr, 64 * 1024));
     let status = tokio::select! { biased;
-        _ = stop.cancelled() => { let _ = child.start_kill(); let _ = child.wait().await; None },
-        _ = wait_for_stall(advanced, budget) => { let _ = child.start_kill(); let _ = child.wait().await; None },
-        _ = tokio::time::sleep(Duration::from_secs(86400)) => { let _ = child.start_kill(); let _ = child.wait().await; None },
-        result = child.wait() => Some(result),
+        _ = stop.cancelled() => {
+            let _ = child.start_kill(); let _ = child.wait().await;
+            Err(io::Error::new(io::ErrorKind::Interrupted, "处理已取消"))
+        },
+        _ = wait_for_stall(advanced, budget) => {
+            let _ = child.start_kill(); let _ = child.wait().await;
+            Err(io::Error::new(io::ErrorKind::TimedOut, format!("处理超时：{} 秒没有新增进度", budget.as_secs())))
+        },
+        _ = tokio::time::sleep(Duration::from_secs(86400)) => {
+            let _ = child.start_kill(); let _ = child.wait().await;
+            Err(io::Error::new(io::ErrorKind::TimedOut, "处理超过 24 小时上限"))
+        },
+        result = child.wait() => result,
     };
     let stdout = out.await.map_err(io::Error::other)??;
     let stderr = err.await.map_err(io::Error::other)??;
+    let status = status?;
     if stdout.len() > 1024 * 1024 || stderr.len() > 64 * 1024 {
         return Err(io::Error::other("媒体工具响应超出限制"));
     }
-    let status =
-        status.ok_or_else(|| io::Error::new(io::ErrorKind::Interrupted, "处理已取消或超时"))??;
     if !status.success() {
+        let diagnostic = diagnostic_summary(&stderr);
         return Err(io::Error::other(format!(
-            "媒体工具退出码 {:?}",
-            status.code()
+            "媒体工具退出码 {}{}",
+            status
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "未知".into()),
+            if diagnostic.is_empty() {
+                String::new()
+            } else {
+                format!("：{diagnostic}")
+            }
         )));
     }
     Ok(Output {
@@ -1002,6 +1145,225 @@ async fn probe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn recovery_fixture() -> (tempfile::TempDir, PathBuf, Postprocessor) {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = crate::Workspace::from_repo_root(directory.path());
+        workspace.ensure_ready().unwrap();
+        let root = directory.path().join("downloads");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        std::fs::write(root.join("resume.ts"), b"preserved source").unwrap();
+        let ffmpeg = directory.path().join("ffmpeg.exe");
+        std::fs::write(&ffmpeg, b"not executed").unwrap();
+        std::fs::write(
+            ffmpeg.with_file_name(if cfg!(windows) {
+                "ffprobe.exe"
+            } else {
+                "ffprobe"
+            }),
+            b"not executed",
+        )
+        .unwrap();
+        let manager = Postprocessor::new(
+            Engine::new(),
+            Store::new(workspace.clone()),
+            Some(ffmpeg),
+            Arc::new(tokio::sync::RwLock::new(
+                ConfigStore::load(workspace).unwrap(),
+            )),
+        );
+        (directory, root, manager)
+    }
+
+    fn recovery_record(
+        root: &Path,
+        id: &str,
+        state: MediaJobState,
+        delete_original: bool,
+    ) -> JournalRecord {
+        JournalRecord {
+            job: serde_json::from_value(serde_json::json!({
+                "id": id, "taskId": null, "source": "resume.ts", "output": "resume.mp4",
+                "state": state, "deleteOriginal": delete_original,
+                "sourceRemoved": false, "message": ""
+            }))
+            .unwrap(),
+            input: RecoveryInput {
+                root: root.to_path_buf(),
+                identity: storage::source_identity(
+                    &storage::open_conversion_source(root, "resume.ts").unwrap(),
+                )
+                .unwrap(),
+                options: RemuxOptions {
+                    delete_original,
+                    minimum_free_bytes: 0,
+                },
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_uses_latest_attempt_once_and_preserves_its_cleanup_choice() {
+        let (_directory, root, manager) = recovery_fixture();
+        let mut latest =
+            recovery_record(&root, "latest-keep-source", MediaJobState::Cancelled, false);
+        latest.job.source = "./resume.ts".into();
+        let entries = [
+            recovery_record(&root, "old-cleanup", MediaJobState::Cancelled, true),
+            latest,
+        ];
+        std::fs::write(
+            &manager.inner.journal_path,
+            serde_json::to_vec(&entries).unwrap(),
+        )
+        .unwrap();
+        let slot = manager.inner.slot.clone().acquire_owned().await.unwrap();
+        let resumed = manager.recover().await.unwrap();
+        let pending = manager
+            .jobs()
+            .into_iter()
+            .filter(|job| job.state.pending())
+            .collect::<Vec<_>>();
+        manager.shutdown(Duration::ZERO).await;
+        drop(slot);
+        assert_eq!(pending.len(), 1);
+        assert!(
+            !pending[0].delete_original,
+            "an old cancelled cleanup must not override a later keep-source retry"
+        );
+        assert_eq!(resumed, 1, "count attempts, not superseded journal entries");
+        assert_eq!(
+            std::fs::read(root.join("resume.ts")).unwrap(),
+            b"preserved source"
+        );
+        assert!(!root.join("resume.mp4").exists());
+    }
+
+    #[tokio::test]
+    async fn recovery_does_not_revive_cancelled_history_after_a_newer_terminal_attempt() {
+        for state in [
+            MediaJobState::Complete,
+            MediaJobState::CleanupFailed,
+            MediaJobState::Failed,
+        ] {
+            let (_directory, root, manager) = recovery_fixture();
+            let entries = [
+                recovery_record(&root, "old-cancelled", MediaJobState::Cancelled, true),
+                recovery_record(&root, "latest-terminal", state, false),
+            ];
+            std::fs::write(
+                &manager.inner.journal_path,
+                serde_json::to_vec(&entries).unwrap(),
+            )
+            .unwrap();
+            let slot = manager.inner.slot.clone().acquire_owned().await.unwrap();
+            let resumed = manager.recover().await.unwrap();
+            manager.shutdown(Duration::ZERO).await;
+            drop(slot);
+            assert_eq!(
+                resumed, 0,
+                "newer {state:?} must supersede cancelled history"
+            );
+            assert_eq!(manager.jobs().len(), 2);
+            assert_eq!(
+                std::fs::read(root.join("resume.ts")).unwrap(),
+                b"preserved source"
+            );
+            assert!(!root.join("resume.mp4").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_never_marks_an_unverified_output_collision_as_ready() {
+        let (_directory, root, manager) = recovery_fixture();
+        let entry = recovery_record(&root, "interrupted", MediaJobState::Verifying, true);
+        std::fs::write(
+            &manager.inner.journal_path,
+            serde_json::to_vec(&[entry]).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(root.join("resume.mp4"), b"unverified existing output").unwrap();
+        let resumed = manager.recover().await.unwrap();
+        manager.shutdown(Duration::ZERO).await;
+        assert_eq!(resumed, 0);
+        let jobs = manager.jobs();
+        assert!(
+            !matches!(
+                jobs[0].state,
+                MediaJobState::Complete | MediaJobState::CleanupFailed
+            ),
+            "an existing file alone does not prove verified MP4 publication: {:?}",
+            jobs[0].state
+        );
+        assert_eq!(
+            std::fs::read(root.join("resume.mp4")).unwrap(),
+            b"unverified existing output"
+        );
+        assert_eq!(
+            std::fs::read(root.join("resume.ts")).unwrap(),
+            b"preserved source"
+        );
+    }
+
+    #[test]
+    fn copyts_progress_uses_frames_even_when_the_media_clock_is_zero_or_offset() {
+        let mut progress = ToolProgress::default();
+        assert!(progress.observe("frame=25"));
+        assert!(!progress.observe("out_time_us=0"));
+        assert_eq!(stage_fraction(progress, Some(100.0), Some(100)), Some(0.25));
+        assert!(progress.observe("out_time_us=90000000"));
+        assert_eq!(stage_fraction(progress, Some(100.0), Some(100)), Some(0.25));
+        assert_eq!(stage_fraction(progress, Some(100.0), None), Some(0.9));
+        assert_eq!(stage_fraction(progress, None, None), None);
+    }
+
+    #[test]
+    fn only_new_frames_bytes_or_media_time_count_as_tool_activity() {
+        let mut progress = ToolProgress::default();
+        for line in [
+            "frame=N/A",
+            "out_time_us=-1",
+            "speed=10x",
+            "progress=continue",
+        ] {
+            assert!(!progress.observe(line), "{line}");
+        }
+        assert!(progress.observe("total_size=4096"));
+        assert!(!progress.observe("total_size=4096"));
+        assert!(!progress.observe("total_size=2048"));
+        assert!(progress.observe("frame=10"));
+        assert!(!progress.observe("frame=10"));
+        assert!(progress.observe("out_time_us=1000000"));
+    }
+
+    #[test]
+    fn media_diagnostics_are_bounded_and_redact_credentials_before_publication() {
+        let diagnostic = diagnostic_summary(
+            b"[h264] reference picture missing\nhttps://user:password@media.invalid/live?token=abc\nCookie: private=value\nAuthorization: Bearer confidential\n",
+        );
+        assert!(diagnostic.contains("reference picture missing"));
+        for secret in [
+            "password",
+            "media.invalid",
+            "abc",
+            "private",
+            "confidential",
+        ] {
+            assert!(!diagnostic.contains(secret), "{diagnostic}");
+        }
+        assert_eq!(diagnostic_summary(&[b'x'; 2000]).chars().count(), 768);
+        assert!(diagnostic_summary(b" \r\n\t").is_empty());
+    }
+
+    #[test]
+    fn stage_context_keeps_timeout_distinct_from_user_cancellation() {
+        for kind in [io::ErrorKind::TimedOut, io::ErrorKind::Interrupted] {
+            let error = stage_error("MP4 完整解码校验失败", io::Error::new(kind, "diagnostic"));
+            assert_eq!(error.kind(), kind);
+            assert!(error.to_string().contains("diagnostic"));
+        }
+    }
 
     #[tokio::test]
     async fn readiness_does_not_depend_on_a_settings_write_lock() {

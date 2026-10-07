@@ -9,6 +9,7 @@ StreamCap uses **Rust, Tauri 2 and Leptos/WASM**. The supported release target i
 - TS, FLV, MKV, MOV, MP4, NUT, WAV, MP3, WMA, M4A and AAC recording/segmentation; native FLV downloading, naming templates, duration/rate reporting and free-space protection.
 - In-progress/completed TS preview, common web media, FFmpeg compatibility previews, cached live-source previews and PNG screenshots. Player assets are bundled.
 - Lossless TS-to-MP4 remuxing after stop or natural completion. Optional source cleanup follows track/codec/packet/duration and full-decode verification; collisions, failures and cancellation preserve source files.
+- Separate progress for source reading, remuxing, track verification and full decoding. Task cards prioritize the active segment; the media library separates active jobs from history and offers manual retries that keep the source TS.
 - Desktop notifications, DingTalk, WeCom, Feishu, Bark, ntfy, ServerChan, Telegram and SMTP, plus bounded post-recording executable jobs.
 - Scheduled/countdown shutdown with a cancellable 60-second warning; recording and processing finish before shutdown, without forcing other applications closed.
 - Integrated window controls, close/tray preferences, native folder selection, Chinese/English UI, shortcuts, last-page restoration, explicit release checks and verified FFmpeg installation.
@@ -27,7 +28,11 @@ Automatic conversion and cleanup are snapshotted when recording starts. Manual l
 
 TS and compatibility previews support time-based seeking, including already-recorded portions of a growing recording and a return-to-latest control. ffprobe reads the recorded duration; FFmpeg seeks directly and streams at most 120 seconds per preview segment, continuing as needed without downloading the entire recording or creating a full MP4. Preview processes are cancelled and joined on close. Live-source cache entries expire after five minutes; preview never starts an implicit platform request. Timestamp SRT files use actual segment durations; subtitle failure keeps source media.
 
-Shutdown waits up to 30 seconds for remux work. Interrupted jobs are persisted in media_jobs.json and may resume only in the same recordings root with unchanged file identities and no existing destination, retaining the original cleanup preference. Historical recordings are never scanned or converted automatically. A 4500-second setting is a platform-check interval, not a recording duration.
+Shutdown waits up to 30 seconds for remux work. Interrupted jobs are persisted in media_jobs.json. Only the latest attempt for each source may resume, in the same recordings root with unchanged file identities and no existing destination, retaining that attempt's cleanup preference. Older cancelled jobs cannot override a later keep-source retry or resume after a newer terminal result. An existing MP4 requires manual verification and is not reported as validated. Historical recordings are never scanned or converted automatically. A 4500-second setting is a platform-check interval, not a recording duration.
+
+When source cleanup is enabled, full decoding follows remuxing and can take longer for large recordings. Stage progress prefers measured frame counts for a single video track, using media time when no frame count is available; source reading never invents a percentage. Cancellation, timeout and validation failure remain distinct, with bounded, redacted tool diagnostics available in processing details.
+
+`CleanupFailed` means the MP4 passed the required checks and was published, but deleting the source did not finish. Decode failure still prevents publication and does not pass an unverified MP4 to recording scripts. The application never silently recompresses video or weakens source-deletion checks. Manual retries keep the source TS and never overwrite an existing MP4.
 
 Schedules support multiple start times, fractional hours and overnight windows. Post-recording scripts must be JSON argv arrays beginning with an absolute executable path. {file} and {room} are argument substitutions, never shell fragments. Scripts receive only this recording's source files or newly converted MP4s, never historical conversions with the same filename. Media remains protected until scripts finish, and Windows Job Objects own script descendants. Shutdown timers work while the app is running, with a 60-second cancellable warning before stopping and finalizing recordings; failures prevent a power action.
 
@@ -38,6 +43,7 @@ FFmpeg recording requires an http:// proxy; SOCKS is available for resolution an
 Install Rust 1.95.0 with MSVC/Windows SDK and Node.js 24. From the desktop directory:
 
 ```powershell
+$env:CARGO_HOME = Join-Path (Get-Location) 'build/cargo-home'
 rustup target add wasm32-unknown-unknown
 npm ci --cache .\build\npm-cache
 cargo install trunk --version 0.21.14 --locked --root .\target\tools

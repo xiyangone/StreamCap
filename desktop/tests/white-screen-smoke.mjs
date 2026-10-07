@@ -28,7 +28,11 @@ try {
         const shell=await page.locator('.app-shell').boundingBox();assert.equal(shell.x,0);assert.equal(shell.y,0);
         assert.equal(await page.locator('.device-avatar').count(),0);
         assert.equal(await page.getByRole('group',{name:'窗口控制'}).getByRole('button').count(),3);
-        assert.ok(layout.glass.includes('blur'), '玻璃态样式必须实际加载');
+        assert.equal(layout.surface.background, theme === 'dark' ? 'rgb(27, 37, 51)' : 'rgb(255, 255, 255)', '新版面板底色必须实际加载');
+        assert.equal(layout.surface.border, 'solid', '面板边界必须存在');
+        assert.ok(layout.surface.borderWidth >= 1 && layout.surface.radius >= 8, '面板尺寸样式必须实际加载');
+        assert.equal(layout.surface.backdrop, 'none', '实色面板不叠加无效模糊');
+        assert.equal(layout.baseFontSize, 14, '基础字号必须实际加载');
         if (width === 1280 || path === '/recordings') await h.shot(theme + '-' + width + path.replaceAll('/', '-'));
         cases.push({ width, theme, path, layout });
         console.log('PASS ' + width + ' ' + theme + ' ' + path);

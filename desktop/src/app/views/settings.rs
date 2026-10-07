@@ -299,7 +299,7 @@ pub fn SettingsView() -> impl IntoView {
     };
     view! {
         <div class="page settings-page">
-            <header class="page-header"><div><span class="eyebrow">"MAKE IT YOURS"</span><h1>{t("偏好设置")}</h1><p>{t("让每一次录制，更符合你的习惯。")}</p></div>
+            <header class="page-header"><div><h1>{t("偏好设置")}</h1><p>{t("管理录制、文件处理和应用偏好。")}</p></div>
                 <Show when=move || !changes.get().is_empty()><button class="button primary" disabled=move || busy.get() on:click=save><Icon name="check" size=17 />{move || if busy.get() { t("保存中…") } else { t("保存修改") }}</button></Show>
             </header>
             <div class="settings-layout">
@@ -320,6 +320,7 @@ pub fn SettingsView() -> impl IntoView {
                                         <label class="field"><span>{t("默认录制格式")}</span><select class="input" prop:value=move || draft.with(|m| m.get("video_format").and_then(Value::as_str).unwrap_or("TS").to_string()) on:change=move |e| change.run(("video_format", Value::String(event_target_value(&e))))>{FORMAT_OPTIONS.iter().map(|format| view! { <option value=*format>{*format}</option> }).collect_view()}</select></label></div>
                                         <SettingToggle label=t("录制结束转 MP4") description=t("TS 停止录制后无损转封装；仅影响之后启动的录制。需要 FFmpeg 和同目录 ffprobe。") setting="convert_to_mp4" draft=draft on_change=change />
                                         <SettingToggle label=t("转换成功后清理源 TS") description=t("仅在 MP4 完整校验成功后删除对应源 TS；失败或取消时保留。") setting="delete_original" draft=draft on_change=change />
+                                        <div class="conversion-policy"><Icon name="shield" size=17 /><p>{t("转封装不会重新压缩画面。清理源文件前会完整解码校验，长录像需要更久；退出时未完成的任务下次会尝试恢复。")}</p></div>
                                         <SettingToggle label=t("分段录制") description=t("按设定时长生成独立文件，便于保存和整理。") setting="segmented_recording_enabled" draft=draft on_change=change />
                                         <SettingText label=t("分段时长") hint=t("单位：秒，范围 1–86400。") setting="video_segment_time" draft=draft on_change=change numeric=true />
                                     </SettingsGroup>

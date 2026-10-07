@@ -88,6 +88,11 @@ pub fn RecordingsView() -> impl IntoView {
     let batch_ids = RwSignal::new(Vec::<String>::new());
     let delete_open = RwSignal::new(false);
     let delete_ids = RwSignal::new(Vec::<String>::new());
+    let processing = Memo::new(move |_| {
+        state
+            .media_jobs
+            .with(|jobs| jobs.iter().filter(|job| job.pending()).count())
+    });
     let visible = Memo::new(move |_| {
         let query = keyword.get().trim().to_lowercase();
         let key = platform.get();
@@ -266,7 +271,9 @@ pub fn RecordingsView() -> impl IntoView {
                     <div class="view-switch" role="group" aria-label=t("视图模式")><button class:active=move || state.grid_view.get() aria-label=t("网格视图") title=t("网格视图") aria-pressed=move || state.grid_view.get().to_string() on:click=move |_| set_layout.run(true)><Icon name="grid" size=18 /></button><button class:active=move || !state.grid_view.get() aria-label=t("列表视图") title=t("列表视图") aria-pressed=move || (!state.grid_view.get()).to_string() on:click=move |_| set_layout.run(false)><Icon name="list" size=18 /></button></div>
                 </div>
             </section>
-            <div class="results-line"><label class="select-all"><input type="checkbox" prop:checked=all_visible_selected disabled=move || visible.get().is_empty() on:change=select_visible /><span>{t("全选当前结果")}</span></label><span>{move || crate::tr_format!("显示 {} 个直播间", visible.get().len())}</span></div>
+            <div class="results-line"><label class="select-all"><input type="checkbox" prop:checked=all_visible_selected disabled=move || visible.get().is_empty() on:change=select_visible /><span>{t("全选当前结果")}</span></label>
+                <Show when=move || { processing.get() > 0 }><a class="text-link processing-link" href="/storage"><Icon name="file" size=14 />{move || crate::tr_format!("{} 项录后处理", processing.get())}</a></Show>
+                <span>{move || crate::tr_format!("显示 {} 个直播间", visible.get().len())}</span></div>
             <Show when=move || !selected.get().is_empty()><div class="batch-bar glass" role="region" aria-label=t("所选任务操作")><strong>{move || crate::tr_format!("已选 {} 项", selected.get().len())}</strong><button class="button secondary small" disabled=move || busy.get() || has_active_selection() || !state.status.get().ok title=t("录制中的任务须先停止") on:click=move |_| { batch_ids.set(selected.get_untracked()); batch_open.set(true); }><Icon name="edit" size=15 />{t("批量编辑")}</button><button class="button secondary small" disabled=move || busy.get() || !state.status.get().ok on:click=move |_| monitor_selected.run(true)>{t("开启监控")}</button><button class="button secondary small" disabled=move || busy.get() || !state.status.get().ok on:click=move |_| monitor_selected.run(false)>{t("暂停监控")}</button><button class="button ghost-danger small" disabled=move || busy.get() || has_active_selection() || !state.status.get().ok on:click=move |_| { delete_ids.set(selected.get_untracked()); delete_open.set(true); }><Icon name="trash" size=15 />{t("移除所选")}</button><button class="icon-button" aria-label=t("取消选择") on:click=move |_| selected.set(Vec::new())><Icon name="close" size=17 /></button></div></Show>
             <Show when=move || state.loading.get()><div class="skeleton-grid" aria-label=t("加载任务")><div class="skeleton" /><div class="skeleton" /><div class="skeleton" /></div></Show>
             <Show when=move || !state.loading.get() && visible.get().is_empty()><div class="glass empty-panel"><EmptyState icon="search" title=t("没有匹配的直播间") description=t("尝试调整搜索条件，或添加新的直播间。") /><button class="button secondary" on:click=move |_| { keyword.set(String::new()); platform.set(String::new()); filter.set(Filter::All); }>{t("清除筛选")}</button></div></Show>
