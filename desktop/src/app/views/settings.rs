@@ -2,12 +2,16 @@ use crate::app::i18n::t;
 use crate::{
     api::{desktop, gateway},
     app::{
-        components::{ConfirmDialog, Icon, PageHeader, QrLoginDialog},
+        components::{
+            ActionButton, ConfirmDialog, FormFeedback, Icon, IconButton, PageHeader, QrLoginDialog,
+            ToggleSwitch,
+        },
         labels::{platform_label, FORMAT_OPTIONS, PLATFORMS, QUALITY_OPTIONS},
     },
 };
 use leptos::prelude::*;
 use serde_json::{json, Map, Value};
+use std::collections::HashMap;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -90,10 +94,13 @@ pub fn SettingsView() -> impl IntoView {
     let cookie_error = RwSignal::new(None::<String>);
     let cookie_search = RwSignal::new(String::new());
     let cookie_platform = RwSignal::new("douyin".to_string());
+    let account_drafts = RwSignal::new(HashMap::<String, Map<String, Value>>::new());
+    let account_revision = RwSignal::new(0_u32);
     let reveal = RwSignal::new(false);
     let qr_open = RwSignal::new(false);
     let appearance_busy = RwSignal::new(false);
     let window_busy = RwSignal::new(false);
+    let directory_busy = RwSignal::new(false);
     let qr_account = RwSignal::new(None::<String>);
     let desktop = desktop::state();
 
@@ -106,12 +113,15 @@ pub fn SettingsView() -> impl IntoView {
         let _ = gateway::refresh_settings(state, false).await;
     });
     let settings_error = move || error.get().or_else(|| state.settings_error.get());
-    let reload_settings = move |_| {
+    let reload_settings = Callback::new(move |_| {
+        if state.settings_loading.get_untracked() || busy.get_untracked() {
+            return;
+        }
         error.set(None);
         leptos::task::spawn_local(async move {
             let _ = gateway::refresh_settings(state, true).await;
         });
-    };
+    });
     Effect::new(move |_| {
         if tab.get() != Tab::Accounts
             || cookies_loaded.get_untracked()
@@ -123,7 +133,11 @@ pub fn SettingsView() -> impl IntoView {
         cookie_error.set(None);
         leptos::task::spawn_local(async move {
             match gateway::fetch_cookies().await {
-                Ok(values) => {
+                Ok(mut values) => {
+                    let Some(pending) = cookie_changes.try_get_untracked() else {
+                        return;
+                    };
+                    values.extend(pending);
                     let _ = cookies.try_set(values);
                     let _ = cookies_loaded.try_set(true);
                 }
@@ -142,8 +156,8 @@ pub fn SettingsView() -> impl IntoView {
             values.insert(key.into(), value);
         });
     });
-    let save = move |_| {
-        if busy.get_untracked() {
+    let save = Callback::new(move |_| {
+        if busy.get_untracked() || !state.status.get_untracked().ok {
             return;
         }
         let patch = changes.get_untracked();
@@ -197,9 +211,9 @@ pub fn SettingsView() -> impl IntoView {
             }
             let _ = busy.try_set(false);
         });
-    };
-    let save_cookies = move |_| {
-        if busy.get_untracked() {
+    });
+    let save_cookies = Callback::new(move |_| {
+        if busy.get_untracked() || !state.status.get_untracked().ok {
             return;
         }
         let patch = cookie_changes.get_untracked();
@@ -220,7 +234,38 @@ pub fn SettingsView() -> impl IntoView {
             }
             let _ = busy.try_set(false);
         });
-    };
+    });
+    let choose_directory = Callback::new(move |_| {
+        if directory_busy.get_untracked() || busy.get_untracked() || !desktop.available {
+            return;
+        }
+        directory_busy.set(true);
+        leptos::task::spawn_local(async move {
+            match desktop::pick_directory().await {
+                Ok(Some(path)) => {
+                    let _ = change.try_run(("live_save_path", Value::String(path)));
+                }
+                Ok(None) => {}
+                Err(message) => {
+                    let _ = error.try_set(Some(message));
+                }
+            }
+            let _ = directory_busy.try_set(false);
+        });
+    });
+    let choose_layout = Callback::new(move |grid: bool| {
+        if appearance_busy.get_untracked() || state.grid_view.get_untracked() == grid {
+            return;
+        }
+        appearance_busy.set(true);
+        state.grid_view.set(grid);
+        leptos::task::spawn_local(async move {
+            if let Err(error) = gateway::save_settings(json!({"is_grid_view":grid})).await {
+                state.fail(error);
+            }
+            let _ = appearance_busy.try_set(false);
+        });
+    });
     let choose_close_action = Callback::new(move |choice: String| {
         if window_busy.get_untracked() {
             return;
@@ -267,6 +312,9 @@ pub fn SettingsView() -> impl IntoView {
         reveal.set(false);
     });
     let set_cookie = Callback::new(move |value: String| {
+        if busy.get_untracked() {
+            return;
+        }
         let key = cookie_platform.get_untracked();
         if key == "kuaishou" {
             qr_account.set(None);
@@ -278,14 +326,18 @@ pub fn SettingsView() -> impl IntoView {
             map.insert(key, Value::String(value));
         });
     });
-    let cookie_retry = move |_| {
+    let cookie_retry = Callback::new(move |_| {
         if cookies_loading.get_untracked() {
             return;
         }
         cookies_loading.set(true);
         leptos::task::spawn_local(async move {
             match gateway::fetch_cookies().await {
-                Ok(values) => {
+                Ok(mut values) => {
+                    let Some(pending) = cookie_changes.try_get_untracked() else {
+                        return;
+                    };
+                    values.extend(pending);
                     let _ = cookies.try_set(values);
                     let _ = cookies_loaded.try_set(true);
                     let _ = cookie_error.try_set(None);
@@ -296,36 +348,54 @@ pub fn SettingsView() -> impl IntoView {
             }
             let _ = cookies_loading.try_set(false);
         });
-    };
+    });
     view! {
         <div class="page settings-page">
             <PageHeader title=t("偏好设置") subtitle=t("配置录制、存储与应用行为。")>
-                <Show when=move || !changes.get().is_empty()><button class="button primary" disabled=move || busy.get() on:click=save><Icon name="check" size=17 />{move || if busy.get() { t("保存中…") } else { t("保存修改") }}</button></Show>
+                <Show when=move || !changes.get().is_empty()><ActionButton label=t("保存修改") icon="check" variant="primary" busy=busy busy_label=t("保存中…")
+                    disabled=Signal::derive(move || !state.status.get().ok) on_click=save /></Show>
             </PageHeader>
             <div class="settings-layout">
                 <nav class="settings-nav" aria-label=t("设置分类")>
+                    <ul class="ui-menu settings-menu">
                     {[(Tab::Recording,"video",t("录制与存储")),(Tab::Appearance,"sun",t("外观与窗口")),(Tab::Network,"signal",t("网络与检测")),(Tab::Accounts,"lock",t("平台登录")),(Tab::Automation,"clock",t("自动化与通知"))].into_iter().map(|(mode,icon,label)| view! {
-                        <button class="settings-nav-item" class:active=move || tab.get() == mode aria-pressed=move || (tab.get() == mode).to_string() on:click=move |_| tab.set(mode)><Icon name=icon size=18 /><span>{label}</span><Icon name="chevron" size=13 /></button>
+                        <li><ActionButton label=label icon=icon class="settings-nav-item" variant="ghost"
+                            current=Signal::derive(move || (tab.get() == mode).then_some("page"))
+                            pressed=Signal::derive(move || Some(tab.get() == mode))
+                            on_click=Callback::new(move |_| tab.set(mode)) /></li>
                     }).collect_view()}
-                    <div class="settings-local-note"><Icon name="shield" size=18 /><p>{t("设置和登录信息仅保存在此设备。")}</p></div>
+                    </ul>
+                    <p class="settings-local-note"><Icon name="shield" size=15 />{t("设置和登录信息仅保存在此设备。")}</p>
                 </nav>
-                <div class="settings-content">
-                    <Show when=move || settings_error().is_some()><div class="inline-error" role="alert"><Icon name="alert" size=18 /><p>{move || settings_error().unwrap_or_default()}</p><Show when=move || changes.get().is_empty()><button class="button secondary small" on:click=reload_settings>{t("重试")}</button></Show></div></Show>
+                <section class="settings-content" aria-label=t("设置内容")>
+                    <header class="settings-content-header">
+                        <h2>{move || match tab.get() {
+                            Tab::Recording => t("录制与存储"),
+                            Tab::Appearance => t("外观与窗口"),
+                            Tab::Network => t("网络与检测"),
+                            Tab::Accounts => t("平台登录"),
+                            Tab::Automation => t("自动化与通知"),
+                        }}</h2>
+                        <Show when=move || !changes.get().is_empty()><span class="ui-badge ui-badge-sm">{t("有未保存的修改")}</span></Show>
+                    </header>
+                    <div class="settings-sections">
+                    <Show when=move || settings_error().is_some()><div class="inline-error"><FormFeedback error=Signal::derive(settings_error) />
+                        <Show when=move || changes.get().is_empty()><ActionButton label=t("重试") class="small" disabled=Signal::derive(move || state.settings_loading.get() || busy.get()) on_click=reload_settings /></Show></div></Show>
                     <Show when=move || tab.get() == Tab::Recording || tab.get() == Tab::Network || tab.get() == Tab::Automation>
-                        <Show when=move || !loading.get() && !draft.get().is_empty() fallback=move || view! { <div class="loading-state"><span class="spinner" />{t("正在读取设置…")}</div> }>
-                            <fieldset disabled=move || busy.get()>
+                        <Show when=move || !loading.get() && !draft.get().is_empty() fallback=move || view! { <div class="loading-state"><span class="ui-loading ui-loading-spinner ui-loading-sm spinner" aria-hidden="true" />{t("正在读取设置…")}</div> }>
+                            <fieldset class="settings-form" disabled=move || busy.get()>
                                 <Show when=move || tab.get() == Tab::Recording>
                                     <SettingsGroup title=t("录制偏好") subtitle=t("作为直播间的默认配置，可为单个任务单独覆盖。") icon="video">
-                                        <div class="form-grid"><label class="field"><span>{t("默认清晰度")}</span><select class="input" prop:value=move || draft.with(|m| m.get("record_quality").and_then(Value::as_str).unwrap_or("OD").to_string()) on:change=move |e| change.run(("record_quality", Value::String(event_target_value(&e))))>{QUALITY_OPTIONS.iter().map(|(code,label)| view! { <option value=*code>{*label}</option> }).collect_view()}</select></label>
-                                        <label class="field"><span>{t("默认录制格式")}</span><select class="input" prop:value=move || draft.with(|m| m.get("video_format").and_then(Value::as_str).unwrap_or("TS").to_string()) on:change=move |e| change.run(("video_format", Value::String(event_target_value(&e))))>{FORMAT_OPTIONS.iter().map(|format| view! { <option value=*format>{*format}</option> }).collect_view()}</select></label></div>
+                                        <div class="form-grid"><label class="field"><span>{t("默认清晰度")}</span><select class="ui-select input" prop:value=move || draft.with(|m| m.get("record_quality").and_then(Value::as_str).unwrap_or("OD").to_string()) on:change=move |e| change.run(("record_quality", Value::String(event_target_value(&e))))>{QUALITY_OPTIONS.iter().map(|(code,label)| view! { <option value=*code>{*label}</option> }).collect_view()}</select></label>
+                                        <label class="field"><span>{t("默认录制格式")}</span><select class="ui-select input" prop:value=move || draft.with(|m| m.get("video_format").and_then(Value::as_str).unwrap_or("TS").to_string()) on:change=move |e| change.run(("video_format", Value::String(event_target_value(&e))))>{FORMAT_OPTIONS.iter().map(|format| view! { <option value=*format>{*format}</option> }).collect_view()}</select></label></div>
                                         <SettingToggle label=t("录制结束转 MP4") description=t("TS 停止录制后无损转封装；仅影响之后启动的录制。需要 FFmpeg 和同目录 ffprobe。") setting="convert_to_mp4" draft=draft on_change=change />
                                         <SettingToggle label=t("转换成功后清理源 TS") description=t("仅在 MP4 完整校验成功后删除对应源 TS；失败或取消时保留。") setting="delete_original" draft=draft on_change=change />
-                                        <div class="conversion-policy"><Icon name="shield" size=17 /><p>{t("转封装不会重新压缩画面。清理源文件前会完整解码校验，长录像需要更久；退出时未完成的任务下次会尝试恢复。")}</p></div>
+                                        <div class="ui-alert ui-alert-soft inline-notice conversion-policy"><Icon name="shield" size=17 /><p>{t("转封装不会重新压缩画面。清理源文件前会完整解码校验，长录像需要更久；退出时未完成的任务下次会尝试恢复。")}</p></div>
                                         <SettingToggle label=t("分段录制") description=t("按设定时长生成独立文件，便于保存和整理。") setting="segmented_recording_enabled" draft=draft on_change=change />
                                         <SettingText label=t("分段时长") hint=t("单位：秒，范围 1–86400。") setting="video_segment_time" draft=draft on_change=change numeric=true />
                                     </SettingsGroup>
                                     <SettingsGroup title=t("文件与目录") subtitle=t("文件保存在本机；改变路径不移动已有录制文件。") icon="folder">
-                                        <div class="directory-picker"><SettingText label=t("录制保存位置") hint=t("留空使用应用默认录制目录。") setting="live_save_path" draft=draft on_change=change /><button class="button secondary small" type="button" disabled=move || !desktop.available on:click=move |_| {leptos::task::spawn_local(async move {match desktop::pick_directory().await{Ok(Some(path))=>change.run(("live_save_path",Value::String(path))),Ok(None)=>{},Err(error)=>state.fail(error)}});} >{t("选择文件夹")}</button></div>
+                                        <div class="directory-picker"><SettingText label=t("录制保存位置") hint=t("留空使用应用默认录制目录。") setting="live_save_path" draft=draft on_change=change /><ActionButton label=t("选择文件夹") icon="folder" class="small" busy=directory_busy disabled=Signal::derive(move || busy.get() || !desktop.available) on_click=choose_directory /></div>
                                         <SettingToggle label=t("生成时间字幕") description=t("录制结束后生成同名 SRT，按真实分段时长写入录制时间；需要 ffprobe。") setting="generate_time_subtitle_file" draft=draft on_change=change />
                                         <SettingToggle label=t("文件名包含直播标题") description=t("将直播标题添加到新录制文件的名称中。") setting="filename_includes_title" draft=draft on_change=change />
                                         <SettingToggle label=t("按平台建立文件夹") description=t("不同直播平台的内容分别存放。") setting="folder_name_platform" draft=draft on_change=change />
@@ -344,7 +414,7 @@ pub fn SettingsView() -> impl IntoView {
                                     <SettingsGroup title=t("代理与直播源") subtitle=t("应用于直播解析和新启动的录制。") icon="signal">
                                         <p class="setting-note">{t("关闭应用代理时使用系统网络路由（包括 TUN），不继承环境代理；是否经过远端节点取决于系统分流规则。")}</p>
                                         <SettingToggle label=t("使用代理") description=t("通过指定代理查询并拉取直播流。") setting="enable_proxy" draft=draft on_change=change />
-                                        <SettingText label=t("代理地址") hint=t("FFmpeg 录制使用 http:// 代理；SOCKS 仅支持解析和 FLV 直下。") setting="proxy_address" draft=draft on_change=change /><SettingText label=t("使用代理的平台") hint=t("平台标识用逗号分隔；留空对全部平台生效。") setting="default_platform_with_proxy" draft=draft on_change=change /><label class="field"><span>{t("优先直播源")}</span><select class="input" prop:value=move || draft.with(|m|m.get("default_live_source").and_then(Value::as_str).unwrap_or("FLV").to_string()) on:change=move |e|change.run(("default_live_source",Value::String(event_target_value(&e))))><option value="FLV">"FLV"</option><option value="HLS">"HLS"</option></select></label><SettingToggle label=t("强制 HTTPS 拉流") description=t("将 HTTP 播放地址升级为 HTTPS；平台必须支持 HTTPS。") setting="force_https_recording" draft=draft on_change=change /><SettingToggle label=t("FLV 直接下载") description=t("使用 Rust 直接下载；需要 FLV 格式并关闭分段。") setting="flv_use_direct_download" draft=draft on_change=change />
+                                        <SettingText label=t("代理地址") hint=t("FFmpeg 录制使用 http:// 代理；SOCKS 仅支持解析和 FLV 直下。") setting="proxy_address" draft=draft on_change=change /><SettingText label=t("使用代理的平台") hint=t("平台标识用逗号分隔；留空对全部平台生效。") setting="default_platform_with_proxy" draft=draft on_change=change /><label class="field"><span>{t("优先直播源")}</span><select class="ui-select input" prop:value=move || draft.with(|m|m.get("default_live_source").and_then(Value::as_str).unwrap_or("FLV").to_string()) on:change=move |e|change.run(("default_live_source",Value::String(event_target_value(&e))))><option value="FLV">"FLV"</option><option value="HLS">"HLS"</option></select></label><SettingToggle label=t("强制 HTTPS 拉流") description=t("将 HTTP 播放地址升级为 HTTPS；平台必须支持 HTTPS。") setting="force_https_recording" draft=draft on_change=change /><SettingToggle label=t("FLV 直接下载") description=t("使用 Rust 直接下载；需要 FLV 格式并关闭分段。") setting="flv_use_direct_download" draft=draft on_change=change />
                                     </SettingsGroup>
                                 </Show>
 
@@ -368,56 +438,92 @@ pub fn SettingsView() -> impl IntoView {
                                   </SettingsGroup>
                                 </Show>
                             </fieldset>
-                            <Show when=move || !changes.get().is_empty()><div class="settings-savebar"><span><i class="unsaved-dot" />{t("有未保存的修改")}</span><button class="button secondary small" disabled=move || busy.get() on:click=move |_| { changes.set(Map::new()); error.set(None); }>{t("放弃修改")}</button><button class="button primary small" disabled=move || busy.get() on:click=save>{t("保存修改")}</button></div></Show>
+                            <Show when=move || !changes.get().is_empty()><div class="settings-savebar"><span><i class="unsaved-dot" />{t("有未保存的修改")}</span>
+                                <ActionButton label=t("放弃修改") class="small" disabled=busy on_click=Callback::new(move |_| { changes.set(Map::new()); error.set(None); }) />
+                                <ActionButton label=t("保存修改") icon="check" variant="primary" class="small" busy=busy busy_label=t("保存中…")
+                                    disabled=Signal::derive(move || !state.status.get().ok) on_click=save />
+                            </div></Show>
                         </Show>
                     </Show>
                     <Show when=move || tab.get() == Tab::Appearance>
                         <LanguagePicker /><SettingsGroup title=t("外观") subtitle=t("窗口和内容使用同一套主题。") icon="sun">
                             <div class="theme-options" role="group" aria-label=t("主题模式")>
                                 {[("light",t("浅色"),"sun"),("dark",t("深色"),"moon"),("system",t("跟随系统"),"monitor")].into_iter().map(|(mode,label,icon)| view! {
-                                    <button class="theme-option" class:active=move || state.theme.get() == mode aria-pressed=move || (state.theme.get() == mode).to_string() on:click=move |_| choose_theme.run(mode)><span class="theme-preview" data-preview=mode><i /><i /><i /></span><span><Icon name=icon size=17 />{label}<span class="theme-check"><Icon name="check" size=16 /></span></span></button>
+                                    <ActionButton label=label class="theme-option" variant="ghost" pressed=Signal::derive(move || Some(state.theme.get() == mode))
+                                        on_click=Callback::new(move |_| choose_theme.run(mode))><span class="theme-preview" data-preview=mode><i /><i /><i /></span><span class="theme-option-label"><Icon name=icon size=17 />{label}<span class="theme-check"><Icon name="check" size=16 /></span></span></ActionButton>
                                 }).collect_view()}
                             </div>
                             <div class="settings-row"><div><strong>{t("强调色")}</strong><p>{t("用于主要按钮、选中状态和界面高亮。")}</p></div></div>
                             <div class="accent-options" role="group" aria-label=t("强调色")>
                                 {[("blue",t("晴空蓝")),("teal",t("湖水青")),("purple",t("鸢尾紫")),("green",t("松林绿")),("orange",t("暖橙")),("red",t("珊瑚红")),("indigo",t("靛蓝"))].into_iter().map(|(color,label)| view! {
-                                    <button class="accent-swatch" data-color=color class:active=move || state.accent.get() == color aria-label=label title=label aria-pressed=move || (state.accent.get() == color).to_string() on:click=move |_| choose_accent.run(color)><Icon name="check" size=17 /></button>
+                                    <span class="accent-choice" data-color=color><IconButton label=label icon="check" class="accent-swatch"
+                                        pressed=Signal::derive(move || Some(state.accent.get() == color)) on_click=Callback::new(move |_| choose_accent.run(color)) /></span>
                                 }).collect_view()}
                             </div>
-                            <div class="settings-row"><div><strong>{t("默认任务视图")}</strong><p>{t("在网格卡片和紧凑列表之间切换。")}</p></div><div class="view-switch"><button class:active=move || state.grid_view.get() aria-label=t("默认网格视图") disabled=move || appearance_busy.get() on:click=move |_| { state.grid_view.set(true); appearance_busy.set(true); leptos::task::spawn_local(async move { if let Err(error) = gateway::save_settings(json!({"is_grid_view":true})).await { state.fail(error); } let _ = appearance_busy.try_set(false); }); }><Icon name="grid" size=18 /></button><button class:active=move || !state.grid_view.get() aria-label=t("默认列表视图") disabled=move || appearance_busy.get() on:click=move |_| { state.grid_view.set(false); appearance_busy.set(true); leptos::task::spawn_local(async move { if let Err(error) = gateway::save_settings(json!({"is_grid_view":false})).await { state.fail(error); } let _ = appearance_busy.try_set(false); }); }><Icon name="list" size=18 /></button></div></div>
+                            <div class="settings-row"><div><strong>{t("默认任务视图")}</strong><p>{t("在网格卡片和紧凑列表之间切换。")}</p></div><div class="view-switch">
+                                <IconButton label=t("默认网格视图") icon="grid" disabled=appearance_busy pressed=Signal::derive(move || Some(state.grid_view.get())) on_click=Callback::new(move |_| choose_layout.run(true)) />
+                                <IconButton label=t("默认列表视图") icon="list" disabled=appearance_busy pressed=Signal::derive(move || Some(!state.grid_view.get())) on_click=Callback::new(move |_| choose_layout.run(false)) />
+                            </div></div>
                         </SettingsGroup>
                     </Show>
                     <Show when=move || tab.get() == Tab::Appearance && desktop.available>
                         <SettingsGroup title=t("窗口行为") subtitle=t("选择点击窗口关闭按钮或按 Alt+F4 后的行为。") icon="monitor">
                             <div class="settings-row"><div><strong>{t("关闭窗口时")}</strong><p>{t("退出会停止录制；托盘模式继续在后台运行。")}</p></div>
-                                <select class="input" aria-label=t("关闭窗口时") prop:value=move||state.setting("close_action","ask") disabled=move||window_busy.get() on:change=move|event|choose_close_action.run(event_target_value(&event))>
+                                <select class="ui-select input" aria-label=t("关闭窗口时") prop:value=move||state.setting("close_action","ask") disabled=move||window_busy.get() on:change=move|event|choose_close_action.run(event_target_value(&event))>
                                     <option value="ask">{t("每次询问")}</option><option value="exit">{t("退出应用")}</option><option value="tray">{t("最小化到托盘")}</option>
                                 </select>
                             </div>
                         </SettingsGroup>
                     </Show>
-                    <Show when=move || tab.get() == Tab::Accounts><AccountEditor platform=cookie_platform />
+                    <Show when=move || tab.get() == Tab::Accounts>
                         <SettingsGroup title=t("平台登录") subtitle=t("部分平台需要 Cookie 才能获取直播信息。仅保存明确编辑的项目。") icon="lock">
                             <div class="scope-notice"><Icon name="shield" size=19 /><p>{t("Cookie 属于敏感登录信息，请勿分享或提交到代码仓库。")}</p></div>
-                            <Show when=move || cookies_loading.get()><div class="loading-state"><span class="spinner" />{t("正在读取平台信息…")}</div></Show>
-                            <Show when=move || cookie_error.get().is_some()><div class="inline-error" role="alert"><p>{move || cookie_error.get().unwrap_or_default()}</p><Show when=move || !cookies_loaded.get()><button class="button secondary small" on:click=cookie_retry>{t("重试")}</button></Show></div></Show>
+                            <Show when=move || cookies_loading.get()><div class="loading-state"><span class="ui-loading ui-loading-spinner ui-loading-sm spinner" aria-hidden="true" />{t("正在读取平台信息…")}</div></Show>
+                            <Show when=move || cookie_error.get().is_some()><div class="inline-error"><FormFeedback error=cookie_error title=t("操作未完成") />
+                                <Show when=move || !cookies_loaded.get()><ActionButton label=t("重试") class="small" disabled=cookies_loading on_click=cookie_retry /></Show></div></Show>
                             <Show when=move || cookies_loaded.get()>
-                                <div class="cookie-workspace"><div class="cookie-sidebar"><label class="search-field compact"><Icon name="search" size=16 /><input aria-label=t("搜索平台") placeholder=t("搜索平台…") prop:value=move || cookie_search.get() on:input=move |e| cookie_search.set(event_target_value(&e)) /></label><div class="cookie-platform-list" role="group" aria-label=t("Cookie 平台列表")>
-                                    {move || cookie_keys().into_iter().map(|key| { let target = key.clone(); let active_key = key.clone(); let saved_key = key.clone(); view! { <button class="cookie-platform" class:active=move || cookie_platform.get() == active_key on:click=move |_| select_cookie.run(target.clone())><span>{platform_label(&key)}</span><span class="configured-dot" class:configured=move || cookies.with(|values| values.get(&saved_key).and_then(Value::as_str).is_some_and(|s| !s.is_empty())) /></button> } }).collect_view()}
-                                </div></div><div class="cookie-editor"><div class="cookie-editor-heading"><div><h3>{move || platform_label(&cookie_platform.get())}</h3><span>{t("平台 Cookie")}</span></div><Show when=move || cookie_platform.get() == "kuaishou"><button class="button secondary small" disabled=move || !state.status.get().resolver_ready on:click=move |_| qr_open.set(true)><Icon name="qr" size=16 />{t("扫码登录")}</button></Show></div>
-                                    <label class="field"><span>{t("登录信息")}</span><input class="input cookie-input" type=move || if reveal.get() { "text" } else { "password" } autocomplete="off" spellcheck="false" aria-label=t("平台 Cookie") placeholder=t("粘贴该平台的 Cookie") disabled=move || busy.get()
+                                <div class="cookie-workspace">
+                                <div class="cookie-platform-toolbar">
+                                    <label class="field cookie-platform-picker"><span>{t("选择平台")}</span>
+                                        <select class="ui-select input" aria-label=t("Cookie 平台列表") prop:value=move || { let _ = cookie_search.get(); cookie_platform.get() }
+                                            on:change=move |event| select_cookie.run(event_target_value(&event))>
+                                            <Show when=move || !cookie_keys().contains(&cookie_platform.get())>
+                                                <option value=move || cookie_platform.get() prop:selected=true>{move || platform_label(&cookie_platform.get())}</option>
+                                            </Show>
+                                            <For each=cookie_keys key=|key| key.clone() children=move |key| {
+                                                let label = platform_label(&key);
+                                                let selected_key = key.clone();
+                                                view! { <option value=key prop:selected=move || cookie_platform.get() == selected_key>{label}</option> }
+                                            } />
+                                        </select>
+                                    </label>
+                                    <div class="search-field compact"><Icon name="search" size=16 /><input class="ui-input" aria-label=t("搜索平台") placeholder=t("搜索平台…") prop:value=move || cookie_search.get() on:input=move |e| cookie_search.set(event_target_value(&e)) />
+                                    <Show when=move || !cookie_search.get().is_empty()><IconButton label=t("清除搜索") icon="close" on_click=Callback::new(move |_| cookie_search.set(String::new())) /></Show>
+                                    </div>
+                                </div>
+                                <Show when=move || cookie_keys().is_empty()><p class="field-hint">{t("没有匹配的平台")}</p></Show>
+                                <div class="cookie-editor"><div class="cookie-editor-heading"><div><strong>{move || platform_label(&cookie_platform.get())}</strong><span class="ui-badge ui-badge-sm">{move || if cookies.with(|values| values.get(&cookie_platform.get()).and_then(Value::as_str).is_some_and(|value| !value.is_empty())) { t("已填写") } else { t("未填写") }}</span></div><Show when=move || cookie_platform.get() == "kuaishou"><ActionButton label=t("扫码登录") icon="qr" class="small" variant="ghost"
+                                    disabled=Signal::derive(move || busy.get() || !state.status.get().ok || !state.status.get().resolver_ready)
+                                    on_click=Callback::new(move |_| qr_open.set(true)) /></Show></div>
+                                    <label class="field"><span>{t("登录信息")}</span><input class="ui-input input cookie-input" type=move || if reveal.get() { "text" } else { "password" } autocomplete="off" spellcheck="false" aria-label=t("平台 Cookie") placeholder=t("粘贴该平台的 Cookie") disabled=move || busy.get()
                                         prop:value=move || cookies.with(|values| values.get(&cookie_platform.get()).and_then(Value::as_str).unwrap_or("").to_string()) on:input=move |e| set_cookie.run(event_target_value(&e)) /></label>
-                                    <div class="cookie-tools"><button class="text-button" on:click=move |_| reveal.update(|v| *v = !*v)><Icon name="eye" size=15 />{move || if reveal.get() { t("隐藏内容") } else { t("显示内容") }}</button><button class="text-button danger-text" disabled=move || busy.get() on:click=move |_| set_cookie.run(String::new())>{t("清空此平台")}</button></div>
+                                    <div class="cookie-tools"><ActionButton label=Signal::derive(move || if reveal.get() { t("隐藏内容") } else { t("显示内容") }) icon="eye" class="small" variant="ghost"
+                                        pressed=Signal::derive(move || Some(reveal.get())) on_click=Callback::new(move |_| reveal.update(|value| *value = !*value)) />
+                                        <ActionButton label=t("清空此平台") class="small" variant="ghost-danger" disabled=busy on_click=Callback::new(move |_| set_cookie.run(String::new())) />
+                                    </div>
                                     <Show when=move||cookie_platform.get()=="kuaishou"&&qr_account.get().is_some()><div class="account-status" role="status"><Icon name="check" size=17/><span>{move||qr_account.get().unwrap_or_default()}{t(" · 已保存")}</span></div></Show>
                                     <p class="field-hint">{t("清空后需要保存才会移除登录信息。其他平台不受影响。")}</p>
-                                    <div class="cookie-save"><span>{move || crate::tr_format!("{} 个平台待保存", cookie_changes.get().len())}</span><button class="button primary" disabled=move || busy.get() || cookie_changes.get().is_empty() on:click=save_cookies>{move || if busy.get() { t("保存中…") } else { t("保存登录信息") }}</button></div>
+                                    <div class="cookie-save"><span>{move || crate::tr_format!("{} 个平台待保存", cookie_changes.get().len())}</span><ActionButton label=t("保存登录信息") icon="check" variant="primary"
+                                        busy=busy busy_label=t("保存中…") disabled=Signal::derive(move || cookie_changes.get().is_empty() || !state.status.get().ok) on_click=save_cookies /></div>
                                 </div></div>
                             </Show>
                         </SettingsGroup>
+                        <AccountEditor platform=cookie_platform drafts=account_drafts saved_revision=account_revision />
                     </Show>
 
                     <Show when=move || tab.get()==Tab::Recording><ToolSettings /></Show>
-                </div>
+                    </div>
+                </section>
             </div>
         </div>
         <QrLoginDialog open=qr_open on_success=Callback::new(move |result: gateway::QrSnapshot| {
@@ -436,7 +542,12 @@ fn SettingsGroup(
     icon: &'static str,
     children: Children,
 ) -> impl IntoView {
-    view! { <section class="settings-group"><header class="settings-group-header"><span class="settings-group-icon"><Icon name=icon size=20 /></span><div><h2>{title}</h2><p>{subtitle}</p></div></header><div class="settings-group-body">{children()}</div></section> }
+    view! {
+        <section class="settings-group">
+            <header class="settings-group-header"><h3><Icon name=icon size=16 /><span>{title}</span></h3><p>{subtitle}</p></header>
+            <div class="settings-group-body">{children()}</div>
+        </section>
+    }
 }
 #[component]
 fn SettingText(
@@ -448,7 +559,7 @@ fn SettingText(
     #[prop(optional)] numeric: bool,
     #[prop(optional)] secret: bool,
 ) -> impl IntoView {
-    view! { <label class="field settings-field"><span>{label}</span><input class="input" type=if secret {"password"}else{"text"} autocomplete="off" inputmode=if numeric { "decimal" } else { "text" } prop:value=move || draft.with(|values| values.get(setting).map(|v| v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_string())).unwrap_or_default()) on:input=move |e| on_change.run((setting,Value::String(event_target_value(&e)))) /><small class="field-hint">{hint}</small></label> }
+    view! { <label class="field settings-field"><span>{label}</span><input class="ui-input input" type=if secret {"password"}else{"text"} autocomplete="off" inputmode=if numeric { "decimal" } else { "text" } prop:value=move || draft.with(|values| values.get(setting).map(|v| v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_string())).unwrap_or_default()) on:input=move |e| on_change.run((setting,Value::String(event_target_value(&e)))) /><small class="field-hint">{hint}</small></label> }
 }
 #[component]
 fn SettingToggle(
@@ -458,14 +569,41 @@ fn SettingToggle(
     draft: RwSignal<Map<String, Value>>,
     on_change: Callback<(&'static str, Value)>,
 ) -> impl IntoView {
-    view! { <label class="settings-row"><span><strong>{label}</strong><small>{description}</small></span><input class="switch" type="checkbox" role="switch" aria-label=label prop:checked=move || draft.with(|values| values.get(setting).and_then(Value::as_bool).unwrap_or(false)) on:change=move |e| on_change.run((setting,Value::Bool(event_target_checked(&e)))) /></label> }
+    view! { <ToggleSwitch label=label hint=description
+    checked=Signal::derive(move || draft.with(|values| values.get(setting).and_then(Value::as_bool).unwrap_or(false)))
+    on_change=Callback::new(move |enabled| on_change.run((setting, Value::Bool(enabled)))) /> }
 }
 
 #[component]
 fn LanguagePicker() -> impl IntoView {
     let state = gateway::app_state();
     let busy = RwSignal::new(false);
-    view! {<SettingsGroup title=t("界面语言") subtitle=t("保存后重新加载界面，不停止后台录制。") icon="settings"><label class="field"><span>{t("语言")}</span><select class="input" aria-label=t("界面语言") prop:value=move||state.setting("language","zh_CN") disabled=move||busy.get() on:change=move|e|{let value=event_target_value(&e);busy.set(true);leptos::task::spawn_local(async move{match gateway::save_settings(json!({"language":value})).await{Ok(())=>crate::app::i18n::set_language(&value),Err(error)=>state.fail(error)}let _=busy.try_set(false);});}><option value="zh_CN">{t("简体中文")}</option><option value="en">"English"</option></select></label></SettingsGroup>}
+    let error = RwSignal::new(None::<String>);
+    let change = Callback::new(move |value: String| {
+        if busy.get_untracked() || !state.status.get_untracked().ok {
+            return;
+        }
+        busy.set(true);
+        error.set(None);
+        leptos::task::spawn_local(async move {
+            match gateway::save_settings(json!({"language":value})).await {
+                Ok(()) => crate::app::i18n::set_language(&value),
+                Err(message) => {
+                    let _ = error.try_set(Some(message));
+                }
+            }
+            let _ = busy.try_set(false);
+        });
+    });
+    view! {
+        <SettingsGroup title=t("界面语言") subtitle=t("保存后重新加载界面，不停止后台录制。") icon="settings">
+            <label class="field"><span>{t("语言")}</span><select class="ui-select input" aria-label=t("界面语言") prop:value=move||state.setting("language","zh_CN")
+                disabled=move||busy.get() || !state.status.get().ok on:change=move |event| change.run(event_target_value(&event))>
+                <option value="zh_CN">{t("简体中文")}</option><option value="en">"English"</option>
+            </select></label>
+            <FormFeedback error=error title=t("操作未完成") />
+        </SettingsGroup>
+    }
 }
 #[component]
 fn ShutdownTimer() -> impl IntoView {
@@ -474,11 +612,22 @@ fn ShutdownTimer() -> impl IntoView {
     let hours = RwSignal::new(state.setting("quick_shutdown_hours", "3"));
     let confirm = RwSignal::new(false);
     let busy = RwSignal::new(false);
+    let error = RwSignal::new(None::<String>);
     let start = Callback::new(move |_| {
-        let Ok(value) = hours.get_untracked().parse::<f64>() else {
-            state.fail(t("请输入有效小时数"));
+        if busy.get_untracked() || !state.status.get_untracked().ok {
+            return;
+        }
+        let Some(value) = hours
+            .get_untracked()
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite() && (0.01..=168.0).contains(value))
+        else {
+            error.set(Some(t("请输入 0.01–168 之间的小时数").into()));
+            state.fail(t("请输入 0.01–168 之间的小时数"));
             return;
         };
+        error.set(None);
         busy.set(true);
         leptos::task::spawn_local(async move {
             match gateway::shutdown_timer(Some(value)).await {
@@ -486,23 +635,78 @@ fn ShutdownTimer() -> impl IntoView {
                     state.notify(t("关机倒计时已启动"));
                     let _ = confirm.try_set(false);
                 }
-                Err(error) => state.fail(error),
+                Err(message) => {
+                    let _ = error.try_set(Some(message.clone()));
+                    state.fail(message);
+                }
             }
             let _ = busy.try_set(false);
         });
     });
-    view! {<div class="form-grid"><label class="field"><span>{t("关机倒计时（小时）")}</span><input class="input" type="number" min="0.01" max="168" prop:value=move||hours.get() on:input=move|e|hours.set(event_target_value(&e))/></label><div class="timer-actions"><button class="button secondary small" type="button" on:click=move |_|confirm.set(true)>{t("启动倒计时")}</button><button class="button secondary small" type="button" on:click=move |_|leptos::task::spawn_local(async move{let result=if native.available {desktop::cancel_shutdown().await} else {gateway::shutdown_timer(None).await};match result{Ok(())=>state.notify(t("关机倒计时已取消")),Err(error)=>state.fail(error)}})>{t("取消倒计时")}</button></div></div><ConfirmDialog open=confirm title=t("启动关机倒计时") description=Signal::derive(move||crate::tr_format!("将在 {} 小时后提示关机。请先保存其他应用中的工作。",hours.get())) busy=busy on_confirm=start icon="clock" destructive=false confirm_text=t("启动倒计时") busy_text=t("正在设置…") />}
+    let cancel = Callback::new(move |_| {
+        if busy.get_untracked() {
+            return;
+        }
+        busy.set(true);
+        error.set(None);
+        leptos::task::spawn_local(async move {
+            let result = if native.available {
+                desktop::cancel_shutdown().await
+            } else {
+                gateway::shutdown_timer(None).await
+            };
+            match result {
+                Ok(()) => state.notify(t("关机倒计时已取消")),
+                Err(message) => {
+                    let _ = error.try_set(Some(message));
+                }
+            }
+            let _ = busy.try_set(false);
+        });
+    });
+    view! {
+        <div class="form-grid"><label class="field"><span>{t("关机倒计时（小时）")}</span><input class="ui-input input" type="number" min="0.01" max="168"
+            prop:value=move||hours.get() disabled=move || busy.get() on:input=move|event| { hours.set(event_target_value(&event)); error.set(None); } /></label>
+            <div class="timer-actions"><ActionButton label=t("启动倒计时") icon="clock" class="small" disabled=Signal::derive(move || busy.get() || !state.status.get().ok)
+                on_click=Callback::new(move |_| confirm.set(true)) />
+                <ActionButton label=t("取消倒计时") class="small" disabled=busy on_click=cancel />
+            </div>
+        </div>
+        <FormFeedback error=error title=t("操作未完成") />
+        <ConfirmDialog open=confirm title=t("启动关机倒计时") description=Signal::derive(move||crate::tr_format!("将在 {} 小时后提示关机。请先保存其他应用中的工作。",hours.get()))
+            busy=busy disabled=Signal::derive(move || !state.status.get().ok) on_confirm=start icon="clock" destructive=false confirm_text=t("启动倒计时") busy_text=t("正在设置…") />
+    }
 }
 #[component]
-fn AccountEditor(platform: RwSignal<String>) -> impl IntoView {
+fn AccountEditor(
+    platform: RwSignal<String>,
+    drafts: RwSignal<HashMap<String, Map<String, Value>>>,
+    saved_revision: RwSignal<u32>,
+) -> impl IntoView {
     let state = gateway::app_state();
-    let draft = RwSignal::new(Map::<String, Value>::new());
-    let dirty = RwSignal::new(Map::<String, Value>::new());
+    let summary = RwSignal::new(None::<(String, gateway::AccountSummary)>);
+    let dirty = Memo::new(move |_| {
+        drafts.with(|drafts| drafts.get(&platform.get()).cloned().unwrap_or_default())
+    });
+    let current_summary = Memo::new(move |_| {
+        summary.with(|summary| {
+            summary
+                .as_ref()
+                .filter(|(key, _)| key == &platform.get())
+                .map(|(_, summary)| summary.clone())
+                .unwrap_or_default()
+        })
+    });
+    let draft = Memo::new(move |_| account_fields(&current_summary.get(), &dirty.get()));
     let busy = RwSignal::new(false);
+    let loading = RwSignal::new(false);
+    let error = RwSignal::new(None::<String>);
     let revision = RwSignal::new(0_u32);
-    let has_password = RwSignal::new(false);
-    let has_token = RwSignal::new(false);
+    let has_password = Signal::derive(move || current_summary.get().has_password);
+    let has_token = Signal::derive(move || current_summary.get().has_access_token);
     let load_account = Callback::new(move |(key, generation): (String, u32)| {
+        loading.set(true);
+        error.set(None);
         leptos::task::spawn_local(async move {
             let result = gateway::accounts().await;
             if revision.try_get_untracked() != Some(generation) {
@@ -510,27 +714,32 @@ fn AccountEditor(platform: RwSignal<String>) -> impl IntoView {
             }
             match result {
                 Ok(values) => {
-                    let summary = values.get(&key).cloned().unwrap_or_default();
-                    draft.set(account_fields(&summary, &dirty.get_untracked()));
-                    has_password.set(summary.has_password);
-                    has_token.set(summary.has_access_token);
+                    let account = values.get(&key).cloned().unwrap_or_default();
+                    summary.set(Some((key, account)));
                 }
-                Err(error) => state.fail(error),
+                Err(message) => error.set(Some(message)),
             }
+            loading.set(false);
         });
     });
     Effect::new(move |_| {
         let key = platform.get();
+        let _ = saved_revision.get();
         let generation = revision.get_untracked().wrapping_add(1);
         revision.set(generation);
-        draft.set(Map::new());
-        dirty.set(Map::new());
-        has_password.set(false);
-        has_token.set(false);
+        summary.set(None);
         load_account.run((key, generation));
     });
-    let save = move |_| {
-        if busy.get_untracked() {
+    let change = Callback::new(move |(field, value): (&'static str, String)| {
+        let value = Value::String(value);
+        let key = platform.get_untracked();
+        drafts.update(|drafts| {
+            drafts.entry(key).or_default().insert(field.into(), value);
+        });
+        error.set(None);
+    });
+    let save = Callback::new(move |_| {
+        if busy.get_untracked() || !state.status.get_untracked().ok {
             return;
         }
         let key = platform.get_untracked();
@@ -541,33 +750,73 @@ fn AccountEditor(platform: RwSignal<String>) -> impl IntoView {
         // A read started before this write must not publish an older account summary.
         let generation = revision.get_untracked().wrapping_add(1);
         revision.set(generation);
+        loading.set(false);
+        error.set(None);
         busy.set(true);
         leptos::task::spawn_local(async move {
             match gateway::save_account(&key, Value::Object(patch.clone())).await {
                 Ok(()) => {
-                    if revision.try_get_untracked() == Some(generation) {
-                        let _ = dirty.try_update(|pending| acknowledge_saved(pending, &patch));
-                        // Keep newer edits, but never leave an acknowledged secret in the field.
-                        draft.update(|fields| {
-                            for key in ["password", "accessToken"] {
-                                if patch
-                                    .get(key)
-                                    .is_some_and(|value| fields.get(key) == Some(value))
-                                {
-                                    fields.remove(key);
-                                }
+                    let _ = drafts.try_update(|drafts| {
+                        if let Some(pending) = drafts.get_mut(&key) {
+                            acknowledge_saved(pending, &patch);
+                            if pending.is_empty() {
+                                drafts.remove(&key);
                             }
-                        });
-                        load_account.run((key, generation));
-                    }
+                        }
+                    });
+                    // Refresh the currently mounted editor, even if this request's editor
+                    // was disposed while the user switched settings categories.
+                    let _ = saved_revision.try_update(|value| *value = value.wrapping_add(1));
                     state.notify(t("平台账号配置已保存"));
                 }
-                Err(error) => state.fail(error),
+                Err(message) => {
+                    if platform.try_get_untracked().as_ref() == Some(&key) {
+                        let _ = error.try_set(Some(message));
+                    } else {
+                        state.fail(crate::tr_format!(
+                            "{} 账号保存失败：{}",
+                            platform_label(&key),
+                            message
+                        ));
+                    }
+                }
             }
             let _ = busy.try_set(false);
         });
-    };
-    view! {<details class="settings-group"><summary>{t("平台账号与访问令牌")}</summary><div class="settings-group-body"><p>{t("使用下方所选平台。已有密码和令牌不会回显，未修改的字段不会被覆盖。")}</p>{[("username",t("账号"),false),("password",t("密码"),true),("accessToken",t("访问令牌"),true),("accountType",t("账号类型"),false)].into_iter().map(|(key,label,secret)|view!{<label class="field"><span>{label}</span><input class="input" type=if secret{"password"}else{"text"} autocomplete="off" prop:value=move||draft.with(|m|m.get(key).and_then(Value::as_str).unwrap_or("").to_string()) placeholder=move||if (key=="password"&&has_password.get())||(key=="accessToken"&&has_token.get()){t("已保存；输入可替换")}else{""} on:input=move|e|{let value=Value::String(event_target_value(&e));draft.update(|m|{m.insert(key.into(),value.clone());});dirty.update(|m|{m.insert(key.into(),value);});}/></label>}).collect_view()}<button class="button secondary" type="button" disabled=move||busy.get()||dirty.get().is_empty() on:click=save>{t("保存平台账号")}</button></div></details>}
+    });
+    let retry_account = Callback::new(move |_| {
+        if loading.get_untracked() || busy.get_untracked() {
+            return;
+        }
+        let generation = revision.get_untracked().wrapping_add(1);
+        revision.set(generation);
+        load_account.run((platform.get_untracked(), generation));
+    });
+    view! {
+        <details class="settings-group account-group"><summary><Icon name="lock" size=18 />{t("平台账号与访问令牌")}</summary>
+            <div class="settings-group-body">
+                <div class="account-editor-status"><strong>{move || platform_label(&platform.get())}</strong><span>{move || crate::tr_format!("{} 个平台有账号草稿", drafts.with(|drafts| drafts.values().filter(|pending| !pending.is_empty()).count()))}</span></div>
+                <p>{t("使用下方所选平台。已有密码和令牌不会回显，未修改的字段不会被覆盖。")}</p>
+                <p class="field-hint">{t("切换平台会保留本页的未保存账号草稿；离开设置页前请保存。")}</p>
+                <Show when=move || loading.get()><p class="field-hint" role="status">{t("正在读取平台信息…")}</p></Show>
+                <div class="form-grid">
+                    {[("username",t("账号"),false),("password",t("密码"),true),("accessToken",t("访问令牌"),true),("accountType",t("账号类型"),false)].into_iter().map(|(key,label,secret)|view!{
+                        <label class="field"><span>{label}</span><input class="ui-input input" type=if secret{"password"}else{"text"} autocomplete="off"
+                            prop:value=move||draft.with(|fields|fields.get(key).and_then(Value::as_str).unwrap_or("").to_string())
+                            placeholder=move||if (key=="password"&&has_password.get())||(key=="accessToken"&&has_token.get()){t("已保存；输入可替换")}else{""}
+                            on:input=move |event| change.run((key, event_target_value(&event))) /></label>
+                    }).collect_view()}
+                </div>
+                <FormFeedback error=error title=t("操作未完成") />
+                <div class="account-editor-actions">
+                    <ActionButton label=t("保存平台账号") icon="check" busy=busy busy_label=t("保存中…")
+                        disabled=Signal::derive(move || dirty.get().is_empty() || !state.status.get().ok) on_click=save />
+                    <Show when=move || error.get().is_some()><ActionButton label=t("重新读取账号状态") icon="refresh" class="small"
+                        disabled=Signal::derive(move || loading.get() || busy.get()) on_click=retry_account /></Show>
+                </div>
+            </div>
+        </details>
+    }
 }
 #[component]
 fn ToolSettings() -> impl IntoView {
@@ -608,6 +857,13 @@ fn ToolSettings() -> impl IntoView {
         })
     });
     let install = Callback::new(move |_| {
+        if busy.get_untracked()
+            || !state.status.get_untracked().ok
+            || result.get_untracked()["installation"]["state"] == "downloading"
+        {
+            return;
+        }
+        error.set(None);
         busy.set(true);
         leptos::task::spawn_local(async move {
             match gateway::install_tools().await {
@@ -616,12 +872,27 @@ fn ToolSettings() -> impl IntoView {
                     state.notify(t("开始下载并校验 FFmpeg"));
                     let _ = reload.try_update(|v| *v = v.wrapping_add(1));
                 }
-                Err(error) => state.fail(error),
+                Err(message) => {
+                    let _ = error.try_set(Some(message.clone()));
+                    state.fail(message);
+                }
             }
             let _ = busy.try_set(false);
         });
     });
-    view! {<SettingsGroup title=t("录制工具") subtitle=t("noFF 不捆绑 FFmpeg。安装仅写入应用数据目录，不修改 PATH。") icon="settings"><p role="status">{move||if result.get()["ffmpegReady"]==true&&result.get()["ffprobeReady"]==true{t("FFmpeg 与 ffprobe 已就绪")}else{t("需要 FFmpeg 与 ffprobe")}}</p><p role="status">{move||result.get()["installation"]["message"].as_str().unwrap_or("").to_string()}</p><Show when=move||error.get().is_some()><p class="field-error">{move||error.get().unwrap_or_default()}</p></Show><button class="button secondary" type="button" disabled=move||busy.get()||result.get()["installation"]["state"]=="downloading" on:click=move |_|confirm.set(true)>{t("安装 FFmpeg")}</button></SettingsGroup><ConfirmDialog open=confirm title=t("安装录制工具") description=t("将从 Gyan 下载并验证 FFmpeg，保存到应用数据目录；不会覆盖已有工具。") busy=busy on_confirm=install icon="download" destructive=false confirm_text=t("确认安装") busy_text=t("正在安装…") />}
+    view! {
+        <SettingsGroup title=t("录制工具") subtitle=t("noFF 不捆绑 FFmpeg。安装仅写入应用数据目录，不修改 PATH。") icon="settings">
+            <p role="status">{move||if result.get()["ffmpegReady"]==true&&result.get()["ffprobeReady"]==true{t("FFmpeg 与 ffprobe 已就绪")}else{t("需要 FFmpeg 与 ffprobe")}}</p>
+            <p role="status">{move||result.get()["installation"]["message"].as_str().unwrap_or("").to_string()}</p>
+            <FormFeedback error=error title=t("操作未完成") />
+            <ActionButton label=t("安装 FFmpeg") icon="download" busy=busy busy_label=t("正在安装…")
+                disabled=Signal::derive(move || !state.status.get().ok || result.get()["installation"]["state"]=="downloading")
+                on_click=Callback::new(move |_|confirm.set(true)) />
+        </SettingsGroup>
+        <ConfirmDialog open=confirm title=t("安装录制工具") description=t("将从 Gyan 下载并验证 FFmpeg，保存到应用数据目录；不会覆盖已有工具。")
+            busy=busy disabled=Signal::derive(move || !state.status.get().ok || result.get()["installation"]["state"]=="downloading")
+            on_confirm=install icon="download" destructive=false confirm_text=t("确认安装") busy_text=t("正在安装…") />
+    }
 }
 
 #[component]

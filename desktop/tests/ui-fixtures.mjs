@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
+import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { dirname, extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -110,6 +111,10 @@ export async function streamPreviewFixture(res, prepareBytes, state, preview) {
 export async function createHarness(label, options = {}) {
   // No production backend, resolver, user configuration or recording files are opened.
   await readFile(join(dist, 'index.html'));
+  // CSS-only iteration is explicitly marked in evidence; release verification leaves this off.
+  const sourceStylesPreview = process.env.STREAMCAP_TEST_SOURCE_CSS === '1';
+  const previewStyles = sourceStylesPreview ? await readFile(join(desktop, 'build/ui.css')) : null;
+  const previewIntegrity = previewStyles && 'sha384-' + createHash('sha384').update(previewStyles).digest('base64');
   const allowedArtifacts = join(desktop, 'tests', 'artifacts');
   const artifactsRoot = resolve(process.env.STREAMCAP_TEST_ARTIFACTS || allowedArtifacts);
   assert.ok(artifactsRoot === allowedArtifacts || artifactsRoot.startsWith(allowedArtifacts + sep), 'Artifacts must remain under tests/artifacts');
@@ -189,9 +194,18 @@ export async function createHarness(label, options = {}) {
         const asset = resolve(dist, '.' + decoded);
         if (asset !== dist && !asset.startsWith(dist + sep)) { json(res, { detail: 'Invalid path' }, 400); return; }
         const extension = extname(asset);
-        const file = extension ? asset : join(dist, 'index.html');
+        const file = sourceStylesPreview && /^\/ui(?:-[a-f0-9]+)?\.css$/.test(decoded)
+          ? join(desktop, 'build/ui.css') : extension ? asset : join(dist, 'index.html');
         const mime = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.wasm': 'application/wasm', '.css': 'text/css', '.png': 'image/png', '.svg': 'image/svg+xml' };
-        try { const data = await readFile(file); res.writeHead(200, { 'Content-Type': mime[extname(file)] ?? 'application/octet-stream' }); res.end(data); }
+        try {
+          let data = sourceStylesPreview && file === join(desktop, 'build/ui.css') ? previewStyles : await readFile(file);
+          if (previewStyles && extname(file) === '.html') {
+            data = Buffer.from(data.toString().replace(/<link\b[^>]*>/g, tag =>
+              /rel="stylesheet"/.test(tag) && /href="\/ui(?:-[a-f0-9]+)?\.css"/.test(tag)
+                ? tag.replace(/integrity="[^"]*"/, `integrity="${previewIntegrity}"`) : tag));
+          }
+          res.writeHead(200, { 'Content-Type': mime[extname(file)] ?? 'application/octet-stream' }); res.end(data);
+        }
         catch { res.writeHead(404); res.end(); }
         return;
       }
@@ -440,7 +454,7 @@ export async function createHarness(label, options = {}) {
     holdNextAccountWrite: () => holdNextResponse('accountWrite'),
     setOffline(value) { state.offline = value; if (value) { for (const stream of streams) stream.end(); streams.clear(); } },
     async shot(name) { const file = join(runDir, name + '.png'); await page.screenshot({ path: file, animations: 'disabled' }); return file; },
-    async report(value) { await writeFile(join(runDir, 'result.json'), JSON.stringify({ ...value, isolated: true, blocked, runtimeErrors, unexpectedApi: state.unexpected, requestCount: state.requests.length }, null, 2)); },
+    async report(value) { await writeFile(join(runDir, 'result.json'), JSON.stringify({ ...value, sourceStylesPreview, isolated: true, blocked, runtimeErrors, consoleErrors, unexpectedApi: state.unexpected, requestCount: state.requests.length }, null, 2)); },
     async close() { for (const release of responseReleases) release(); await browser.close(); await closeServer(); },
   };
 }
@@ -452,25 +466,150 @@ export async function eventually(read, predicate, message, timeout = 8000) {
   assert.fail(message + ': ' + JSON.stringify(value));
 }
 
+export const themeColors = {
+  light: { surface: 'rgb(255, 255, 255)', text: 'rgb(38, 50, 68)', sidebar: 'rgb(246, 247, 249)' },
+  dark: { surface: 'rgb(27, 31, 39)', text: 'rgb(231, 235, 241)', sidebar: 'rgb(23, 27, 34)' },
+};
+
 export async function waitTheme(page, theme) {
-  await page.waitForFunction((expected) => {
-    const dark = expected === 'dark';
+  assert.ok(Object.hasOwn(themeColors, theme), 'Use an explicit supported theme');
+  await page.waitForFunction(({ expected, colors }) => {
     const body = getComputedStyle(document.body);
     const sidebar = document.querySelector('.sidebar');
     return document.documentElement.dataset.theme === expected
-      && body.backgroundColor === (dark ? 'rgb(17, 20, 25)' : 'rgb(246, 247, 249)')
-      && body.color === (dark ? 'rgb(237, 241, 246)' : 'rgb(32, 41, 56)')
-      && sidebar && getComputedStyle(sidebar).backgroundColor === (dark ? 'rgb(21, 25, 31)' : 'rgb(238, 241, 245)');
-  }, theme);
+      && body.backgroundColor === colors.surface
+      && body.color === colors.text
+      && sidebar && getComputedStyle(sidebar).backgroundColor === colors.sidebar;
+  }, { expected: theme, colors: themeColors[theme] });
 }
 
 export async function visible(locator) { await locator.waitFor({ state: 'visible' }); }
 export async function hidden(locator) { await locator.waitFor({ state: 'hidden' }); }
+export async function setSwitch(locator, checked) {
+  await visible(locator);
+  assert.equal(await locator.getAttribute('role'), 'switch', 'Binary preferences use the shared switch');
+  const current = await locator.getAttribute('aria-checked');
+  assert.ok(current === 'true' || current === 'false', 'A switch exposes its current state');
+  if (current !== String(checked)) await locator.click();
+  await eventually(() => locator.getAttribute('aria-checked'), value => value === String(checked), 'Switch state updates');
+}
+export async function openCardMenu(card) {
+  const menu = card.locator('details.card-menu');
+  assert.equal(await menu.count(), 1, 'Each recording card owns exactly one action menu');
+  assert.equal(await menu.getAttribute('name'), 'streamcap-task-menu', 'Card menus share an exclusive group');
+  const trigger = menu.getByRole('button', { name: '更多操作', exact: true });
+  await visible(trigger);
+  if (!await menu.evaluate(node => node.open)) await trigger.click();
+  await eventually(() => menu.evaluate(node => node.open), Boolean, 'Card action menu opens');
+  await visible(menu.locator('.card-menu-panel'));
+  return menu;
+}
+export async function closeCardMenu(menu) {
+  const trigger = menu.getByRole('button', { name: '更多操作', exact: true });
+  await trigger.press('Escape');
+  await eventually(() => menu.evaluate(node => node.open), value => !value, 'Escape closes the card action menu');
+  assert.equal(await trigger.evaluate(node => node === document.activeElement), true, 'Escape restores menu trigger focus');
+}
+export async function cardMenuAction(card, name) {
+  const menu = await openCardMenu(card);
+  await menu.locator('.card-menu-panel').getByRole('button', { name, exact: true }).click();
+  await eventually(() => menu.evaluate(node => node.open), value => !value, 'Selecting an action closes its menu');
+}
+export async function assertSingleLineActions(buttons) {
+  const labels = await buttons.evaluateAll(nodes => nodes.flatMap(button => {
+    const bounds = button.getBoundingClientRect(), walker = document.createTreeWalker(button, NodeFilter.SHOW_TEXT);
+    const rectangles = [];
+    let text = '', node;
+    while ((node = walker.nextNode())) {
+      if (!node.textContent.trim() || node.parentElement.closest('svg,[aria-hidden="true"],[hidden],.sr-only')) continue;
+      const range = document.createRange();
+      range.selectNodeContents(node);
+      rectangles.push(...[...range.getClientRects()].filter(rect => rect.width > 0 && rect.height > 0));
+      text += node.textContent.trim();
+    }
+    if (!text || !rectangles.length) return [];
+    const labelStyle = getComputedStyle(button.querySelector('span:not([aria-hidden="true"])') || button);
+    const lineHeight = parseFloat(labelStyle.lineHeight) || parseFloat(labelStyle.fontSize) * 1.5;
+    return [{
+      text, whiteSpace: labelStyle.whiteSpace, lineHeight,
+      textHeight: Math.max(...rectangles.map(rect => rect.bottom)) - Math.min(...rectangles.map(rect => rect.top)),
+      left: Math.min(...rectangles.map(rect => rect.left)), right: Math.max(...rectangles.map(rect => rect.right)),
+      buttonLeft: bounds.left, buttonRight: bounds.right,
+    }];
+  }));
+  assert.ok(labels.length > 0, 'The action area contains measurable text labels');
+  for (const label of labels) {
+    assert.ok(label.textHeight <= label.lineHeight + 2, 'Short action text must remain on one line: ' + JSON.stringify(label));
+    assert.ok(label.left >= label.buttonLeft - 1 && label.right <= label.buttonRight + 1, 'Action text must not spill beyond its button: ' + JSON.stringify(label));
+  }
+  return labels;
+}
+export async function assertDialogStyles(modal, theme, requiredControls = []) {
+  await visible(modal);
+  const frame = await modal.evaluate(node => {
+    const box = node.getBoundingClientRect(), style = getComputedStyle(node);
+    const body = node.querySelector('.modal-body');
+    return {
+      left: box.left, right: box.right, top: box.top, bottom: box.bottom,
+      width: box.width, height: box.height, viewportWidth: innerWidth, viewportHeight: innerHeight,
+      background: style.backgroundColor, color: style.color, backdrop: style.backdropFilter,
+      border: style.borderTopStyle, borderWidth: parseFloat(style.borderTopWidth),
+      overflow: node.scrollWidth > node.clientWidth + 2 || !!body && body.scrollWidth > body.clientWidth + 2,
+    };
+  });
+  assert.ok(frame.width >= 300 && frame.height > 80, 'The dialog has a usable measured surface');
+  assert.ok(frame.left >= 0 && frame.right <= frame.viewportWidth + 1 && frame.top >= 0 && frame.bottom <= frame.viewportHeight + 1, 'The dialog stays inside the viewport');
+  assert.equal(frame.background, themeColors[theme].surface, 'Dialog theme surface is opaque and compiled');
+  assert.equal(frame.color, themeColors[theme].text);
+  assert.equal(frame.backdrop, 'none');
+  assert.equal(frame.border, 'solid');
+  assert.ok(frame.borderWidth >= 1, 'Native dialog boundary remains visible');
+  assert.equal(frame.overflow, false, 'Dialog controls must not cause horizontal scrolling');
+  const fields = modal.locator('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="range"]), textarea, select');
+  const controls = [];
+  for (const field of await fields.all()) {
+    if (!await field.isVisible()) continue;
+    await field.scrollIntoViewIfNeeded();
+    const control = await field.evaluate(node => {
+      const style = getComputedStyle(node), box = node.getBoundingClientRect();
+      const kind = node.tagName.toLowerCase();
+      const libraryClass = kind === 'textarea' ? 'ui-textarea' : kind === 'select' ? 'ui-select' : 'ui-input';
+      return {
+        kind, libraryClass, hasLibraryClass: node.classList.contains(libraryClass),
+        width: box.width, height: box.height, left: box.left, right: box.right,
+        viewportWidth: innerWidth, fontSize: parseFloat(style.fontSize),
+        border: style.borderTopStyle, borderWidth: parseFloat(style.borderTopWidth),
+        borderColor: style.borderTopColor, background: style.backgroundColor,
+      };
+    });
+    assert.equal(control.hasLibraryClass, true, `A visible ${control.kind} must use ${control.libraryClass}`);
+    assert.ok(control.width >= 80 && control.height >= (control.kind === 'textarea' ? 64 : 32), 'Form controls retain usable dimensions: ' + JSON.stringify(control));
+    assert.ok(control.fontSize >= 13, 'Form control text remains readable');
+    assert.ok(control.left >= 0 && control.right <= control.viewportWidth + 1, 'Visible form controls stay inside the window');
+    assert.equal(control.border, 'solid');
+    assert.ok(control.borderWidth >= 1, 'Compiled library fields retain a visible border');
+    assert.ok(!/^(?:transparent|rgba\([^)]*,\s*0(?:\.0+)?\))$/.test(control.borderColor) && !/\/\s*0(?:\.0+)?%?\s*\)$/.test(control.borderColor), 'Field borders must not be transparent');
+    assert.notEqual(control.borderColor, control.background, 'Field border contrasts with its background');
+    controls.push(control);
+  }
+  for (const kind of requiredControls) assert.ok(controls.some(control => control.kind === kind), `The dialog exposes its expected ${kind} control`);
+  const buttons = modal.locator('button:visible');
+  assert.ok(await buttons.count() > 0, 'Every dialog retains a visible action');
+  for (const button of await buttons.all()) {
+    const styled = await button.evaluate(node => {
+      const box = node.getBoundingClientRect();
+      return node.classList.contains('ui-btn') && box.height >= 24 && box.width >= 24;
+    });
+    assert.equal(styled, true, 'Visible dialog actions use sized library buttons');
+  }
+  await modal.locator('.modal-body').evaluate(node => { node.scrollTop = 0; });
+  return { frame, controls };
+}
 export async function go(page, base, path) {
   await page.goto(base + path, { waitUntil: 'domcontentloaded' });
   await visible(page.locator('.app-shell'));
   await visible(page.locator('.page h1'));
-  await hidden(page.locator('.skeleton-grid'));
+  await hidden(page.locator('.skeleton-grid, .overview-loading'));
 }
 
 export async function inspectLayout(page) {
@@ -482,7 +621,15 @@ export async function inspectLayout(page) {
       return { width: bounds.width, height: bounds.height, top: bounds.top, left: bounds.left };
     };
     const content = document.querySelector('.content-area');
-    const panel = document.querySelector('.page :is(.stats-strip,.cards-grid.list-view,.recording-card,.file-browser,.settings-group-body,.about-detail)');
+    const surfaces = {
+      '/home': '.home-page .overview-main',
+      '/recordings': '.page .recording-card',
+      '/storage': '.page .file-manager',
+      '/settings': '.page .settings-content',
+      '/about': '.page .about-content',
+    };
+    const surfaceSelector = surfaces[location.pathname];
+    const panel = surfaceSelector && document.querySelector(surfaceSelector);
     const panelStyle = panel && getComputedStyle(panel);
     const overflow = Array.from(document.querySelectorAll('.page *')).filter((el) => {
       if (!el.getClientRects().length || ['svg', 'path', 'circle', 'rect', 'line', 'polyline', 'polygon', 'i'].includes(el.tagName.toLowerCase())) return false;
@@ -497,6 +644,8 @@ export async function inspectLayout(page) {
       contentOverflow: !!content && content.scrollWidth > content.clientWidth + 2,
       overflow,
       surface: panelStyle && {
+        selector: surfaceSelector,
+        ...rect(surfaceSelector),
         background: panelStyle.backgroundColor,
         border: panelStyle.borderTopStyle,
         borderWidth: parseFloat(panelStyle.borderTopWidth),
@@ -504,6 +653,8 @@ export async function inspectLayout(page) {
         backdrop: panelStyle.backdropFilter,
       },
       baseFontSize: parseFloat(getComputedStyle(document.documentElement).fontSize),
+      bodyFontSize: parseFloat(getComputedStyle(document.body).fontSize),
+      headingFontSize: document.querySelector('.page h1') && parseFloat(getComputedStyle(document.querySelector('.page h1')).fontSize),
       dialogs: document.querySelectorAll('dialog[open]').length,
     };
   });

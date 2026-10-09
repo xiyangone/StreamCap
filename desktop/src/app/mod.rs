@@ -6,7 +6,7 @@ pub mod navigation;
 pub mod views;
 
 use crate::api::{desktop, gateway};
-use components::Icon;
+use components::{Icon, IconButton};
 use leptos::prelude::*;
 use leptos_router::hooks::use_location;
 use wasm_bindgen::{closure::Closure, JsCast};
@@ -83,7 +83,7 @@ fn Shell() -> impl IntoView {
         }
     });
     view! {
-        <div class="app-shell" class:native-desktop=desktop.available data-ui="workbench">
+        <div class="app-shell" class:native-desktop=desktop.available data-ui="library-workspace" data-controls="daisyui-5">
             <a class="skip-link" href="#main-content">{t("跳到主要内容")}</a>
             <navigation::Sidebar />
             <div class="main-area">
@@ -91,7 +91,7 @@ fn Shell() -> impl IntoView {
                 <ShutdownBanner />
                 <main id="main-content" class="content-area" tabindex="-1">
                     <Show when=move || state.error.get().is_some()>
-                        <div class="connection-banner" role="alert"><Icon name="alert" /><div><strong>{t("暂时无法连接本地服务")}</strong><p>{t("正在自动重试。已有任务仍保留，恢复连接后将刷新任务状态。")}</p></div></div>
+                        <div class="connection-banner" role="alert"><Icon name="alert" /><div><strong>{t("暂时无法连接本地服务")}</strong><p>{t("正在自动重试。已有任务仍保留，恢复连接后将刷新任务状态。")}</p></div><span class="control-spinner" aria-hidden="true" /></div>
                     </Show>
                     <AppRoutes />
                 </main>
@@ -129,14 +129,20 @@ fn Topbar() -> impl IntoView {
                         <Icon name="file" size=14 /><span>{move || crate::tr_format!("{} 项处理中", processing.get())}</span>
                     </a>
                 </Show>
-                <span class="sync-status" class:online=move||state.status.get().ok&&state.events_connected.get() title=t("任务状态由本机自动更新，不涉及云同步")><i class="status-dot" />{move||if !state.status.get().ok{t("本地服务连接中")}else if state.events_connected.get(){t("本地实时更新")}else{t("正在重连")}}</span>
-                <button class="icon-button theme-toggle" title=t("切换明暗主题") aria-label=move||if state.is_dark(){t("切换到浅色")}else{t("切换到深色")} on:click=move |_|{state.theme.set(if state.is_dark(){"light".into()}else{"dark".into()});gateway::save_appearance(state);}>
-                    <Show when=move||state.is_dark() fallback=||view!{<Icon name="moon"/>}><Icon name="sun"/></Show>
-                </button>
+                <span class="sync-status" role="status" class:online=move||state.status.get().ok&&state.events_connected.get() title=t("任务状态由本机自动更新，不涉及云同步")><i class="status-dot" aria-hidden="true" />{move||if !state.status.get().ok{t("本地服务连接中")}else if state.events_connected.get(){t("本地实时更新")}else{t("正在重连")}}</span>
+                <span class="topbar-divider" aria-hidden="true" />
+                <IconButton label=t("切换明暗主题") icon="moon" class="theme-toggle"
+                    aria_label=Signal::derive(move || if state.is_dark() { t("切换到浅色") } else { t("切换到深色") }.to_string())
+                    on_click=Callback::new(move |_| {
+                        state.theme.set(if state.is_dark() { "light".into() } else { "dark".into() });
+                        gateway::save_appearance(state);
+                    })>
+                    <Show when=move || state.is_dark() fallback=|| view! { <Icon name="moon" /> }><Icon name="sun" /></Show>
+                </IconButton>
                 <Show when=move||desktop.available><div class="window-controls" role="group" aria-label=t("窗口控制")>
-                    <button class="window-button" title=t("最小化") aria-label=t("最小化窗口") on:click=move |_|desktop::action(desktop,state,"minimize")><Icon name="minimize" size=16/></button>
-                    <button class="window-button" title=move||if desktop.status.get().maximized{t("还原")}else{t("最大化")} aria-label=move||if desktop.status.get().maximized{t("还原窗口")}else{t("最大化窗口")} on:click=move |_|desktop::action(desktop,state,"maximize")><Show when=move||desktop.status.get().maximized fallback=||view!{<Icon name="maximize" size=14/>}><Icon name="restore" size=14/></Show></button>
-                    <button class="window-button window-close" title=t("关闭") aria-label=t("关闭窗口") on:click=move |_|desktop::action(desktop,state,"close")><Icon name="close" size=18/></button>
+                    <button class="window-button" type="button" title=t("最小化") aria-label=t("最小化窗口") on:click=move |_|desktop::action(desktop,state,"minimize")><Icon name="minimize" size=16/></button>
+                    <button class="window-button" type="button" title=move||if desktop.status.get().maximized{t("还原")}else{t("最大化")} aria-label=move||if desktop.status.get().maximized{t("还原窗口")}else{t("最大化窗口")} on:click=move |_|desktop::action(desktop,state,"maximize")><Show when=move||desktop.status.get().maximized fallback=||view!{<Icon name="maximize" size=14/>}><Icon name="restore" size=14/></Show></button>
+                    <button class="window-button window-close" type="button" title=t("关闭") aria-label=t("关闭窗口") on:click=move |_|desktop::action(desktop,state,"close")><Icon name="close" size=18/></button>
                 </div></Show>
             </div>
         </header>

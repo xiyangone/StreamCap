@@ -1,4 +1,4 @@
-use super::{Dialog, EmptyState, Icon, InlineNotice};
+use super::{ActionButton, Dialog, EmptyState, FormFeedback, Icon, InlineNotice};
 use crate::app::i18n::t;
 use crate::{
     api::gateway::{self, Recording, RecordingFile, StorageItem},
@@ -41,6 +41,7 @@ pub fn MediaPlayer(#[prop(into)] path: Signal<String>) -> impl IntoView {
     let app = gateway::app_state();
     let message = RwSignal::new(String::new());
     let phase = RwSignal::new("loading".to_string());
+    let capturing = RwSignal::new(false);
     let video = NodeRef::<leptos::html::Video>::new();
     let session = StoredValue::new_local(None::<PlayerSession>);
     let audio = move || {
@@ -95,17 +96,24 @@ pub fn MediaPlayer(#[prop(into)] path: Signal<String>) -> impl IntoView {
                 let _ = message.try_set(crate::app::i18n::message(text));
             });
         let capture_path = current.clone();
-        let capture = Closure::<dyn FnMut()>::new(move || match capture_frame(&capture_path) {
-            Ok(image) => {
-                let current = capture_path.clone();
-                leptos::task::spawn_local(async move {
-                    match gateway::save_screenshot(&current, &image).await {
-                        Ok(_) => app.notify(t("截图已保存")),
-                        Err(error) => app.fail(error),
-                    }
-                });
+        let capture = Closure::<dyn FnMut()>::new(move || {
+            if capturing.get_untracked() {
+                return;
             }
-            Err(_) => app.fail(t("请先播放视频再截图")),
+            match capture_frame(&capture_path) {
+                Ok(image) => {
+                    capturing.set(true);
+                    let current = capture_path.clone();
+                    leptos::task::spawn_local(async move {
+                        match gateway::save_screenshot(&current, &image).await {
+                            Ok(_) => app.notify(t("截图已保存")),
+                            Err(error) => app.fail(error),
+                        }
+                        let _ = capturing.try_set(false);
+                    });
+                }
+                Err(_) => app.fail(t("请先播放视频再截图")),
+            }
         });
         let dispose = attach_media(
             element.unchecked_ref(),
@@ -126,7 +134,8 @@ pub fn MediaPlayer(#[prop(into)] path: Signal<String>) -> impl IntoView {
         });
     });
     view! {
-        <div class="media-preview" data-player-state=move || phase.get() data-path=move||path.get()>
+        <div class="media-preview" data-player-state=move || phase.get() data-path=move||path.get()
+            data-capturing=move || capturing.get().to_string()>
             <Show when=supported fallback=|| view! { <EmptyState icon="file" title=t("此格式需要本地播放器") description=t("当前预览支持 TS、MP4 和常见网页媒体格式。原文件不受影响。") /> }>
                 <Show when=audio fallback=move || view! { <video node_ref=video class="video-player" controls playsinline preload="auto" aria-label=t("录制视频预览") /> }>
                     <div class="audio-art"><Icon name="volume" size=40 /><span>{t("音频录制")}</span></div>
@@ -324,20 +333,42 @@ pub fn PreviewHost() -> impl IntoView {
             <Show when=move || target.get().is_some()>
             <div class="preview-heading">
                 <div class="preview-context"><Icon name="video" size=21 /><div><span class="preview-eyebrow">{t("录制文件")}</span><p class="preview-title">{move || target.get().map(|rec| rec.name()).unwrap_or_default()}</p></div></div>
-                <Show when=move || target.get().is_some_and(|rec| rec.is_live)><button class="button secondary small" type="button" title=t("直播源缓存有效期 5 分钟，过期后请先手动检测。预览不会新增录制文件。") on:click=move |_| { if let Some(rec)=target.get_untracked() { playing.set(format!("live:{}",rec.rec_id)); } }><Icon name="video" size=15 />{t("预览直播源")}</button></Show>
+                <Show when=move || target.get().is_some_and(|rec| rec.is_live)>
+                    <ActionButton label=t("预览直播源") icon="video" class="small"
+                        title=t("直播源缓存有效期 5 分钟，过期后请先手动检测。预览不会新增录制文件。")
+                        pressed=Signal::derive(move || Some(playing.get().starts_with("live:")))
+                        disabled=Signal::derive(move || !state.status.get().ok)
+                        on_click=Callback::new(move |_| {
+                            if !state.status.get_untracked().ok { return; }
+                            if let Some(rec)=target.get_untracked().filter(|rec| rec.is_live) { playing.set(format!("live:{}",rec.rec_id)); }
+                        }) />
+                </Show>
             </div>
             </Show>
             <Show when=move || target.get().is_none()><p class="dialog-description break-anywhere preview-media-title">{move || playing.get().rsplit(['/', '\\']).next().unwrap_or_default().to_string()}</p></Show>
-            <Show when=move || loading.get()><div class="loading-state"><span class="spinner" />{t("正在读取录制文件…")}</div></Show>
-            <Show when=move || error.get().is_some()><p class="field-error" role="alert">{move || error.get().unwrap_or_default()}</p></Show>
+            <Show when=move || loading.get()><div class="loading-state"><span class="ui-loading ui-loading-spinner ui-loading-sm spinner" aria-hidden="true" />{t("正在读取录制文件…")}</div></Show>
+            <FormFeedback error=error title=t("无法读取录制文件") />
             <Show when=move || !loading.get() && error.get().is_none() && files.get().is_empty() && playing.get().is_empty()><EmptyState icon="video" title=t("还没有录制文件") description=t("TS 开始写入后可在这里预览，文件大小会自动更新。") /></Show>
             <Show when=move || !playing.get().is_empty()><MediaPlayer path=Signal::derive(move || playing.get()) /></Show>
             <Show when=move || target.get().is_some()>
             <div class="preview-files-heading"><span>{t("录制文件")}<small>{move || files.get().len()}</small></span><span class="preview-current-file" title=move || playing.get()>{move || playing.get().rsplit(['/', '\\']).next().unwrap_or_default().to_string()}</span></div>
-            <div class="preview-file-list" role="list" aria-label=t("录制文件")>{move || files.get().into_iter().map(|file| {
-                let path = file.path.clone(); let active_path = path.clone();
-                view! { <button role="listitem" class="preview-file" class:active=move || playing.get() == active_path on:click=move |_| playing.set(path.clone())><Icon name="file" size=17 /><span>{file.name}</span><small>{human_size(file.size)}<br />{crate::app::labels::modified_time(Some(file.modified))}</small></button> }
-            }).collect_view()}</div>
+            <ul class="preview-file-list" aria-label=t("录制文件")>
+                <For each=move || files.with(|items| items.iter().map(|file| file.path.clone()).collect::<Vec<_>>())
+                    key=|path| path.clone() children=move |path| {
+                        let path = StoredValue::new(path);
+                        let file = Signal::derive(move || files.with(|items| items.iter().find(|file| file.path == path.get_value()).cloned()));
+                        view! {
+                            <li><ActionButton label=t("播放录制文件") icon="file" class="preview-file"
+                                aria_label=Signal::derive(move || crate::tr_format!("播放{}", file.get().map(|file| file.name).unwrap_or_default()))
+                                pressed=Signal::derive(move || Some(playing.get() == path.get_value()))
+                                on_click=Callback::new(move |_| playing.set(path.get_value()))>
+                                <span class="preview-file-name">{move || file.get().map(|file| file.name).unwrap_or_default()}</span>
+                                <small>{move || file.get().map(|file| human_size(file.size)).unwrap_or_default()}<br />
+                                    {move || file.get().map(|file| crate::app::labels::modified_time(Some(file.modified))).unwrap_or_default()}</small>
+                            </ActionButton></li>
+                        }
+                    } />
+            </ul>
             </Show>
             <Show when=move || !media_message().is_empty()><InlineNotice icon="history"><span role="status">{media_message}</span></InlineNotice></Show>
         </Dialog>

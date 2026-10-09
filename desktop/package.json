@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "pwsh -NoProfile -File scripts/build-frontend.ps1 -Serve",
     "build": "pwsh -NoProfile -File scripts/build-frontend.ps1",
+    "build:styles": "node node_modules/@tailwindcss/cli/dist/index.mjs --input styles.css --output build/ui.css --minify",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build --no-bundle",
@@ -14,10 +15,18 @@
     "verify": "pwsh -NoProfile -File scripts/verify-native.ps1",
     "test:player": "node tests/player-regression.mjs"
   },
+  "overrides": {
+    "@tailwindcss/cli": {
+      "@parcel/watcher": "2.6.0"
+    }
+  },
   "devDependencies": {
+    "@tailwindcss/cli": "4.3.3",
     "@tauri-apps/api": "^2.12.0",
     "@tauri-apps/cli": "^2.12.0",
+    "daisyui": "5.7.47",
     "mpegts.js": "1.8.2",
-    "playwright": "1.63.0"
+    "playwright": "1.63.0",
+    "tailwindcss": "4.3.3"
   }
 }

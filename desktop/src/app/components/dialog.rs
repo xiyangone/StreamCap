@@ -1,4 +1,4 @@
-use super::Icon;
+use super::{ActionButton, Icon, IconButton};
 use crate::app::i18n::t;
 use leptos::{html, prelude::*};
 use wasm_bindgen::JsCast;
@@ -55,9 +55,11 @@ pub fn Dialog(
         }
     });
     view! {
-        <dialog node_ref=element class=if wide { "modal modal-wide" } else { "modal" }
+        <dialog node_ref=element class=if wide { "ui-modal-box modal modal-wide" } else { "ui-modal-box modal" }
+            data-ui-component="dialog"
             class:preview-shell=minimized.is_some() class:modal-minimized=is_minimized
             aria-label=move || title.get() aria-modal=move || (!is_minimized()).to_string()
+            aria-busy=move || busy.is_some_and(|value| value.get()).to_string()
             on:keydown=move |event: leptos::ev::KeyboardEvent| {
                 if is_minimized() && event.key() == "Escape" {
                     event.prevent_default(); event.stop_propagation(); close();
@@ -77,11 +79,15 @@ pub fn Dialog(
             <header class="modal-header"><div class="modal-title"><h2>{move || title.get()}</h2></div>
                 <div class="modal-header-actions">
                 {minimized.map(|value| view! {
-                    <button class="icon-button" type="button" aria-label=move || if value.get() { t("恢复预览") } else { t("最小化预览") } title=move || if value.get() { t("恢复预览") } else { t("最小化预览") } on:click=move |_| value.update(|mini| *mini = !*mini)>
-                        <Show when=move || value.get() fallback=|| view! { <Icon name="minimize" /> }><Icon name="restore" /></Show>
-                    </button>
+                    <Show when=move || value.get() fallback=move || view! {
+                        <IconButton label=t("最小化预览") icon="minimize" on_click=Callback::new(move |_| value.set(true)) />
+                    }>
+                        <IconButton label=t("恢复预览") icon="restore" on_click=Callback::new(move |_| value.set(false)) />
+                    </Show>
                 })}
-                <button class="icon-button" type="button" aria-label=t("关闭对话框") title=t("关闭") disabled=move || busy.is_some_and(|b| b.get()) on:click=move |_| close()><Icon name="close" /></button>
+                <IconButton label=t("关闭对话框") icon="close"
+                    disabled=Signal::derive(move || busy.is_some_and(|value| value.get()))
+                    on_click=Callback::new(move |_| close()) />
                 </div>
             </header>
             <div class="modal-body">{children()}</div>
@@ -96,10 +102,11 @@ pub fn ConfirmDialog(
     #[prop(into)] description: Signal<String>,
     busy: RwSignal<bool>,
     on_confirm: Callback<()>,
+    #[prop(default = Signal::stored(false), into)] disabled: Signal<bool>,
     #[prop(default = "trash")] icon: &'static str,
     #[prop(default = true)] destructive: bool,
-    #[prop(default = t("确认删除"))] confirm_text: &'static str,
-    #[prop(default = t("正在删除…"))] busy_text: &'static str,
+    #[prop(default = t("确认移除"))] confirm_text: &'static str,
+    #[prop(default = t("正在移除…"))] busy_text: &'static str,
     #[prop(default = t("请确认操作对象和影响范围。"))] hint: &'static str,
 ) -> impl IntoView {
     view! {
@@ -108,8 +115,10 @@ pub fn ConfirmDialog(
                 <div class=if destructive {"confirm-symbol"} else {"confirm-symbol confirm-neutral"}><Icon name=icon size=24 /></div>
                 <div><p class="dialog-description">{move || description.get()}</p><p class="field-hint">{hint}</p></div>
             </div>
-            <footer class="modal-actions"><button class="button secondary" disabled=move || busy.get() on:click=move |_| open.set(false)>{t("取消")}</button>
-                <button class=if destructive {"button danger"} else {"button primary"} disabled=move || busy.get() on:click=move |_| on_confirm.run(())>{move || if busy.get() { busy_text } else { confirm_text }}</button>
+            <footer class="modal-actions">
+                <ActionButton label=t("取消") disabled=busy on_click=Callback::new(move |_| open.set(false)) />
+                <ActionButton label=confirm_text icon=icon variant=if destructive { "danger" } else { "primary" }
+                    busy=busy busy_label=busy_text disabled=disabled on_click=on_confirm />
             </footer>
         </Dialog>
     }

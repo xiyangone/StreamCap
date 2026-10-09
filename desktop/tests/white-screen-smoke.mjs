@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { createHarness, eventually, go, inspectLayout, seedMediaJob, visible, waitTheme } from './ui-fixtures.mjs';
+import { assertDialogStyles, assertSingleLineActions, cardMenuAction, createHarness, eventually, go, hidden, inspectLayout, seedMediaJob, themeColors, visible, waitTheme } from './ui-fixtures.mjs';
 
 const h = await createHarness('visual');
 const { page, state } = h;
@@ -9,6 +9,7 @@ state.mediaJobs = [
   seedMediaJob({taskId:'fixture-6',source:'history/current-recording.ts',state:'verifying',stagePercent:42,startedAt:Math.floor(Date.now()/1000)-35,message:'正在校验 MP4 完整性'}),
 ];
 const cases = [];
+const dialogCases = [];
 let failure;
 try {
   for (const width of [1280, 950, 800, 375]) {
@@ -33,14 +34,26 @@ try {
         const shell=await page.locator('.app-shell').boundingBox();assert.equal(shell.x,0);assert.equal(shell.y,0);
         assert.equal(await page.locator('.device-avatar').count(),0);
         assert.equal(await page.getByRole('group',{name:'窗口控制'}).getByRole('button').count(),3);
-        assert.equal(layout.surface.background, theme === 'dark' ? 'rgb(26, 30, 38)' : 'rgb(255, 255, 255)', '新版面板底色必须实际加载');
-        assert.equal(layout.surface.border, 'solid', '面板边界必须存在');
-        assert.ok(layout.surface.borderWidth >= 1 && layout.surface.radius >= 6 && layout.surface.radius <= 12, '面板尺寸样式必须实际加载');
+        assert.ok(layout.surface?.width > 0 && layout.surface.height > 0, '当前页面必须有实际可测的主内容承载区');
+        assert.equal(layout.surface.background, themeColors[theme].surface, '新版主内容底色必须不透明且实际加载');
+        assert.ok(layout.surface.left >= 0 && layout.surface.left + layout.surface.width <= width + 2, '主内容承载区不能越过窗口');
         assert.equal(layout.surface.backdrop, 'none', '实色面板不叠加无效模糊');
-        assert.equal(layout.baseFontSize, 14, '基础字号必须实际加载');
+        assert.equal(layout.baseFontSize, 16, '根字号必须实际加载');
+        assert.equal(layout.bodyFontSize, 14, '正文基础字号必须实际加载');
+        assert.equal(layout.headingFontSize, width <= 600 ? 23 : 25, '页头字号必须符合当前窗口的响应式排版');
         assert.equal(await page.locator('.glass').count(),0,'旧玻璃组件路径已移除');
         assert.equal(await page.locator('.page-header').count(),1,'页面共用唯一标题结构');
+        if (path === '/home') layout.shortActions = await assertSingleLineActions(page.locator('.overview-task-action button:visible'));
+        if (path === '/storage') layout.shortActions = await assertSingleLineActions(page.locator('.file-row-actions button:visible'));
         if (path === '/recordings') {
+          const actions = await page.locator('.card-record').evaluateAll(nodes => nodes.map(node => ({
+            height: node.getBoundingClientRect().height,
+            fontSize: parseFloat(getComputedStyle(node).fontSize),
+            background: getComputedStyle(node).backgroundColor,
+          })));
+          assert.ok(actions.length > 0 && actions.every(action => action.height >= 40 && action.fontSize >= 13), '录制主操作必须可读且有足够点击面积');
+          assert.ok(actions.every(action => action.background !== layout.surface.background), '录制主操作不能被旧的小白按钮样式覆盖');
+          assert.equal(await page.getByRole('switch', {name:'自动检测',exact:true}).count(), state.recordings.length, '每张卡片独立显示自动检测开关');
           for (const [name, mode] of [['列表视图','list'],['网格视图','grid']]) {
             await page.getByRole('button',{name,exact:true}).click();
             const arrangement=await inspectLayout(page);
@@ -48,7 +61,8 @@ try {
             assert.deepEqual(arrangement.overflow,[],`${mode} 组件必须适配窗口`);
             if(mode==='list' && width>=950) {
               const heights=await page.locator('.recording-card').evaluateAll(nodes=>nodes.map(node=>node.getBoundingClientRect().height));
-              assert.ok(Math.max(...heights)<=150,'桌面任务行包含录后摘要时也应保持紧凑: '+JSON.stringify(heights));
+              const limit = width >= 1200 ? 200 : 240;
+              assert.ok(Math.max(...heights)<=limit,'分区操作与录后摘要仍应保持有限行高: '+JSON.stringify(heights));
             }
             assert.equal(await page.locator('.card-media-job .card-media-job-source:visible').count(),0,'完整历史路径默认收进详情');
             await h.shot(`${theme}-${width}-recordings-${mode}`);
@@ -60,6 +74,63 @@ try {
       }
     }
   }
+  assert.equal(cases.length, 40, '完整保留五页面、四窗口、双主题矩阵');
+  const recordingsBeforeDialogs = structuredClone(state.recordings);
+  const filesBeforeDialogs = structuredClone(state.files);
+  const cookiesBeforeDialogs = structuredClone(state.cookies);
+  const mutationCount = () => state.requests.filter(request =>
+    /^(POST|PUT|PATCH|DELETE)$/.test(request.method)
+    && /^\/api\/(?:recordings|media|cookies|accounts)(?:\/|$)/.test(request.path)).length;
+  const mutationsBeforeDialogs = mutationCount();
+  const inactiveCard = () => page.locator('article.recording-card[data-rec-id="fixture-3"]');
+  const scenarios = [
+    { name: '添加直播间', slug: 'add', route: '/recordings', controls: ['textarea', 'input'],
+      open: () => page.getByRole('button', { name: '添加直播间', exact: true }).click() },
+    { name: '编辑直播间', slug: 'edit', route: '/recordings', controls: ['input', 'select'],
+      open: () => cardMenuAction(inactiveCard(), '编辑任务') },
+    { name: '批量编辑任务', slug: 'batch', route: '/recordings', controls: ['input', 'select'],
+      open: async () => {
+        await inactiveCard().getByRole('checkbox').check();
+        await page.locator('article.recording-card[data-rec-id="fixture-5"]').getByRole('checkbox').check();
+        await page.getByRole('button', { name: '批量编辑', exact: true }).click();
+      } },
+    { name: '直播间信息', slug: 'info', route: '/recordings', controls: ['input'],
+      open: () => inactiveCard().getByRole('button', { name: state.recordings.find(record => record.recId === 'fixture-3').streamerName, exact: true }).click() },
+    { name: '快手扫码登录', slug: 'qr', route: '/settings', controls: [],
+      open: async () => {
+        state.qrPhase = 'waiting';
+        await page.getByRole('button', { name: '平台登录', exact: true }).click();
+        await page.getByRole('combobox', { name: 'Cookie 平台列表', exact: true }).selectOption('kuaishou');
+        await page.getByRole('button', { name: '扫码登录', exact: true }).click();
+        await visible(page.getByRole('dialog', { name: '快手扫码登录', exact: true }).getByText('二维码有效期：120 秒', { exact: true }));
+      } },
+    { name: '关闭 StreamCap', slug: 'close', route: '/home', controls: [],
+      open: () => page.getByRole('button', { name: '关闭窗口', exact: true }).click() },
+  ];
+  for (const width of [1280, 600]) {
+    await page.setViewportSize({ width, height: 900 });
+    for (const theme of ['light', 'dark']) {
+      state.userConfig.theme_mode = theme;
+      for (const scenario of scenarios) {
+        await go(page, h.base, scenario.route);
+        await waitTheme(page, theme);
+        await eventually(() => page.locator('.content-area .loading-state:visible').count(), count => count === 0, '弹窗所在页面完成加载');
+        await scenario.open();
+        const modal = page.getByRole('dialog', { name: scenario.name, exact: true });
+        const styles = await assertDialogStyles(modal, theme, scenario.controls);
+        await h.shot(`dialog-${theme}-${width}-${scenario.slug}`);
+        await page.keyboard.press('Escape');
+        await hidden(modal);
+        assert.equal(state.native.closing, false, '视觉检查不得退出模拟应用');
+        dialogCases.push({ width, theme, name: scenario.name, styles });
+      }
+    }
+  }
+  assert.equal(dialogCases.length, 24, '六弹窗必须覆盖明暗主题及桌面、600px 窗口');
+  assert.deepEqual(state.recordings, recordingsBeforeDialogs, '弹窗视觉检查不更改任务');
+  assert.deepEqual(state.files, filesBeforeDialogs, '弹窗视觉检查保留全部媒体源文件');
+  assert.deepEqual(state.cookies, cookiesBeforeDialogs, '模拟二维码截图不保存或更改登录信息');
+  assert.equal(mutationCount(), mutationsBeforeDialogs, '只打开、关闭弹窗，不提交业务写入');
   await page.setViewportSize({ width: 1280, height: 900 });
   state.recordings = [];
   state.userConfig.theme_mode = 'light';
@@ -71,13 +142,14 @@ try {
   await visible(page.locator('.connection-banner'));
   await h.shot('offline-state');
   assert.deepEqual(h.blocked, []); assert.deepEqual(state.unexpected, []); assert.deepEqual(h.runtimeErrors, []);
+  assert.deepEqual(h.consoleErrors.filter(message => !message.startsWith('Failed to load resource:')), [], '应用 console.error');
 } catch (error) {
   failure = error;
   await h.shot('failure').catch(() => {});
   console.error(error.stack ?? error);
 } finally {
-  await h.report({ passed: !failure, cases, failure: failure ? String(failure.stack ?? failure) : null });
+  await h.report({ passed: !failure, cases, dialogCases, failure: failure ? String(failure.stack ?? failure) : null });
   await h.close();
 }
-console.log(JSON.stringify({ passed: !failure, cases: cases.length, artifacts: h.runDir }));
+console.log(JSON.stringify({ passed: !failure, cases: cases.length, dialogs: dialogCases.length, artifacts: h.runDir }));
 if (failure) process.exitCode = 1;

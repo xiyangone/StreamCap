@@ -3,14 +3,57 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { createReadStream } from 'node:fs';
 import { Readable } from 'node:stream';
-import { mkdir, mkdtemp, readFile, stat, writeFile } from 'node:fs/promises';
-import { dirname, join, resolve, sep } from 'node:path';
+import { createHash } from 'node:crypto';
+import { mkdir, mkdtemp, readFile, realpath, stat, writeFile } from 'node:fs/promises';
+import { dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { chromium } from 'playwright';
 
 const desktop = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const dist = await realpath(join(desktop, 'dist'));
+const publishedHtml = await readFile(join(dist, 'index.html'), 'utf8');
+const stylesheetAssets = new Map();
+const stylesheetLinks = [];
+const localAssetOrigin = 'http://127.0.0.1';
+const insideDist = file => {
+  const path = relative(dist, file);
+  return path !== '' && path !== '..' && !path.startsWith('..' + sep) && !isAbsolute(path);
+};
+for (const [tag] of publishedHtml.matchAll(/<link\b[^>]*>/gi)) {
+  const attributes = {};
+  for (const match of tag.matchAll(/\s(rel|href|integrity)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi)) {
+    attributes[match[1].toLowerCase()] = match[2] ?? match[3] ?? match[4];
+  }
+  if (!attributes.rel?.toLowerCase().split(/\s+/).includes('stylesheet')) continue;
+  assert.ok(attributes.href, 'A published stylesheet must have a local href');
+  const url = new URL(attributes.href, localAssetOrigin + '/');
+  assert.equal(url.origin, localAssetOrigin, 'Player CSS must not load from an external origin');
+  assert.equal(url.username + url.password + url.search + url.hash, '', 'Published CSS URLs cannot carry credentials, queries or fragments');
+  const file = resolve(dist, '.' + decodeURIComponent(url.pathname));
+  assert.ok(insideDist(file), 'CSS paths must stay inside dist');
+  assert.equal(extname(file).toLowerCase(), '.css', 'Only published CSS files may be loaded');
+  const physical = await realpath(file);
+  assert.ok(insideDist(physical), 'CSS symlinks or junctions must not escape dist');
+  const bytes = await readFile(physical);
+  assert.ok(!/@(?:source|plugin)\b|@import\s+["']tailwindcss/.test(bytes.toString()), 'Player regression requires compiled CSS, never source directives');
+  if (attributes.integrity) {
+    const verified = attributes.integrity.split(/\s+/).some(value => {
+      const match = /^(sha256|sha384|sha512)-([A-Za-z0-9+/=]+)$/.exec(value);
+      return match && createHash(match[1]).update(bytes).digest('base64') === match[2];
+    });
+    assert.ok(verified, 'Published stylesheet bytes must match dist/index.html integrity');
+  }
+  assert.ok(!stylesheetAssets.has(url.pathname), 'Published CSS links must be unambiguous');
+  const escapeAttribute = value => value.replaceAll('&', '&amp;').replaceAll('"', '&quot;');
+  stylesheetAssets.set(url.pathname, { bytes, path: relative(dist, physical), sha256: createHash('sha256').update(bytes).digest('hex') });
+  stylesheetLinks.push(`<link rel="stylesheet" href="${escapeAttribute(url.pathname)}"${attributes.integrity ? ` integrity="${escapeAttribute(attributes.integrity)}"` : ''}>`);
+}
+assert.ok(stylesheetAssets.size > 0, 'Build dist before running player regression; no CSS fallback is permitted');
+const publishedCss = [...stylesheetAssets.values()].map(asset => asset.bytes.toString()).join('\n');
+assert.match(publishedCss, /\.ui-btn\b/, 'Published CSS includes the actual button library');
+assert.match(publishedCss, /\.ui-select\b/, 'Published CSS includes the actual select library');
 const allowed = join(desktop, 'tests', 'artifacts');
 const artifactRoot = resolve(process.env.STREAMCAP_TEST_ARTIFACTS || allowed);
 assert.ok(artifactRoot === allowed || artifactRoot.startsWith(allowed + sep));
@@ -26,7 +69,8 @@ await run(ffmpeg, ['-v','error','-nostdin','-itsoffset','0.375','-i',mp4,'-f','l
 await run(ffmpeg, ['-v','error','-nostdin','-f','lavfi','-i','sine=frequency=440:sample_rate=44100','-t','4','-c:a','aac','-f','mpegts',audioTs], { windowsHide: true });
 const nativeBackend = process.env.STREAMCAP_TEST_BACKEND;
 if (nativeBackend) { const url=new URL(nativeBackend); assert.equal(url.hostname,'127.0.0.1'); assert.notEqual(url.port,'6059'); }
-const result = { passed: false, cases: [], performance: [], output, segments: 0, maxActiveSegments: 0, errors: [] };
+const result = { passed: false, cases: [], performance: [], output, segments: 0, maxActiveSegments: 0, errors: [],
+  stylesheets: [...stylesheetAssets.values()].map(({ path, sha256 }) => ({ path, sha256 })) };
 const durationFor = path => path === 'short.ts' ? 0.8 : path === 'audio.wma' ? 4 : 18;
 let active = 0, growing = false;
 const children = new Set();
@@ -36,9 +80,13 @@ const server = createServer(async (req, res) => {
     const url = new URL(req.url, 'http://localhost');
     if (url.pathname === '/') {
       res.setHeader('Content-Type','text/html; charset=utf-8');
-      res.end(`<!doctype html><html lang="zh-CN"><head><link rel="stylesheet" href="/styles.css"></head><body style="padding:36px;background:#e9eef6"><main style="max-width:960px;margin:auto"><div class="media-preview"><video class="video-player" playsinline aria-label="录制视频预览"></video></div></main><script src="/mpegts.js"></script><script type="module">import {attachMedia,activePlayerCount} from '/media-player.js';let dispose;window.beginPreview=path=>{dispose?.();const host=document.querySelector('.media-preview');host.dataset.path=path;dispose=attachMedia(host.querySelector('video'),location.origin,path,(phase,text)=>{host.dataset.playerState=phase;host.dataset.message=text;});};window.endPreview=()=>{dispose?.();dispose=null;};window.playerCount=activePlayerCount;window.frameHash=()=>{const v=document.querySelector('video'),c=document.createElement('canvas');c.width=16;c.height=9;const x=c.getContext('2d');x.drawImage(v,0,0,16,9);return [...x.getImageData(0,0,16,9).data].reduce((h,v)=>Math.imul(h^v,16777619)>>>0,2166136261);};</script></body></html>`); return;
+      res.end(`<!doctype html><html lang="zh-CN" data-theme="light"><head>${stylesheetLinks.join('')}</head><body style="padding:36px;background:#e9eef6"><main style="max-width:960px;margin:auto"><div class="media-preview"><video class="video-player" playsinline aria-label="录制视频预览"></video></div></main><script src="/mpegts.js"></script><script type="module">import {attachMedia,activePlayerCount} from '/media-player.js';let dispose;window.beginPreview=path=>{dispose?.();const host=document.querySelector('.media-preview');host.dataset.path=path;dispose=attachMedia(host.querySelector('video'),location.origin,path,(phase,text)=>{host.dataset.playerState=phase;host.dataset.message=text;});};window.endPreview=()=>{dispose?.();dispose=null;};window.playerCount=activePlayerCount;window.frameHash=()=>{const v=document.querySelector('video'),c=document.createElement('canvas');c.width=16;c.height=9;const x=c.getContext('2d');x.drawImage(v,0,0,16,9);return [...x.getImageData(0,0,16,9).data].reduce((h,v)=>Math.imul(h^v,16777619)>>>0,2166136261);};</script></body></html>`); return;
     }
-    const assets = { '/styles.css': ['styles.css','text/css'], '/media-player.js': ['assets/media-player.js','application/javascript'], '/mpegts.js': ['node_modules/mpegts.js/dist/mpegts.js','application/javascript'] };
+    if (stylesheetAssets.has(url.pathname)) {
+      res.setHeader('Content-Type', 'text/css');
+      res.end(stylesheetAssets.get(url.pathname).bytes); return;
+    }
+    const assets = { '/media-player.js': ['dist/media-player.js','application/javascript'], '/mpegts.js': ['dist/media/mpegts.js','application/javascript'] };
     if (assets[url.pathname]) { const [file, mime] = assets[url.pathname]; res.setHeader('Content-Type',mime); res.end(await readFile(join(desktop,file))); return; }
     if (nativeBackend && ['/api/media/info','/api/media/transcode'].includes(url.pathname) && url.searchParams.get('path')==='native-copy.ts') {
       const abort=new AbortController();res.once('close',()=>abort.abort());
@@ -80,13 +128,29 @@ await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
 const browser = await chromium.launch({headless:true,args:['--autoplay-policy=no-user-gesture-required']});
 const page = await browser.newPage({viewport:{width:1180,height:820}});
 page.on('pageerror', error => result.errors.push(error.message));
+const base = 'http://127.0.0.1:' + server.address().port;
+const loadedStylesheets = new Set();
+page.on('response', response => {
+  const path = new URL(response.url()).pathname;
+  if (stylesheetAssets.has(path)) {
+    if (response.status() === 200) loadedStylesheets.add(path);
+    else result.errors.push(`Published CSS returned ${response.status()}: ${path}`);
+  }
+});
+await page.route('**/*', route => {
+  const url = new URL(route.request().url());
+  if (url.origin === base) return route.continue();
+  result.errors.push('Blocked non-fixture browser request: ' + url.origin + url.pathname);
+  return route.abort('blockedbyclient');
+});
 const at = async seconds => page.waitForFunction(seconds => {
   const v=document.querySelector('video');return v.readyState>=2&&!v.seeking&&Math.abs(Number(v.dataset.timelinePosition)-seconds)<0.6;
 },seconds,{timeout:8000});
 const step = async (name, action) => {const start=performance.now();await action();result.cases.push({name,passed:true,milliseconds:Math.round(performance.now()-start)});console.log('PASS '+name);};
 try {
-  await page.goto('http://127.0.0.1:'+server.address().port);
+  await page.goto(base);
   await page.waitForFunction(()=>typeof window.beginPreview==='function');
+  assert.deepEqual([...loadedStylesheets].sort(), [...stylesheetAssets.keys()].sort(), 'Every dist stylesheet must actually load in the browser');
   await step('native MP4 with a positive first timestamp starts at its real buffered range',async()=>{
     await page.evaluate(()=>{
       const v=document.querySelector('video'),get=Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype,'buffered').get;
@@ -97,6 +161,40 @@ try {
     await page.waitForFunction(()=>{const v=document.querySelector('video');return v.currentTime>.6&&!v.paused;},null,{timeout:5000});
     const state=await page.locator('video').evaluate(v=>({start:v.buffered.start(0),frame:Number(v.dataset.framePosition),mode:v.dataset.playerMode}));
     assert.ok(state.start>.15,JSON.stringify(state));assert.ok(state.frame>=state.start);assert.equal(state.mode,'native');
+    assert.equal(await page.getByRole('group',{name:'播放与跳转',exact:true}).getByRole('button').count(),3);
+    assert.equal(await page.getByRole('group',{name:'声音控制',exact:true}).getByRole('slider',{name:'音量',exact:true}).count(),1);
+    assert.equal(await page.getByRole('group',{name:'播放选项',exact:true}).getByRole('combobox',{name:'播放速度',exact:true}).count(),1);
+    assert.equal(await page.getByRole('button',{name:'暂停',exact:true}).getAttribute('aria-keyshortcuts'),'Space');
+    const controlStyles = await page.evaluate(() => {
+      const button = document.querySelector('.seek-play'), select = document.querySelector('.seek-rate');
+      const measure = node => {
+        const style = getComputedStyle(node), box = node.getBoundingClientRect();
+        return { width: box.width, height: box.height, radius: parseFloat(style.borderRadius),
+          fontSize: parseFloat(style.fontSize), borderWidth: parseFloat(style.borderTopWidth),
+          background: style.backgroundColor };
+      };
+      const matchesLibraryRule = (rules, token, node) => [...rules].some(rule => {
+        if (rule.selectorText?.includes(token)) {
+          try { if (node.matches(rule.selectorText)) return true; } catch { /* Nested selectors are checked through their parent rule. */ }
+        }
+        return rule.cssRules && matchesLibraryRule(rule.cssRules, token, node);
+      });
+      return {
+        rootFontSize: parseFloat(getComputedStyle(document.documentElement).fontSize),
+        bodyFontSize: parseFloat(getComputedStyle(document.body).fontSize),
+        button: measure(button), select: measure(select),
+        buttonLibrary: button.classList.contains('ui-btn') && [...document.styleSheets].some(sheet => matchesLibraryRule(sheet.cssRules, '.ui-btn', button)),
+        selectLibrary: select.classList.contains('ui-select') && [...document.styleSheets].some(sheet => matchesLibraryRule(sheet.cssRules, '.ui-select', select)),
+      };
+    });
+    assert.equal(controlStyles.rootFontSize, 16);
+    assert.equal(controlStyles.bodyFontSize, 14);
+    assert.equal(controlStyles.buttonLibrary, true, 'A loaded library rule styles the playback button');
+    assert.equal(controlStyles.selectLibrary, true, 'A loaded library rule styles the speed selector');
+    assert.ok(controlStyles.button.width >= 32 && controlStyles.button.height >= 32 && controlStyles.button.radius >= 4);
+    assert.notEqual(controlStyles.button.background, 'rgba(0, 0, 0, 0)', 'The primary playback button has its real styled background');
+    assert.ok(controlStyles.select.width >= 48 && controlStyles.select.height >= 28 && controlStyles.select.borderWidth >= 1 && controlStyles.select.fontSize >= 13);
+    result.controlStyles = controlStyles;
     await page.getByRole('button',{name:'暂停',exact:true}).click();
     await page.evaluate(()=>{const range=document.querySelector('.seek-range');range.value='0';range.dispatchEvent(new Event('input',{bubbles:true}));range.dispatchEvent(new Event('change',{bubbles:true}));});
     await page.waitForFunction(()=>{const v=document.querySelector('video');return !v.seeking&&!document.querySelector('.media-preview').classList.contains('is-seeking')&&Math.abs(v.currentTime-.375)<.08;});

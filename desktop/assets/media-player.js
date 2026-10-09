@@ -33,7 +33,7 @@ export function attachMedia(video, apiOrigin, relativePath, onState, onCapture) 
   let total = 0, offset = 0, nativeStart = 0, wantedPlay = true, scrubbing = false, changing = false, probing = false;
   let dragTarget = 0, pendingTarget = null, lastDispatch = 0, seekStarted = 0, acceptedTarget = null;
   let poll = null, continuation = null, seekTimer = null, loadTimeout = null, animation = null;
-  let controls, range, time, play, mute, latest, buffered, transport, hint, rate, volume, fullscreen, freeze;
+  let controls, range, time, play, mute, latest, buffered, transport, hint, rate, volume, fullscreen, freeze, captureButton;
   let terminalError = false, compatibilityAttempted = false;
   let frameRequest = null, frameTicket = 0, frameReady = false, loadKind = 'initial';
   const frameCallbacks = typeof video.requestVideoFrameCallback === 'function';
@@ -65,14 +65,22 @@ export function attachMedia(video, apiOrigin, relativePath, onState, onCapture) 
   };
   const nameButton = (node, text, icon) => {
     node.setAttribute('aria-label', text);
+    node.title = text;
     node.parentElement.dataset.tooltip = text;
     if (node.dataset.icon !== icon) { node.innerHTML = svg(icon); node.dataset.icon = icon; }
   };
-  const button = (text, icon, action) => {
-    const wrapper = create('span', 'player-control-tip', transport);
-    const node = create('button', 'seek-button', wrapper);
-    node.type = 'button'; nameButton(node, text, icon); listen(node, 'click', action);
+  const button = (text, icon, action, group = transport) => {
+    const wrapper = create('span', 'player-control-tip', group);
+    const node = create('button', 'ui-btn ui-btn-ghost ui-btn-sm ui-btn-square icon-button seek-button', wrapper);
+    node.type = 'button'; nameButton(node, text, icon);
+    listen(node, 'click', () => { if (!node.disabled) action(); });
     return node;
+  };
+  const syncCapture = () => {
+    if (!captureButton) return;
+    const capturing = host?.dataset.capturing === 'true';
+    captureButton.disabled = capturing || video.readyState < 2 || terminalError;
+    captureButton.setAttribute('aria-busy', String(capturing));
   };
   const renderBuffer = () => {
     if (!buffered || !(total > 0)) return;
@@ -99,6 +107,8 @@ export function attachMedia(video, apiOrigin, relativePath, onState, onCapture) 
     nameButton(play, wantedPlay ? label('暂停', 'Pause') : label('播放', 'Play'), wantedPlay ? 'pause' : 'play');
     nameButton(mute, video.muted ? label('开启声音', 'Unmute') : label('静音', 'Mute'), video.muted ? 'muted' : 'volume');
     nameButton(fullscreen, document.fullscreenElement === host ? label('退出全屏', 'Exit full screen') : label('全屏', 'Full screen'), document.fullscreenElement === host ? 'exitFull' : 'full');
+    controls.setAttribute('aria-busy', String(changing));
+    syncCapture();
     volume.value = String(video.muted ? 0 : video.volume);
     latest.hidden = mode !== 'timeline' || !info?.isRecording;
     host?.classList.toggle('is-scrubbing', scrubbing);
@@ -404,26 +414,49 @@ export function attachMedia(video, apiOrigin, relativePath, onState, onCapture) 
     });
     listen(range, 'pointerleave', () => { if (!scrubbing) hint.hidden = true; });
     transport = create('div', 'seek-transport', controls);
-    play = button(label('暂停', 'Pause'), 'pause', togglePlay); play.classList.add('seek-play');
-    button(label('后退 10 秒', 'Back 10 seconds'), 'back', () => requestSeek(position() - 10, true));
-    button(label('前进 10 秒', 'Forward 10 seconds'), 'forward', () => requestSeek(position() + 10, true));
+    const playback = create('div', 'seek-playback', transport);
+    playback.setAttribute('role', 'group'); playback.setAttribute('aria-label', label('播放与跳转', 'Playback and seeking'));
+    play = button(label('暂停', 'Pause'), 'pause', togglePlay, playback); play.classList.add('seek-play');
+    play.setAttribute('aria-keyshortcuts', 'Space');
+    button(label('后退 10 秒', 'Back 10 seconds'), 'back', () => requestSeek(position() - 10, true), playback).parentElement.classList.add('seek-skip');
+    button(label('前进 10 秒', 'Forward 10 seconds'), 'forward', () => requestSeek(position() + 10, true), playback).parentElement.classList.add('seek-skip');
     time = create('span', 'seek-time', transport); time.setAttribute('aria-live', 'off');
-    latest = create('button', 'seek-latest', transport); latest.type = 'button'; latest.textContent = label('回到最新', 'Latest');
-    listen(latest, 'click', async () => { try { await refreshInfo(); wantedPlay = true; requestSeek(Math.max(0, total - 3), true); } catch (error) { if (!disposed) update('error', error.message); } });
+    latest = create('button', 'ui-btn ui-btn-ghost ui-btn-xs button seek-latest', transport); latest.type = 'button'; latest.textContent = label('回到最新', 'Latest');
+    listen(latest, 'click', async () => {
+      if (latest.disabled) return;
+      latest.disabled = true; latest.setAttribute('aria-busy', 'true');
+      try {
+        if (await refreshInfo() && !disposed) { wantedPlay = true; requestSeek(Math.max(0, total - 3), true); }
+      } catch (error) { if (!disposed) update('error', error.message); }
+      finally { if (!disposed) { latest.disabled = false; latest.setAttribute('aria-busy', 'false'); } }
+    });
     create('span', 'seek-spacer', transport);
-    mute = button(label('开启声音', 'Unmute'), 'muted', () => { video.muted = !video.muted; render(); });
-    volume = create('input', 'seek-volume', transport); volume.type = 'range'; volume.min = '0'; volume.max = '1'; volume.step = '0.05';
+    const audioControls = create('div', 'seek-audio', transport);
+    audioControls.setAttribute('role', 'group'); audioControls.setAttribute('aria-label', label('声音控制', 'Audio controls'));
+    mute = button(label('开启声音', 'Unmute'), 'muted', () => { video.muted = !video.muted; render(); }, audioControls);
+    volume = create('input', 'seek-volume', audioControls); volume.type = 'range'; volume.min = '0'; volume.max = '1'; volume.step = '0.05';
     volume.setAttribute('aria-label', label('音量', 'Volume'));
     listen(volume, 'input', () => { video.volume = Number(volume.value); video.muted = video.volume === 0; render(); });
-    const speed = create('span', 'player-control-tip', transport); speed.dataset.tooltip = label('播放速度', 'Playback speed');
-    rate = create('select', 'seek-rate', speed); rate.setAttribute('aria-label', label('播放速度', 'Playback speed'));
+    const viewControls = create('div', 'seek-tools', transport);
+    viewControls.setAttribute('role', 'group'); viewControls.setAttribute('aria-label', label('播放选项', 'Playback options'));
+    const speed = create('span', 'player-control-tip seek-speed', viewControls); speed.dataset.tooltip = label('播放速度', 'Playback speed');
+    rate = create('select', 'ui-select ui-select-xs seek-rate', speed); rate.setAttribute('aria-label', label('播放速度', 'Playback speed'));
     for (const value of [0.5, 0.75, 1, 1.25, 1.5, 2]) { const option = document.createElement('option'); option.value = String(value); option.textContent = value + '×'; rate.append(option); }
     rate.value = '1'; listen(rate, 'change', () => { video.defaultPlaybackRate = video.playbackRate = Number(rate.value); });
-    if (onCapture && !relativePath.startsWith('live:')) button(label('保存截图', 'Save screenshot'), 'camera', () => onCapture());
+    if (onCapture && !relativePath.startsWith('live:')) {
+      captureButton = button(label('保存截图', 'Save screenshot'), 'camera', () => onCapture(), viewControls);
+      captureButton.parentElement.classList.add('seek-capture');
+      if (host) {
+        const captureObserver = new MutationObserver(syncCapture);
+        captureObserver.observe(host, { attributes: true, attributeFilter: ['data-capturing'] });
+        removers.push(() => captureObserver.disconnect());
+      }
+      syncCapture();
+    }
     fullscreen = button(label('全屏', 'Full screen'), 'full', () => {
       if (document.fullscreenElement === host) document.exitFullscreen().catch(() => {});
       else host?.requestFullscreen().catch(() => update('ready', label('当前窗口无法全屏', 'Full screen unavailable')));
-    });
+    }, viewControls);
     freeze = create('canvas', 'player-freeze'); freeze.hidden = true; freeze.setAttribute('aria-hidden', 'true');
     video.before(freeze); video.after(controls); video.controls = false;
     host?.classList.add('enhanced-preview');

@@ -13,9 +13,11 @@ $tmp=Join-Path $run 'tmp'
 [IO.Directory]::CreateDirectory($tmp)|Out-Null
 $publish=if($OutputDirectory){[IO.Path]::GetFullPath($OutputDirectory)}else{Join-Path $desktop ('src-tauri/target/native-noFF-'+$stamp)}
 $steps=[Collections.Generic.List[object]]::new()
-$names=@('TEMP','TMP','STREAMCAP_TEST_ARTIFACTS','npm_config_cache','NO_COLOR','STREAMCAP_TEST_FFMPEG','STREAMCAP_TEST_PWSH','PLAYWRIGHT_BROWSERS_PATH')
+$names=@('TEMP','TMP','STREAMCAP_TEST_ARTIFACTS','npm_config_cache','NO_COLOR','STREAMCAP_TEST_FFMPEG','STREAMCAP_TEST_PWSH','PLAYWRIGHT_BROWSERS_PATH','STREAMCAP_TEST_SOURCE_CSS','STREAMCAP_TEST_BACKEND','NODE_OPTIONS','NODE_COMPILE_CACHE','NODE_DISABLE_COMPILE_CACHE')
 $saved=@{};foreach($name in $names){$saved[$name]=[Environment]::GetEnvironmentVariable($name,'Process')}
 $env:TEMP=$tmp;$env:TMP=$tmp;$env:STREAMCAP_TEST_ARTIFACTS=$run;$env:npm_config_cache=Join-Path $desktop 'build/npm-cache';$env:NO_COLOR='true'
+$env:STREAMCAP_TEST_SOURCE_CSS='0';$env:STREAMCAP_TEST_BACKEND=$null
+$env:NODE_OPTIONS=$null;$env:NODE_COMPILE_CACHE=$null;$env:NODE_DISABLE_COMPILE_CACHE='1'
 if(-not $env:PLAYWRIGHT_BROWSERS_PATH){$env:PLAYWRIGHT_BROWSERS_PATH=Join-Path $desktop 'build/playwright'}
 function Step([string]$name,[scriptblock]$body){
     $global:LASTEXITCODE=0;$watch=[Diagnostics.Stopwatch]::StartNew()
@@ -85,13 +87,14 @@ try {
     Step 'core-test' {& cargo test --manifest-path core/Cargo.toml --locked --offline}
     Step 'frontend-test' {& cargo test --manifest-path Cargo.toml --target x86_64-pc-windows-msvc --lib --locked --offline}
     Step 'ffmpeg-recording' {& cargo test --manifest-path core/Cargo.toml --locked --offline --test shutdown ffmpeg_ -- --ignored}
-    Step 'media-pipeline' {& cargo test --manifest-path core/Cargo.toml --locked --offline --test media_pipeline -- --ignored}
     Step 'owned-script-tree' {& cargo test --manifest-path core/Cargo.toml --locked --offline --lib owned_process::tests::owned_script_tree_exits_with_its_job -- --ignored}
     Step 'tauri-test' {& cargo test --manifest-path src-tauri/Cargo.toml --locked --offline}
     Step 'core-clippy' {& cargo clippy --manifest-path core/Cargo.toml --all-targets --locked --offline -- -D warnings}
     Step 'tauri-clippy' {& cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked --offline -- -D warnings}
     Step 'frontend-clippy' {& cargo clippy --manifest-path Cargo.toml --target wasm32-unknown-unknown --locked --offline -- -D warnings}
     Step 'build' {& (Join-Path $PSScriptRoot 'build-release.ps1') -OutputDirectory $publish}
+    # Browser media regressions must consume this run's published assets, never an old dist.
+    Step 'media-pipeline' {& cargo test --manifest-path core/Cargo.toml --locked --offline --test media_pipeline -- --ignored}
     Step 'ui' {& npm test}
     $exe=Join-Path $publish 'StreamCap.exe'
     Step 'native-close' {& (Join-Path $desktop 'tests/native-smoke.ps1') -Executable $exe -ExitMode Choice}

@@ -1,4 +1,4 @@
-use super::{Dialog, FieldSection, Icon, InlineNotice};
+use super::{ActionButton, Dialog, FieldSection, FormFeedback, Icon, InlineNotice};
 use crate::app::i18n::t;
 use crate::{
     api::gateway::{self, NewRecording},
@@ -16,6 +16,10 @@ pub fn AddRecordingDialog(open: RwSignal<bool>) -> impl IntoView {
     let submit = move |event: leptos::ev::SubmitEvent| {
         event.prevent_default();
         if busy.get_untracked() {
+            return;
+        }
+        if !state.status.get_untracked().ok {
+            error.set(Some(t("本地服务未连接").into()));
             return;
         }
         let mut items: Vec<NewRecording> = match parse_recordings(&urls.get_untracked()) {
@@ -60,15 +64,17 @@ pub fn AddRecordingDialog(open: RwSignal<bool>) -> impl IntoView {
             <InlineNotice icon="eye">{t("添加后自动监控直播状态，检测到开播后自动录制，无需手动开始。")}</InlineNotice>
             <form on:submit=submit><FieldSection title=t("直播间")>
                 <label class="field"><span>{t("直播间地址")}<span class="required">" *"</span></span>
-                    <textarea class="input url-input" rows="4" autofocus placeholder=t("每行一个 HTTP 或 HTTPS 地址") prop:value=move || urls.get()
+                    <textarea class="ui-textarea input url-input" rows="4" autofocus placeholder=t("每行一个 HTTP 或 HTTPS 地址") prop:value=move || urls.get()
                         on:input=move |event| { urls.set(event_target_value(&event)); error.set(None); } disabled=move || busy.get() />
                 </label>
                 <div class="input-caption"><span><Icon name="link" size=14 />{t("支持一次添加多个直播间")}</span><span>{move || crate::tr_format!("{} 行", urls.get().lines().filter(|l| !l.trim().is_empty()).count())}</span></div>
-                <label class="field"><span>{t("默认主播名称")}<small>{t("可选")}</small></span><input class="input" placeholder=t("留空后在检测时识别") prop:value=move || name.get() on:input=move |event| name.set(event_target_value(&event)) disabled=move || busy.get() /></label>
-                </FieldSection><details class="import-help"><summary>{t("批量导入格式")}</summary><p>{t("也支持“地址,主播名”或“清晰度,地址,主播名”。清晰度可填 0–4 或 OD / UHD / HD / SD / LD。每行独立解析。")}</p></details>
-                <Show when=move || error.get().is_some()><p class="field-error" role="alert">{move || error.get().unwrap_or_default()}</p></Show>
-                <footer class="modal-actions"><button type="button" class="button secondary" disabled=move || busy.get() on:click=move |_| open.set(false)>{t("取消")}</button>
-                    <button type="submit" class="button primary" disabled=move || busy.get() || !state.status.get().ok><Icon name="plus" size=17 />{move || if busy.get() { t("正在添加…") } else { t("添加直播间") }}</button>
+                </FieldSection>
+                <FormFeedback error=error />
+                <FieldSection title=t("任务名称")><label class="field"><span>{t("默认主播名称")}<small>{t("可选")}</small></span><input class="ui-input input" placeholder=t("留空后在检测时识别") prop:value=move || name.get() on:input=move |event| name.set(event_target_value(&event)) disabled=move || busy.get() /></label><p class="field-hint">{t("仅用于未单独填写名称的地址，录制偏好沿用全局设置。")}</p></FieldSection>
+                <details class="import-help"><summary>{t("批量导入格式")}</summary><p>{t("也支持“地址,主播名”或“清晰度,地址,主播名”。清晰度可填 0–4 或 OD / UHD / HD / SD / LD。每行独立解析。")}</p></details>
+                <footer class="modal-actions"><ActionButton label=t("取消") disabled=busy on_click=Callback::new(move |_| open.set(false)) />
+                    <ActionButton label=t("添加直播间") icon="plus" variant="primary" button_type="submit" busy=busy busy_label=t("正在添加…")
+                        disabled=Signal::derive(move || !state.status.get().ok || urls.get().trim().is_empty()) on_click=Callback::new(|_| {}) />
                 </footer>
             </form>
         </Dialog>

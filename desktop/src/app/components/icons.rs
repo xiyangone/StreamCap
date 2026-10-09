@@ -12,13 +12,16 @@ pub fn Icon(#[prop(into)] name: String, #[prop(optional)] size: u32) -> impl Int
         "sliders" => "M4 4v4m0 6v6M12 4v10m0 6v0M20 4v0m0 6v10M1 8h6M9 14h6M17 4h6",
         "command" => "M8 8H5a3 3 0 1 1 3-3v14a3 3 0 1 1-3-3h14a3 3 0 1 1-3 3V5a3 3 0 1 1 3 3H8ZM8 8h8v8H8Z",
         "history" => "M3 3v6h6M3 9a9 9 0 1 1 0 6M12 7v5l3 2",
-        "settings" => "m9 3-1 3-3 1-2 3 2 2-1 3 3 3 3-1 2 2 3-2 1-3 3-1 1-4-3-2V5l-3-2-2 2Z M9 12a3 3 0 1 0 6 0 3 3 0 0 0-6 0",
+        "settings" => "m9 3-.5 2.5-2 1.2-2.4-.8-3 5.2L3 12l-1.9.9 3 5.2 2.4-.8 2 1.2L9 21h6l.5-2.5 2-1.2 2.4.8 3-5.2L21 12l1.9-.9-3-5.2-2.4.8-2-1.2L15 3ZM9 12a3 3 0 1 0 6 0 3 3 0 0 0-6 0",
         "info" => "M12 11v6m0-10v.01M3 12a9 9 0 1 0 18 0 9 9 0 0 0-18 0",
         "plus" => "M12 5v14M5 12h14",
         "search" => "m21 21-4.5-4.5M3 10a7 7 0 1 0 14 0 7 7 0 0 0-14 0",
         "grid" => "M3 3h7v7H3ZM14 3h7v7h-7ZM3 14h7v7H3ZM14 14h7v7h-7Z",
         "list" => "M8 5h13M8 12h13M8 19h13M3 5h.01M3 12h.01M3 19h.01",
         "play" => "m8 4 12 8-12 8Z",
+        "record" => "M6 12a6 6 0 1 0 12 0 6 6 0 0 0-12 0Z",
+        "scan" => "M8 3H4a1 1 0 0 0-1 1v4m13-5h4a1 1 0 0 1 1 1v4M3 16v4a1 1 0 0 0 1 1h4m8 0h4a1 1 0 0 0 1-1v-4M7 12h10M12 7v10",
+        "more" => "M5 12h.01M12 12h.01M19 12h.01",
         "pause" => "M8 4v16M16 4v16",
         "stop" => "M5 5h14v14H5Z",
         "refresh" => "M20 7V3m0 4h-4M4 17v4m0-4h4M20 7a9 9 0 0 0-15-2M4 17a9 9 0 0 0 15 2",
@@ -54,5 +57,5 @@ pub fn Icon(#[prop(into)] name: String, #[prop(optional)] size: u32) -> impl Int
         _ => "M4 12h16",
     };
     let size = if size == 0 { 20 } else { size };
-    view! { <svg class="icon" width=size height=size viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d=path /></svg> }
+    view! { <svg class="icon" width=size height=size viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d=path /></svg> }
 }

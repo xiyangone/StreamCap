@@ -1,4 +1,4 @@
-use super::{Dialog, Icon, InlineNotice};
+use super::{ActionButton, Dialog, FormFeedback, Icon, InlineNotice};
 use crate::api::gateway::{self, QrSnapshot};
 use crate::app::i18n::t;
 use leptos::prelude::*;
@@ -6,11 +6,13 @@ use serde_json::json;
 
 #[component]
 pub fn QrLoginDialog(open: RwSignal<bool>, on_success: Callback<QrSnapshot>) -> impl IntoView {
+    let state = gateway::app_state();
     let session = RwSignal::new(None::<String>);
     let snapshot = RwSignal::new(None::<QrSnapshot>);
     let error = RwSignal::new(None::<String>);
     let save_error = RwSignal::new(None::<String>);
     let busy = RwSignal::new(false);
+    let requesting = RwSignal::new(false);
     let revision = RwSignal::new(0_u32);
     let retry = RwSignal::new(0_u32);
     Effect::new(move |_| {
@@ -27,6 +29,7 @@ pub fn QrLoginDialog(open: RwSignal<bool>, on_success: Callback<QrSnapshot>) -> 
         snapshot.set(None);
         error.set(None);
         save_error.set(None);
+        requesting.set(shown);
         if !shown {
             return;
         }
@@ -36,12 +39,14 @@ pub fn QrLoginDialog(open: RwSignal<bool>, on_success: Callback<QrSnapshot>) -> 
                 Ok(_) => {
                     if revision.try_get_untracked() == Some(generation) {
                         let _ = error.try_set(Some(t("二维码会话未创建，请重试").into()));
+                        let _ = requesting.try_set(false);
                     }
                     return;
                 }
                 Err(message) => {
                     if revision.try_get_untracked() == Some(generation) {
                         let _ = error.try_set(Some(message));
+                        let _ = requesting.try_set(false);
                     }
                     return;
                 }
@@ -52,6 +57,7 @@ pub fn QrLoginDialog(open: RwSignal<bool>, on_success: Callback<QrSnapshot>) -> 
                 return;
             }
             session.set(Some(id.clone()));
+            requesting.set(false);
             let mut current = first;
             for attempt in 0_u32..300 {
                 if revision.try_get_untracked() != Some(generation) {
@@ -117,8 +123,16 @@ pub fn QrLoginDialog(open: RwSignal<bool>, on_success: Callback<QrSnapshot>) -> 
                 .unwrap_or_else(|| t("正在获取二维码").into())
         })
     };
-    let save = move |_| {
-        if busy.get_untracked() {
+    let reacquire = Callback::new(move |_| {
+        if busy.get_untracked() || requesting.get_untracked() || !open.get_untracked() || !failed()
+        {
+            return;
+        }
+        requesting.set(true);
+        retry.update(|value| *value = value.wrapping_add(1));
+    });
+    let save = Callback::new(move |_| {
+        if busy.get_untracked() || !open.get_untracked() || !state.status.get_untracked().ok {
             return;
         }
         let Some(result) = snapshot.get_untracked().filter(|s| s.state == "success") else {
@@ -137,22 +151,24 @@ pub fn QrLoginDialog(open: RwSignal<bool>, on_success: Callback<QrSnapshot>) -> 
         save_error.set(None);
         leptos::task::spawn_local(async move {
             match gateway::save_cookies(json!({"kuaishou":cookie})).await {
-                Ok(()) => on_success.run(result),
+                Ok(()) => {
+                    let _ = on_success.try_run(result);
+                }
                 Err(message) => {
                     let _ = save_error.try_set(Some(message));
                 }
             }
             let _ = busy.try_set(false);
         });
-    };
+    });
     view! {
         <Dialog open=Signal::derive(move||open.get()) title=t("快手扫码登录") on_close=Callback::new(move |_|open.set(false)) busy=busy>
-            <ol class="login-steps" aria-label=t("登录步骤")><li class:active=move || matches!(phase().as_str(), "loading" | "waiting")>{t("扫描二维码")}</li><li class:active=move || matches!(phase().as_str(), "scanned" | "verifying")>{t("手机确认")}</li><li class:active=move || phase() == "success">{t("保存登录信息")}</li></ol>
+            <ol class="login-steps" aria-label=t("登录步骤")><li class:active=move || matches!(phase().as_str(), "loading" | "waiting") aria-current=move || matches!(phase().as_str(), "loading" | "waiting").then_some("step")>{t("扫描二维码")}</li><li class:active=move || matches!(phase().as_str(), "scanned" | "verifying") aria-current=move || matches!(phase().as_str(), "scanned" | "verifying").then_some("step")>{t("手机确认")}</li><li class:active=move || phase() == "success" aria-current=move || (phase() == "success").then_some("step")>{t("保存登录信息")}</li></ol>
             <InlineNotice icon="lock">{t("在快手 App 扫码并确认。账号验证完成后，点击保存登录信息。")}</InlineNotice>
             <div class="qr-panel" class:qr-code-container=move||phase()=="waiting">
                 <Show when=move||phase()=="waiting"&&snapshot.get().is_some_and(|s|!s.image_base64.is_empty()) fallback=move||view!{
                     <div class="qr-stage" class:error=failed class:success=move||phase()=="success" role="status" aria-live="polite">
-                        <Show when=failed fallback=move||view!{<Show when=move||phase()=="success" fallback=||view!{<span class="spinner"/>}><Icon name="check" size=34/></Show>}><Icon name="alert" size=34/></Show>
+                        <Show when=failed fallback=move||view!{<Show when=move||phase()=="success" fallback=||view!{<span class="ui-loading ui-loading-spinner ui-loading-md spinner" aria-hidden="true"/>}><Icon name="check" size=34/></Show>}><Icon name="alert" size=34/></Show>
                         <strong>{move||match phase().as_str(){"success"=>t("账号验证通过"),"error"=>t("登录未完成"),"expired"=>t("二维码已过期"),"cancelled"=>t("登录已取消"),"scanned"=>t("等待手机确认"),"verifying"=>t("手机已确认"),"loading"=>t("正在获取二维码"),_=>t("正在处理登录")}}</strong>
                         <p>{message}</p>
                         <Show when=move||phase()=="success"><p class="qr-save-hint">{t("登录信息尚未保存，点击下方按钮完成登录。")}</p></Show>
@@ -162,11 +178,13 @@ pub fn QrLoginDialog(open: RwSignal<bool>, on_success: Callback<QrSnapshot>) -> 
                 </Show>
             </div>
             <Show when=move||phase()=="waiting"><p class="qr-status">{t("使用快手 App 扫描二维码")}</p><p class="qr-status qr-countdown">{move||snapshot.get().map(|s|crate::tr_format!("二维码有效期：{} 秒",s.seconds_left)).unwrap_or_default()}</p></Show>
-            <Show when=move||save_error.get().is_some()><p class="field-error" role="alert">{move||save_error.get().unwrap_or_default()}</p></Show>
+            <FormFeedback error=save_error title=t("操作未完成") />
             <footer class="modal-actions">
-                <button class="button secondary" disabled=move||busy.get() on:click=move |_|open.set(false)>{t("关闭")}</button>
-                <Show when=failed><button class="button primary" on:click=move |_|retry.update(|v|*v=v.wrapping_add(1))><Icon name="refresh" size=16/>{t("重新获取")}</button></Show>
-                <Show when=move||phase()=="success"><button class="button primary" disabled=move||busy.get() on:click=save>{move||if busy.get(){t("保存中…")}else{t("保存登录信息")}}</button></Show>
+                <ActionButton label=t("关闭") disabled=busy on_click=Callback::new(move |_|open.set(false)) />
+                <Show when=failed><ActionButton label=t("重新获取") icon="refresh" variant="primary" busy=requesting
+                    disabled=busy busy_label=t("正在获取二维码") on_click=reacquire /></Show>
+                <Show when=move||phase()=="success"><ActionButton label=t("保存登录信息") icon="check" variant="primary" busy=busy
+                    busy_label=t("保存中…") disabled=Signal::derive(move || !state.status.get().ok) on_click=save /></Show>
             </footer>
         </Dialog>
     }

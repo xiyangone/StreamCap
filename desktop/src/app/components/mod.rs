@@ -21,7 +21,9 @@ pub use edit_dialog::EditRecordingDialog;
 pub use icons::Icon;
 pub use media_job_status::MediaJobStatus;
 pub use preview_dialog::{preview_state, provide_preview, PreviewHost};
-pub use primitives::{FieldSection, InlineNotice, Metric, PageHeader};
+pub use primitives::{
+    ActionButton, FieldSection, FormFeedback, IconButton, InlineNotice, PageHeader, ToggleSwitch,
+};
 pub use qr_login_dialog::QrLoginDialog;
 pub use recording_card::RecordingCard;
 pub use toast::Toast;

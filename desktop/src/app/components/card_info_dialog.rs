@@ -1,4 +1,4 @@
-use super::{Dialog, Icon};
+use super::{ActionButton, Dialog, FormFeedback};
 use crate::app::i18n::t;
 use crate::{
     api::gateway::{self, Recording},
@@ -9,6 +9,12 @@ use leptos::prelude::*;
 #[component]
 pub fn CardInfoDialog(target: RwSignal<Option<Recording>>) -> impl IntoView {
     let state = gateway::app_state();
+    let copying = RwSignal::new(false);
+    let error = RwSignal::new(None::<String>);
+    Effect::new(move |_| {
+        let _ = target.get();
+        error.set(None);
+    });
     let record = move || {
         let initial = target.get().unwrap_or_default();
         state
@@ -16,19 +22,27 @@ pub fn CardInfoDialog(target: RwSignal<Option<Recording>>) -> impl IntoView {
             .with(|list| list.iter().find(|r| r.rec_id == initial.rec_id).cloned())
             .unwrap_or(initial)
     };
-    let copy = move |_| {
+    let copy = Callback::new(move |_| {
+        if copying.get_untracked() || target.get_untracked().is_none() {
+            return;
+        }
+        copying.set(true);
+        error.set(None);
         let url = record().url;
         leptos::task::spawn_local(async move {
             match wasm_bindgen_futures_copy(url).await {
                 Ok(()) => state.notify(t("直播间地址已复制")),
-                Err(()) => state.fail(t("无法访问剪贴板，请手动选择并复制地址")),
+                Err(()) => {
+                    let _ = error.try_set(Some(t("无法访问剪贴板，请手动选择并复制地址").into()));
+                }
             }
+            let _ = copying.try_set(false);
         });
-    };
+    });
     view! {
         <Dialog open=Signal::derive(move || target.get().is_some()) title=t("直播间信息") on_close=Callback::new(move |_| target.set(None))>
             <div class="info-heading"><span class="large-initial">{move || record().name().chars().next().unwrap_or('播').to_string()}</span><div><h3>{move || record().name()}</h3><span class=move || record().status().class()>{move || record().status().label()}</span></div></div>
-            <section class="info-section"><h3>{t("录制配置")}</h3><dl class="info-list">
+            <div class="info-columns"><section class="info-section"><h3>{t("录制配置")}</h3><dl class="info-list">
                 <div><dt>{t("直播平台")}</dt><dd>{move || record().platform.unwrap_or_else(|| t("自定义直播间").into())}</dd></div>
                 <div><dt>{t("清晰度")}</dt><dd>{move || quality_label(record().quality.as_deref())}{move || record().inherits("quality").then_some(t(" · 跟随全局"))}</dd></div>
                 <div><dt>{t("录制格式")}</dt><dd>{move || format_label(record().record_format.as_deref())}{move || record().inherits("record_format").then_some(t(" · 跟随全局"))}</dd></div>
@@ -45,9 +59,12 @@ pub fn CardInfoDialog(target: RwSignal<Option<Recording>>) -> impl IntoView {
                 <div><dt>{t("断流恢复")}</dt><dd>{move || crate::tr_format!("已安排 {}/3 次", record().recovery_attempt)}</dd></div>
                 <div><dt>{t("本次录制时长")}</dt><dd>{move||crate::app::labels::duration(record().recorded_seconds)}</dd></div><div><dt>{t("录制速率")}</dt><dd>{move || record().speed.unwrap_or_else(|| "—".into())}</dd></div>
                 <div><dt>{t("保存目录")}</dt><dd class="break-anywhere">{move || record().recording_dir.unwrap_or_else(|| t("尚未生成录制文件").into())}</dd></div>
-            </dl></section>
-            <label class="field"><span>{t("直播间地址")}</span><input class="input" readonly prop:value=move || record().url /></label>
-            <footer class="modal-actions"><button class="button secondary" on:click=copy><Icon name="copy" size=16 />{t("复制地址")}</button><button class="button primary" on:click=move |_| target.set(None)>{t("完成")}</button></footer>
+            </dl></section></div>
+            <label class="field"><span>{t("直播间地址")}</span><input class="ui-input input" readonly prop:value=move || record().url /></label>
+            <FormFeedback error=error title=t("操作未完成") />
+            <footer class="modal-actions"><ActionButton label=t("复制地址") icon="copy" busy=copying busy_label=t("正在复制…") on_click=copy />
+                <ActionButton label=t("完成") variant="primary" on_click=Callback::new(move |_| target.set(None)) />
+            </footer>
         </Dialog>
     }
 }

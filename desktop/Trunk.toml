@@ -6,3 +6,11 @@ dist = "dist"
 addresses = ["127.0.0.1"]
 port = 1420
 open = false
+
+[[hooks]]
+stage = "pre_build"
+command = "node"
+command_arguments = ["node_modules/@tailwindcss/cli/dist/index.mjs", "--input", "styles.css", "--output", "build/ui.css", "--minify"]
+
+[watch]
+ignore = ["build", "target", "core/target", "src-tauri/target", "node_modules", "tests/artifacts"]

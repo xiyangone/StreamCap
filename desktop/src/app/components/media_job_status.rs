@@ -1,4 +1,4 @@
-use super::Icon;
+use super::{ActionButton, FormFeedback, Icon};
 use crate::{
     api::gateway::{self, MediaJob},
     app::{
@@ -16,6 +16,7 @@ pub fn MediaJobStatus(
 ) -> impl IntoView {
     let state = gateway::app_state();
     let busy = RwSignal::new(false);
+    let error = RwSignal::new(None::<String>);
     let pending = move || job.with(|value| value.as_ref().is_some_and(MediaJob::pending));
     let attention = move || job.with(|value| value.as_ref().is_some_and(MediaJob::needs_attention));
     let phase = Memo::new(move |_| job.with(|value| value.as_ref().map(media_phase).unwrap_or("")));
@@ -35,20 +36,26 @@ pub fn MediaJobStatus(
                     .any(|other| other.source == source.get() && other.pending())
             })
     };
-    let retry = move |_| {
+    let retry = Callback::new(move |_| {
         if blocked() {
             return;
         }
         let path = source.get_untracked();
+        if path.is_empty() {
+            return;
+        }
+        error.set(None);
         busy.set(true);
         leptos::task::spawn_local(async move {
             match gateway::remux_file(&path).await {
                 Ok(()) => state.notify(t("已加入转 MP4 队列，原 TS 保留")),
-                Err(error) => state.fail(error),
+                Err(message) => {
+                    let _ = error.try_set(Some(message));
+                }
             }
             let _ = busy.try_set(false);
         });
-    };
+    });
     view! {
         <Show when=move || job.with(Option::is_some)>
             <div class=if compact { "media-job-status card-media-job" } else { "media-job-status media-job-row" }
@@ -73,7 +80,7 @@ pub fn MediaJobStatus(
                     }).unwrap_or_default())}
                 </span>
                 <Show when=move || pending() && job.with(|value| value.as_ref().is_some_and(|job| job.state != "waiting"))>
-                    <progress aria-label=t("本阶段进度") max="100"
+                    <progress class="ui-progress ui-progress-primary" aria-label=t("本阶段进度") max="100"
                         value=move || job.with(|value| value.as_ref().and_then(|job| job.stage_percent).map(|value| value.to_string())) />
                 </Show>
                 <details class="media-job-diagnostics">
@@ -90,12 +97,13 @@ pub fn MediaJobStatus(
                     </div>
                 </details>
                 <Show when=move || !compact && job.with(|value| value.as_ref().is_some_and(|job| matches!(job.state.as_str(), "failed" | "cancelled")))>
-                    <button class="button secondary small media-retry" type="button"
+                    <ActionButton label=t("保留 TS 重试") icon="refresh" class="small media-retry"
                         title=t("重新转换，始终保留源 TS；已有 MP4 不覆盖")
-                        disabled=blocked on:click=retry>
-                        <Icon name="refresh" size=14 />
-                        {move || if busy.get() { t("正在提交…") } else { t("保留 TS 重试") }}
-                    </button>
+                        busy=busy busy_label=t("正在提交…")
+                        disabled=Signal::derive(blocked) on_click=retry />
+                </Show>
+                <Show when=move || error.get().is_some()>
+                    <div class="media-job-feedback"><FormFeedback error=error title=t("操作未完成") /></div>
                 </Show>
             </div>
         </Show>

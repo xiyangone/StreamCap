@@ -1,5 +1,14 @@
 # Third-party notices
 
+## UI component system
+
+daisyUI 5.7.47, Copyright (c) 2020 Pouya Saadeghi, and Tailwind CSS 4.3.3,
+Copyright (c) Tailwind Labs, Inc., are licensed under the MIT License.
+Their generated CSS is bundled locally; no CDN, JavaScript component runtime,
+or Node.js process is required by the installed application. The complete
+licenses are included in `ui/daisyui/LICENSE` and `ui/tailwindcss/LICENSE`.
+Exact build dependency versions are recorded in package-lock.json.
+
 Native platform protocols and bundled Haixiu/LiveMe signing code are adapted from [streamget](https://github.com/ihmily/streamget/tree/016a8d6fbef4f5f14c0ec986dc3528c5a22235ab), pinned source commit `016a8d6fbef4f5f14c0ec986dc3528c5a22235ab`, Copyright (c) 2025 Hmily. No Python runtime from that package is distributed with the native executable.
 
 MIT License

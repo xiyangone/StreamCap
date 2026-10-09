@@ -76,6 +76,21 @@ const eventually=async(read,predicate,label,timeout=15000)=>{
   while(Date.now()<deadline){const value=await read();if(predicate(value))return value;await sleep(100);}
   throw Error('Timed out waiting for '+label);
 };
+const openCardMenu=async card=>{
+  const menu=card.locator('details.card-menu');
+  assert.equal(await menu.count(),1);
+  assert.equal(await menu.getAttribute('name'),'streamcap-task-menu');
+  const trigger=menu.getByRole('button',{name:'更多操作',exact:true});
+  if(!await menu.evaluate(node=>node.open))await trigger.click();
+  await eventually(()=>menu.evaluate(node=>node.open),Boolean,'native card menu opens');
+  await menu.locator('.card-menu-panel').waitFor({state:'visible'});
+  return menu;
+};
+const cardMenuAction=async(card,name)=>{
+  const menu=await openCardMenu(card);
+  await menu.locator('.card-menu-panel').getByRole('button',{name,exact:true}).click();
+  await eventually(()=>menu.evaluate(node=>node.open),value=>!value,'native card action closes menu');
+};
 try {
   const browser=await chromium.connectOverCDP('http://127.0.0.1:'+port);
   page=browser.contexts().flatMap(context=>context.pages()).find(page=>page.url().includes('tauri.localhost'));
@@ -236,7 +251,12 @@ try {
   const mediaCard=page.locator('article[data-rec-id="'+mediaTask.recId+'"]');
   await mediaCard.getByRole('button',{name:'单次录制',exact:true}).click();
   await mediaCard.getByRole('button',{name:'停止录制',exact:true}).waitFor();
-  await mediaCard.getByRole('button',{name:'预览录制文件'}).click();const previewModal=page.getByRole('dialog',{name:'录制预览',exact:true});
+  const firstMenu=await openCardMenu(mediaCard);
+  const menuTrigger=firstMenu.getByRole('button',{name:'更多操作',exact:true});
+  await menuTrigger.press('Escape');
+  await eventually(()=>firstMenu.evaluate(node=>node.open),value=>!value,'native Escape closes task menu');
+  assert.equal(await menuTrigger.evaluate(node=>node===document.activeElement),true);
+  await cardMenuAction(mediaCard,'预览录制文件');const previewModal=page.getByRole('dialog',{name:'录制预览',exact:true});
   await page.waitForFunction(()=>{const video=document.querySelector('video');return video?.videoWidth===160&&video.currentTime>0.5;},null,{timeout:20000});
   const liveSlider=previewModal.getByRole('slider',{name:'播放进度',exact:true});await liveSlider.waitFor();
   await eventually(()=>liveSlider.getAttribute('max'),value=>Number(value)>5,'growing recording timeline',18000);
@@ -270,8 +290,8 @@ try {
   await mediaCard.getByRole('button',{name:'停止录制',exact:true}).click();
   const completedJob=await eventually(async()=>{const response=await fetch(base+'/api/media/jobs');assert.equal(response.status,200);return (await response.json()).jobs.find(j=>j.taskId===mediaTask.recId&&j.state==='complete');},Boolean,'verified media job',25000);
   assert.equal(completedJob.deleteOriginal,deleteOriginal);assert.equal(completedJob.sourceRemoved,deleteOriginal);
-  await mediaCard.getByRole('button',{name:'预览录制文件'}).click();
-  await previewModal.getByRole('listitem').filter({hasText:/\.mp4/}).click();
+  await cardMenuAction(mediaCard,'预览录制文件');
+  await previewModal.getByRole('listitem').filter({hasText:/\.mp4/}).getByRole('button').click();
   await page.waitForFunction(()=>{const video=document.querySelector('video');return video?.videoWidth===160&&video.currentTime>0.5;},null,{timeout:15000});
   await page.screenshot({path:path.join(output,'native-mp4-preview.png'),fullPage:true,animations:'disabled'});
   await previewModal.getByRole('button',{name:'关闭对话框',exact:true}).click();
@@ -292,7 +312,7 @@ try {
   assert.equal((await native()).closing,false);assert.equal((await native()).closePending,false);
   await requestClose();await page.keyboard.press('Escape');await modal.waitFor({state:'hidden'});
   assert.equal((await native()).closePending,false);
-  await requestClose();await modal.getByRole('checkbox',{name:'记住我的选择'}).check();await modal.getByRole('button',{name:/最小化到托盘/}).click();await modal.waitFor({state:'hidden'});
+  await requestClose();await modal.getByRole('switch',{name:'记住我的选择'}).click();assert.equal(await modal.getByRole('switch',{name:'记住我的选择'}).getAttribute('aria-checked'),'true');await modal.getByRole('button',{name:/最小化到托盘/}).click();await modal.waitFor({state:'hidden'});
   const tray=await native();assert.equal(tray.visible,false);assert.equal(tray.closing,false);assert.equal(tray.closePending,false);
   const status=await (await fetch(base+'/api/status')).json();assert.equal(status.ok,true);assert.equal(status.resolverReady,true);
   const settings=await (await fetch(base+'/api/settings')).json();assert.equal(settings.userConfig.close_action,'tray');

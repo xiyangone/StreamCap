@@ -1,4 +1,4 @@
-use super::{Dialog, FieldSection};
+use super::{ActionButton, Dialog, FieldSection, FormFeedback};
 use crate::app::i18n::t;
 use crate::{
     api::gateway::{self, Recording},
@@ -9,6 +9,16 @@ use serde_json::{Map, Value};
 
 pub const KEEP: &str = "__keep";
 pub const GLOBAL: &str = "__global";
+
+fn inheritance_label(value: &str) -> &'static str {
+    if value == KEEP {
+        t("保持原值，不修改此项")
+    } else if value == GLOBAL || value.trim().is_empty() {
+        t("跟随全局设置")
+    } else {
+        t("使用此任务的独立设置")
+    }
+}
 #[derive(Clone, Copy)]
 pub struct RecordingDraft {
     quality: RwSignal<String>,
@@ -194,31 +204,43 @@ impl RecordingDraft {
 
 #[component]
 pub fn RecordingFields(draft: RecordingDraft, #[prop(optional)] batch: bool) -> impl IntoView {
+    let field_id = move |field: &str| {
+        format!(
+            "{}-{field}",
+            if batch {
+                "batch-recording"
+            } else {
+                "edit-recording"
+            }
+        )
+    };
     view! {
         <FieldSection title=t("画质与格式")><div class="form-grid">
-            <label class="field"><span>{t("清晰度")}</span><select class="input" prop:value=move || draft.quality.get() on:change=move |e| draft.quality.set(event_target_value(&e))>
+            <label class="field"><span>{t("清晰度")}</span><select class="ui-select input" aria-label=t("清晰度") aria-describedby=field_id("quality-policy") prop:value=move || draft.quality.get() on:change=move |e| draft.quality.set(event_target_value(&e))>
                 {batch.then(|| view! { <option value=KEEP>{t("保持原值")}</option> })}<option value=GLOBAL>{t("跟随全局")}</option>
                 {QUALITY_OPTIONS.iter().map(|(code,label)| view! { <option value=*code>{*label}</option> }).collect_view()}
-            </select></label>
-            <label class="field"><span>{t("录制格式")}</span><select class="input" prop:value=move || draft.format.get() on:change=move |e| draft.format.set(event_target_value(&e))>
+            </select><small class="field-state" id=field_id("quality-policy")>{move || inheritance_label(&draft.quality.get())}</small></label>
+            <label class="field"><span>{t("录制格式")}</span><select class="ui-select input" aria-label=t("录制格式") aria-describedby=field_id("format-policy") prop:value=move || draft.format.get() on:change=move |e| draft.format.set(event_target_value(&e))>
                 {batch.then(|| view! { <option value=KEEP>{t("保持原值")}</option> })}<option value=GLOBAL>{t("跟随全局")}</option>
                 {FORMAT_OPTIONS.iter().map(|format| view! { <option value=*format>{*format}</option> }).collect_view()}
-            </select></label>
-            <label class="field"><span>{t("分段录制")}</span><select class="input" prop:value=move || draft.segment.get() on:change=move |e| draft.segment.set(event_target_value(&e))>
+            </select><small class="field-state" id=field_id("format-policy")>{move || inheritance_label(&draft.format.get())}</small></label>
+            <label class="field"><span>{t("分段录制")}</span><select class="ui-select input" aria-label=t("分段录制") aria-describedby=field_id("segment-policy") prop:value=move || draft.segment.get() on:change=move |e| draft.segment.set(event_target_value(&e))>
                 {batch.then(|| view! { <option value=KEEP>{t("保持原值")}</option> })}<option value=GLOBAL>{t("跟随全局")}</option><option value="true">{t("开启")}</option><option value="false">{t("关闭")}</option>
-            </select></label>
-            <div class="field-group"><label class="field"><span>{t("分段时长")}<small>{t("秒")}</small></span><input class="input" inputmode="numeric" placeholder=move || if draft.time.get() == KEEP { t("保持原值") } else { t("跟随全局") }
+            </select><small class="field-state" id=field_id("segment-policy")>{move || inheritance_label(&draft.segment.get())}</small></label>
+            <div class="field-group"><label class="field"><span>{t("分段时长")}<small>{t("秒")}</small></span><input class="ui-input input" aria-label=t("分段时长") aria-describedby=field_id("time-policy") inputmode="numeric" placeholder=move || if draft.time.get() == KEEP { t("保持原值") } else { t("跟随全局") }
                 prop:value=move || { let v = draft.time.get(); if v.starts_with("__") { String::new() } else { v } } on:input=move |e| draft.time.set(event_target_value(&e)) /></label>
-                <div class="field-tools"><button class="text-button" type="button" on:click=move |_| draft.time.set(GLOBAL.into())>{t("跟随全局")}</button>{batch.then(|| view! { <button class="text-button" type="button" on:click=move |_| draft.time.set(KEEP.into())>{t("保持原值")}</button> })}</div>
+                <small class="field-state" id=field_id("time-policy")>{move || inheritance_label(&draft.time.get())}</small>
+                <div class="field-tools"><ActionButton label=t("跟随全局") class="small field-tool" variant="ghost" on_click=Callback::new(move |_| draft.time.set(GLOBAL.into())) />{batch.then(|| view! { <ActionButton label=t("保持原值") class="small field-tool" variant="ghost" on_click=Callback::new(move |_| draft.time.set(KEEP.into())) /> })}</div>
             </div>
-            <div class="field-group full-width"><label class="field"><span>{t("自定义码率")}<small>"kbps"</small></span><input class="input" inputmode="numeric" placeholder=move || if draft.bitrate.get() == KEEP { t("保持原值") } else { t("复制源流，不重新编码") }
+            <div class="field-group full-width"><label class="field"><span>{t("自定义码率")}<small>"kbps"</small></span><input class="ui-input input" aria-label=t("自定义码率") aria-describedby=field_id("bitrate-policy") inputmode="numeric" placeholder=move || if draft.bitrate.get() == KEEP { t("保持原值") } else { t("复制源流，不重新编码") }
                 prop:value=move || { let v = draft.bitrate.get(); if v == KEEP { String::new() } else { v } } on:input=move |e| draft.bitrate.set(event_target_value(&e)) /></label>
-                <div class="field-tools"><button class="text-button" type="button" on:click=move |_| draft.bitrate.set(String::new())>{t("复制源流")}</button>{batch.then(|| view! { <button class="text-button" type="button" on:click=move |_| draft.bitrate.set(KEEP.into())>{t("保持原值")}</button> })}</div>
+                <small class="field-state" id=field_id("bitrate-policy")>{move || if draft.bitrate.get() == KEEP { t("保持原值，不修改此项") } else if draft.bitrate.get().trim().is_empty() { t("复制源流，不重新编码") } else { t("使用此任务的独立设置") }}</small>
+                <div class="field-tools"><ActionButton label=t("复制源流") class="small field-tool" variant="ghost" on_click=Callback::new(move |_| draft.bitrate.set(String::new())) />{batch.then(|| view! { <ActionButton label=t("保持原值") class="small field-tool" variant="ghost" on_click=Callback::new(move |_| draft.bitrate.set(KEEP.into())) /> })}</div>
             </div>
 
         </div></FieldSection><FieldSection title=t("监控与自动化")><div class="form-grid">
-            {[(draft.schedule,t("定时录制"),false),(draft.push,t("任务通知"),false),(draft.notify_only,t("仅通知不录制"),true),(draft.direct,t("FLV 直下"),true)].into_iter().map(|(signal,label,inherited)|view!{<label class="field"><span>{label}</span><select class="input" prop:value=move||signal.get() on:change=move|e|signal.set(event_target_value(&e))><option value=KEEP>{t("保持原值")}</option>{inherited.then(||view!{<option value=GLOBAL>{t("跟随全局")}</option>})}<option value="true">{t("开启")}</option><option value="false">{t("关闭")}</option></select></label>}).collect_view()}
-            {[(draft.starts,t("定时开始时间"),t("例如 08:00,23:00")),(draft.hours,t("对应监控小时数"),t("例如 2,3；跨午夜也有效"))].into_iter().map(|(signal,label,hint)|view!{<label class="field"><span>{label}</span><input class="input" placeholder=hint prop:value=move||{let value=signal.get();if value==KEEP{String::new()}else{value}} on:input=move|e|signal.set(event_target_value(&e))/><small>{hint}</small>{batch.then(||view!{<button type="button" class="text-button" on:click=move |_|signal.set(KEEP.into())>{t("保持原值")}</button>})}</label>}).collect_view()}
+            {[(draft.schedule,t("定时录制"),false),(draft.push,t("任务通知"),false),(draft.notify_only,t("仅通知不录制"),true),(draft.direct,t("FLV 直下"),true)].into_iter().map(|(signal,label,inherited)|view!{<label class="field"><span>{label}</span><select class="ui-select input" aria-label=label prop:value=move||signal.get() on:change=move|e|signal.set(event_target_value(&e))><option value=KEEP>{t("保持原值")}</option>{inherited.then(||view!{<option value=GLOBAL>{t("跟随全局")}</option>})}<option value="true">{t("开启")}</option><option value="false">{t("关闭")}</option></select></label>}).collect_view()}
+            {[(draft.starts,t("定时开始时间"),t("例如 08:00,23:00")),(draft.hours,t("对应监控小时数"),t("例如 2,3；跨午夜也有效"))].into_iter().map(|(signal,label,hint)|view!{<div class="field-group"><label class="field"><span>{label}</span><input class="ui-input input" aria-label=label placeholder=hint prop:value=move||{let value=signal.get();if value==KEEP{String::new()}else{value}} on:input=move|e|signal.set(event_target_value(&e))/><small>{hint}</small></label>{batch.then(||view!{<ActionButton label=t("保持原值") class="small field-tool" variant="ghost" on_click=Callback::new(move |_|signal.set(KEEP.into())) />})}</div>}).collect_view()}
         </div></FieldSection>
     }
 }
@@ -231,6 +253,16 @@ pub fn EditRecordingDialog(target: RwSignal<Option<Recording>>) -> impl IntoView
     let url = RwSignal::new(String::new());
     let error = RwSignal::new(None::<String>);
     let busy = RwSignal::new(false);
+    let unavailable = Signal::derive(move || {
+        !state.status.get().ok
+            || target.with(|target| {
+                target.as_ref().is_some_and(|record| {
+                    state
+                        .recording(&record.rec_id)
+                        .is_none_or(|current| current.is_recording)
+                })
+            })
+    });
     Effect::new(move |_| {
         if let Some(rec) = target.get() {
             draft.load(&rec);
@@ -241,7 +273,7 @@ pub fn EditRecordingDialog(target: RwSignal<Option<Recording>>) -> impl IntoView
     });
     let submit = move |event: leptos::ev::SubmitEvent| {
         event.prevent_default();
-        if busy.get_untracked() {
+        if busy.get_untracked() || unavailable.get_untracked() {
             return;
         }
         let Some(rec) = target.get_untracked() else {
@@ -287,14 +319,18 @@ pub fn EditRecordingDialog(target: RwSignal<Option<Recording>>) -> impl IntoView
     view! {
         <Dialog open=Signal::derive(move || target.get().is_some()) title=t("编辑直播间") busy=busy on_close=Callback::new(move |_| target.set(None))>
             <p class="dialog-description">{t("为这个直播间单独设置录制偏好，也可保持跟随全局。")}</p>
-            <form on:submit=submit><fieldset disabled=move || busy.get()><FieldSection title=t("直播间信息")>
-                <label class="field"><span>{t("主播名称")}</span><input class="input" autofocus prop:value=move || name.get() on:input=move |e| name.set(event_target_value(&e)) /></label>
-                <label class="field"><span>{t("直播间地址")}</span><input class="input" prop:value=move || url.get() on:input=move |e| url.set(event_target_value(&e)) /></label>
+            <Show when=move || unavailable.get()><p class="field-error" role="status">{t("请先停止此任务的录制，并确认本地服务已连接。")}</p></Show>
+            <form on:submit=submit><fieldset disabled=move || busy.get() || unavailable.get()><FieldSection title=t("直播间信息")>
+                <label class="field"><span>{t("主播名称")}</span><input class="ui-input input" aria-label=t("主播名称") autofocus prop:value=move || name.get() on:input=move |e| name.set(event_target_value(&e)) /></label>
+                <label class="field"><span>{t("直播间地址")}</span><input class="ui-input input" aria-label=t("直播间地址") prop:value=move || url.get() on:input=move |e| url.set(event_target_value(&e)) /></label>
                 </FieldSection>
                 <RecordingFields draft=draft />
             </fieldset>
-            <Show when=move || error.get().is_some()><p class="field-error" role="alert">{move || error.get().unwrap_or_default()}</p></Show>
-            <footer class="modal-actions"><button class="button secondary" type="button" disabled=move || busy.get() on:click=move |_| target.set(None)>{t("取消")}</button><button class="button primary" type="submit" disabled=move || busy.get()>{move || if busy.get() { t("保存中…") } else { t("保存修改") }}</button></footer>
+            <FormFeedback error=error />
+            <footer class="modal-actions"><ActionButton label=t("取消") disabled=busy on_click=Callback::new(move |_| target.set(None)) />
+                <ActionButton label=t("保存修改") icon="check" variant="primary" button_type="submit" busy=busy busy_label=t("保存中…")
+                    disabled=unavailable on_click=Callback::new(|_| {}) />
+            </footer>
             </form>
         </Dialog>
     }

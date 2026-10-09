@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { apiContracts, createHarness, eventually, go, hidden, inspectLayout, seedMediaJob, seedRecordings, streamPreviewFixture, visible, waitTheme } from './ui-fixtures.mjs';
+import { apiContracts, cardMenuAction, closeCardMenu, createHarness, eventually, go, hidden, inspectLayout, openCardMenu, seedMediaJob, seedRecordings, setSwitch, streamPreviewFixture, themeColors, visible, waitTheme } from './ui-fixtures.mjs';
 
 const h = await createHarness('interaction');
 const { page, state } = h;
@@ -17,6 +17,14 @@ const fetchFixture = route => {
   // Route.fetch bypasses context routing; never contact the application's default port.
   return route.fetch({ url: h.base + url.pathname + url.search, maxRedirects: 0, timeout: 5000 });
 };
+async function openMediaHistory() {
+  const history = page.locator('details.media-history');
+  const trigger = history.locator('summary').first();
+  await visible(trigger);
+  if (await history.getAttribute('open') === null) await trigger.click();
+  await waitState(() => history.evaluate(node => node.open), Boolean, '用户展开处理记录');
+  return history;
+}
 let failure;
 async function step(name, action) {
   await action();
@@ -61,16 +69,22 @@ try {
   });
   await step('真实 WASM 启动、初始任务与 SSE 连接', async () => {
     await go(page, h.base, '/home');
-    await waitState(() => page.locator('.recording-card').count(), (n) => n === 6, '初始任务数量');
+    await waitState(() => page.locator('.overview-task-row').count(), (n) => n === 6, '工作台初始任务数量');
     await visible(page.getByText('本地实时更新', { exact: true }));
     const layout = await inspectLayout(page);
     assert.equal(layout.dialogs, 0);
     assert.equal(layout.surface.background, 'rgb(255, 255, 255)');
-    assert.equal(layout.surface.border, 'solid');
-    assert.ok(layout.surface.borderWidth >= 1 && layout.surface.radius >= 8);
+    assert.ok(layout.surface.width > 0 && layout.surface.height > 0, '工作台实际承载区可见');
+    assert.equal(layout.bodyOverflow, false);
+    assert.equal(layout.contentOverflow, false);
+    assert.deepEqual(layout.overflow, []);
     assert.equal(layout.surface.backdrop, 'none');
-    assert.equal(layout.baseFontSize, 14);
+    assert.equal(layout.baseFontSize, 16);
+    assert.equal(layout.bodyFontSize, 14);
+    assert.equal(layout.headingFontSize, 25);
     await h.shot('01-home-light');
+    await navigate('录制任务');
+    await waitState(() => page.locator('.recording-card').count(), (n) => n === 6, '任务页显示同一初始集合');
   });
   await step('快手冷却和登录受限仍保留人工检查入口', async () => {
     const target=state.recordings[1];
@@ -116,7 +130,7 @@ try {
     await page.route(pattern, handler);
     const modal = dialog('录制预览');
     try {
-      await card('fixture-1').getByRole('button', { name: '预览录制文件' }).click();
+      await cardMenuAction(card('fixture-1'), '预览录制文件');
       await visible(modal.locator('.loading-state'));
       await waitState(() => modal.locator('.preview-file').count(), n => n > 0, '慢响应首次预览列表');
       await hidden(modal.locator('.loading-state'));
@@ -132,7 +146,7 @@ try {
       await page.unroute(pattern, handler);
     }
   });
-  await step('旧列表快照不能恢复 SSE 已删除任务或回退更新', async () => {
+  await step('旧列表快照不能恢复 SSE 已移除任务或回退更新', async () => {
     const original = structuredClone(state.recordings);
     const pattern = '**/api/recordings';
     let release, captured;
@@ -153,7 +167,7 @@ try {
       await visible(card('fixture-3').getByRole('button', { name: '更新不能被旧快照覆盖', exact: true }));
       release(); await completed;
       await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
-      assert.equal(await card('fixture-2').count(), 0, '删除任务被旧快照恢复');
+      assert.equal(await card('fixture-2').count(), 0, '移除任务被旧快照恢复');
       await visible(card('fixture-3').getByRole('button', { name: '更新不能被旧快照覆盖', exact: true }));
       await h.shot('regression-stale-recording-snapshot');
     } finally {
@@ -164,7 +178,7 @@ try {
   });
   await step('旧媒体队列快照不能回退 SSE 已完成状态', async () => {
     const original = structuredClone(state.mediaJobs);
-    await card('fixture-1').getByRole('button', { name: '预览录制文件' }).click();
+    await cardMenuAction(card('fixture-1'), '预览录制文件');
     const modal = dialog('录制预览');
     await visible(modal.locator('.media-preview'));
     const source = await modal.locator('.media-preview').getAttribute('data-path');
@@ -200,7 +214,7 @@ try {
     await page.getByRole('button', { name: '切换到深色' }).click();
     await waitTheme(page, 'dark');
     const bg = await page.locator('body').evaluate((e) => getComputedStyle(e).backgroundColor);
-    assert.equal(bg, 'rgb(17, 20, 25)');
+    assert.equal(bg, themeColors.dark.surface);
     await h.shot('02-home-dark');
     await page.getByRole('button', { name: '切换到浅色' }).click();
     await waitTheme(page, 'light');
@@ -211,7 +225,7 @@ try {
     await waitState(() => page.locator('.recording-card').count(), (n) => n === 1, '搜索结果');
     await page.getByRole('textbox', { name: '搜索直播间' }).fill('不存在的直播间');
     await visible(page.getByText('没有匹配的直播间', { exact: true }));
-    await page.getByRole('button', { name: '清除筛选' }).click();
+    await page.locator('.empty-panel').getByRole('button', { name: '清除筛选' }).click();
     await page.getByRole('combobox', { name: '筛选平台' }).selectOption('bilibili');
     await waitState(() => page.locator('.recording-card').count(), (n) => n === 2, '平台筛选');
     await page.getByRole('combobox', { name: '筛选平台' }).selectOption('');
@@ -261,7 +275,7 @@ try {
   });
   await step('弹窗内 Enter 和空格不误关窗口，真正的背景点击仍可关闭', async () => {
     const before = requests('PUT', '/api/recordings/fixture-3').length;
-    await card('fixture-3').getByRole('button', {name:'编辑任务',exact:true}).click();
+    await cardMenuAction(card('fixture-3'), '编辑任务');
     const modal = dialog('编辑直播间'); await visible(modal);
     await modal.getByRole('textbox', {name:'主播名称',exact:true}).fill('键盘编辑草稿');
     const follow = modal.getByRole('button', {name:'跟随全局',exact:true}).first();
@@ -275,7 +289,7 @@ try {
     assert.equal(requests('PUT', '/api/recordings/fixture-3').length, before);
   });
   await step('单项编辑、字段契约和实时卡片更新', async () => {
-    await card('fixture-3').getByRole('button', { name: '编辑任务' }).click();
+    await cardMenuAction(card('fixture-3'), '编辑任务');
     const modal = dialog('编辑直播间');
     await modal.getByRole('textbox', { name: '主播名称' }).fill('小宇 · 已编辑');
     await modal.getByRole('combobox', { name: '清晰度', exact: true }).selectOption('HD');
@@ -306,8 +320,49 @@ try {
     assert.equal(record('fixture-3').recordFormat, 'MKV');
     await page.getByRole('button', { name: '取消选择' }).click();
   });
+  await step('单卡请求期间锁定批量、筛选与选择，完成后全部恢复', async () => {
+    const original = structuredClone(record('fixture-3'));
+    await card('fixture-5').getByRole('checkbox').check();
+    h.delayNext('POST', '/api/recordings/fixture-3/start', 1500);
+    await card('fixture-3').getByRole('button', { name:'单次录制', exact:true }).click();
+    await visible(card('fixture-3').locator('.card-record[aria-busy="true"]'));
+    assert.equal(await page.getByRole('button', { name:'批量编辑', exact:true }).isDisabled(), true);
+    assert.equal(await page.getByRole('button', { name:'列表视图', exact:true }).isDisabled(), true);
+    assert.equal(await page.getByRole('textbox', { name:'搜索直播间', exact:true }).isDisabled(), true);
+    assert.equal(await page.locator('.task-checkbox:not(:disabled)').count(), 0);
+    await waitState(() => record('fixture-3').isRecording, Boolean, '单卡请求完成');
+    const stop = card('fixture-3').getByRole('button', { name:'停止录制', exact:true });
+    await waitState(() => stop.isEnabled(), Boolean, '同步完成后可以停止');
+    await stop.click();
+    await waitState(() => record('fixture-3').isRecording, value => !value, '停止测试录制');
+    await waitState(() => page.getByRole('button', { name:'取消选择', exact:true }).isEnabled(), Boolean, '操作计数回到零');
+    await page.getByRole('button', { name:'取消选择', exact:true }).click();
+    Object.assign(record('fixture-3'), original); h.emit('update', record('fixture-3'));
+  });
+  await step('筛选隐藏的选择明确计数，批量编辑仍使用完整选择集合', async () => {
+    const originals = ['fixture-3','fixture-5'].map(id => structuredClone(record(id)));
+    await card('fixture-3').getByRole('checkbox').check();
+    await card('fixture-5').getByRole('checkbox').check();
+    assert.equal(await page.locator('.select-all input').evaluate(input => input.indeterminate), true);
+    const search = page.getByRole('textbox', { name:'搜索直播间', exact:true });
+    await search.fill(await card('fixture-3').locator('.card-name').innerText());
+    await visible(page.getByText('当前可见 1 项 · 隐藏 1 项', { exact:true }));
+    assert.equal(await page.locator('.select-all input').evaluate(input => input.checked && !input.indeterminate), true);
+    await page.getByRole('button', { name:'批量编辑', exact:true }).click();
+    const modal = dialog('批量编辑任务');
+    await modal.getByRole('combobox', { name:'清晰度', exact:true }).selectOption('HD');
+    h.delayNext('POST', '/api/recordings/batch-edit', 900);
+    await modal.getByRole('button', { name:'应用到所选任务', exact:true }).click();
+    await waitState(() => modal.getByRole('button', { name:'应用到所选任务', exact:true }).getAttribute('aria-busy'), value => value === 'true', '批量保存忙碌状态');
+    assert.equal(await modal.getByRole('button', { name:'取消', exact:true }).isDisabled(), true);
+    await hidden(modal);
+    assert.deepEqual(requests('POST','/api/recordings/batch-edit').at(-1).body.recIds.sort(), ['fixture-3','fixture-5']);
+    await search.fill('');
+    await page.getByRole('button', { name:'取消选择', exact:true }).click();
+    for (const value of originals) { Object.assign(record(value.recId), value); h.emit('update', record(value.recId)); }
+  });
   await step('恢复跟随全局，覆盖项保持独立', async () => {
-    await card('fixture-3').getByRole('button', { name: '编辑任务' }).click();
+    await cardMenuAction(card('fixture-3'), '编辑任务');
     const modal = dialog('编辑直播间');
     await modal.getByRole('combobox', { name: '清晰度', exact: true }).selectOption('__global');
     await modal.getByRole('combobox', { name: '录制格式', exact: true }).selectOption('__global');
@@ -369,11 +424,11 @@ try {
   await step('录制结束转 MP4 开关按显式选择保存，不改变 TS 与检测间隔', async () => {
     await page.getByRole('button',{name:'录制与存储',exact:true}).click();
     const interval=state.userConfig.loop_time_seconds,format=state.userConfig.video_format;
-    const toggle=page.getByRole('switch',{name:'录制结束转 MP4',exact:true});await toggle.check();
+    const toggle=page.getByRole('switch',{name:'录制结束转 MP4',exact:true});await setSwitch(toggle,true);
     await page.locator('.settings-savebar').getByRole('button',{name:'保存修改'}).click();
     await waitState(()=>state.userConfig.convert_to_mp4,v=>v===true,'启用转换设置');await hidden(page.locator('.settings-savebar'));
     assert.equal(state.userConfig.loop_time_seconds,interval);assert.equal(state.userConfig.video_format,format);
-    await toggle.uncheck();await page.locator('.settings-savebar').getByRole('button',{name:'保存修改'}).click();
+    await setSwitch(toggle,false);await page.locator('.settings-savebar').getByRole('button',{name:'保存修改'}).click();
     await waitState(()=>state.userConfig.convert_to_mp4,v=>v===false,'关闭转换设置');await hidden(page.locator('.settings-savebar'));
   });
   await step('系统主题随系统实时变化，强调色与持久化', async () => {
@@ -428,7 +483,7 @@ try {
     await close.getByRole('button',{name:'取消',exact:true}).click();await hidden(close);assert.equal(state.native.closing,false);assert.equal(state.native.visible,true);
     await page.getByRole('button',{name:'外观与窗口',exact:true}).click();
     await page.getByRole('button',{name:'关闭窗口',exact:true}).click();await visible(close);await page.keyboard.press('Escape');await hidden(close);assert.equal(state.native.closing,false);
-    await page.getByRole('button',{name:'关闭窗口',exact:true}).click();await visible(close);await close.getByRole('checkbox',{name:'记住我的选择'}).check();state.native.failRemember=true;
+    await page.getByRole('button',{name:'关闭窗口',exact:true}).click();await visible(close);await setSwitch(close.getByRole('switch',{name:'记住我的选择'}),true);state.native.failRemember=true;
     await close.getByRole('button',{name:/最小化到托盘/}).click();await visible(close.getByRole('alert'));assert.equal(state.native.visible,true);assert.equal(state.userConfig.close_action,undefined);
     await close.getByRole('button',{name:/最小化到托盘/}).click();await hidden(close);assert.equal(state.native.visible,false);assert.equal(state.native.closing,false);assert.equal(state.userConfig.close_action,'tray');
     await h.restoreNative();await page.getByRole('button',{name:'关闭窗口',exact:true}).click();await waitState(()=>state.native.visible,v=>!v,'记住托盘后直接隐藏');await hidden(close);await h.restoreNative();
@@ -488,7 +543,7 @@ try {
   });
   await step('登录信息按平台局部保存，扫码仅在隔离服务模拟', async () => {
     await page.getByRole('button', { name: '平台登录', exact: true }).click();
-    const input = page.getByRole('textbox', { name: '平台 Cookie' });
+    const input = page.getByLabel('平台 Cookie', { exact: true });
     await visible(input);
     const untouched = state.cookies.bilibili;
     await input.fill('fixture-edited-not-a-credential');
@@ -497,7 +552,7 @@ try {
     assert.deepEqual(requests('PUT', '/api/cookies').at(-1).body.cookies, { douyin: 'fixture-edited-not-a-credential' });
     assert.equal(state.cookies.bilibili, untouched);
     await page.getByRole('textbox', { name: '搜索平台' }).fill('快手');
-    await page.locator('.cookie-platform-list').getByRole('button', { name: '快手直播', exact: true }).click();
+    await page.getByRole('combobox', { name: 'Cookie 平台列表', exact: true }).selectOption('kuaishou');
     await page.getByRole('button', { name: '扫码登录' }).click();
     const modal = dialog('快手扫码登录');
     await visible(modal.getByText('二维码有效期：120 秒', { exact: true }));
@@ -534,9 +589,9 @@ try {
   });
   await step('转换、清理与时间字幕为真实可保存开关，自动化不再显示占位卡片', async () => {
     await page.getByRole('button', {name:'录制与存储',exact:true}).click();
-    await page.getByRole('switch',{name:'录制结束转 MP4',exact:true}).check();
-    await page.getByRole('switch',{name:'转换成功后清理源 TS',exact:true}).check();
-    await page.getByRole('switch',{name:'生成时间字幕',exact:true}).check();
+    await setSwitch(page.getByRole('switch',{name:'录制结束转 MP4',exact:true}),true);
+    await setSwitch(page.getByRole('switch',{name:'转换成功后清理源 TS',exact:true}),true);
+    await setSwitch(page.getByRole('switch',{name:'生成时间字幕',exact:true}),true);
     await page.locator('.settings-savebar').getByRole('button',{name:'保存修改',exact:true}).click();
     await waitState(()=>state.userConfig.delete_original,Boolean,'清理设置保存');assert.equal(state.userConfig.generate_time_subtitle_file,true);
     await page.getByRole('button', { name: '自动化与通知', exact: true }).click();
@@ -548,12 +603,14 @@ try {
   });
   await step('监控、录制、停止与失败反馈', async () => {
     await navigate('录制任务');
-    await card('fixture-5').getByRole('button', { name: '开启监控', exact: true }).click();
+    await setSwitch(card('fixture-5').getByRole('switch', { name: '自动检测', exact: true }),true);
     await waitState(() => record('fixture-5').monitorStatus, Boolean, '监控启用');
     await card('fixture-5').getByRole('button', { name: '单次录制', exact: true }).click();
     await waitState(() => record('fixture-5').isRecording, Boolean, '开始录制');
-    assert.equal(await card('fixture-5').getByRole('button', { name: '编辑任务' }).isDisabled(), true);
-    assert.equal(await card('fixture-5').getByRole('button', { name: '删除任务' }).isDisabled(), true);
+    const recordingMenu = await openCardMenu(card('fixture-5'));
+    assert.equal(await recordingMenu.getByRole('button', { name: '编辑任务', exact: true }).isDisabled(), true);
+    assert.equal(await recordingMenu.getByRole('button', { name: '移除任务', exact: true }).isDisabled(), true);
+    await closeCardMenu(recordingMenu);
     await card('fixture-5').getByRole('button', { name: '停止录制', exact: true }).click();
     await waitState(() => record('fixture-5').isRecording, (v) => !v, '停止录制');
     h.failNext('POST', '/api/recordings/fixture-5/start', '模拟 FFmpeg 启动失败');
@@ -572,12 +629,14 @@ try {
     await attentionTab.click();assert.equal(await page.locator('.recording-card').count(),attentionCount);
     await visible(card('fixture-5'));
     await navigate('总览');
-    assert.equal(await page.locator('.metric').filter({hasText:'需关注'}).locator('strong').innerText(),String(attentionCount));
+    assert.equal(await page.locator('.overview-summary > div').filter({has:page.getByText('需关注',{exact:true})}).locator('dd').innerText(),String(attentionCount));
     await visible(page.getByText('有需要处理的任务，请查看下方提示。',{exact:true}));
-    assert.equal(await page.locator('.recording-card').first().getAttribute('data-rec-id'),'fixture-5');
+    assert.equal(await page.locator('.overview-task-row').first().getAttribute('data-rec-id'),'fixture-5');
     await navigate('录制任务');
     assert.equal(await card('fixture-5').getByRole('button',{name:'单次录制',exact:true}).isDisabled(),true);
-    assert.equal(await card('fixture-5').getByRole('button',{name:'检测直播状态',exact:true}).isDisabled(),true);
+    const verificationMenu = await openCardMenu(card('fixture-5'));
+    assert.equal(await verificationMenu.getByRole('button',{name:'检测直播状态',exact:true}).isDisabled(),true);
+    await closeCardMenu(verificationMenu);
     assert.equal(await card('fixture-5').locator('.card-recording-error').count(),0);
     await card('fixture-5').getByRole('button',{name:'重新验证',exact:true}).click();
     await waitState(()=>state.native.verification,v=>v?.active===true&&v.recId==='fixture-5','只打开当前快手验证入口');
@@ -605,17 +664,30 @@ try {
         const target=card('fixture-5');await target.scrollIntoViewIfNeeded();
         const layout=await target.evaluate(card=>{
           const rect=element=>{const r=element.getBoundingClientRect();return {left:r.left,right:r.right,top:r.top,bottom:r.bottom,cy:(r.top+r.bottom)/2};};
-          const actions=card.querySelector('.card-actions');const buttons=[...actions.querySelectorAll('button')].map(rect);
-          return {card:rect(card),buttons,primary:[...card.querySelectorAll('.card-primary-actions button')].map(rect),tools:[...card.querySelectorAll('.card-tools button')].map(rect),floating:card.querySelectorAll('.card-monitor-row button').length,overflow:document.documentElement.scrollWidth>innerWidth+1};
+          const primary=[...card.querySelectorAll('.card-actions > button.card-record')].map(rect);
+          const tools=[...card.querySelectorAll('.card-menu > summary')].map(rect);
+          return {card:rect(card),buttons:[...primary,...tools],primary,tools,floating:card.querySelectorAll('.card-monitor-row button').length,overflow:document.documentElement.scrollWidth>innerWidth+1};
         });
         assert.equal(layout.floating,0);assert.equal(layout.overflow,false);
+        assert.equal(layout.primary.length,1,'每张卡片保持一个主要录制动作');
+        assert.equal(layout.tools.length,1,'次要动作使用唯一菜单入口');
         for(const button of layout.buttons) assert.ok(button.left>=layout.card.left&&button.right<=layout.card.right+1,'操作按钮不越过卡片');
-        for(const group of [layout.primary,layout.tools]) assert.ok(Math.max(...group.map(r=>r.cy))-Math.min(...group.map(r=>r.cy))<=1,'同组按钮中线对齐');
-        if(list&&width===1280) {
-          assert.ok(Math.max(...layout.primary.map(r=>r.bottom))<=Math.min(...layout.tools.map(r=>r.top)),'主操作与辅助工具明确分组、不重叠');
-          assert.ok(Math.abs(Math.max(...layout.primary.map(r=>r.right))-Math.max(...layout.tools.map(r=>r.right)))<=1,'两组操作右侧对齐');
-        }
+        assert.ok(Math.abs(layout.primary[0].cy-layout.tools[0].cy)<=1,'主操作与菜单入口中线对齐');
+        assert.ok(layout.primary[0].right<=layout.tools[0].left+1,'主要操作与菜单入口不重叠');
+        const menu=await openCardMenu(target);
+        const popup=await menu.locator('.card-menu-panel').evaluate(node=>{
+          const box=node.getBoundingClientRect();
+          return {left:box.left,right:box.right,top:box.top,viewport:innerWidth,
+            rows:[...node.querySelectorAll('button')].map(button=>{const r=button.getBoundingClientRect();return {left:r.left,right:r.right,top:r.top,bottom:r.bottom};})};
+        });
+        assert.equal(popup.rows.length,4);
+        assert.ok(popup.left>=0&&popup.right<=popup.viewport+1,'菜单不得横向溢出窗口');
+        assert.ok(popup.top>=layout.tools[0].bottom,'展开的次要动作与主操作分区、不重叠');
+        assert.ok(Math.max(...popup.rows.map(row=>row.left))-Math.min(...popup.rows.map(row=>row.left))<=1,'菜单项目左侧对齐');
+        assert.ok(Math.max(...popup.rows.map(row=>row.right))-Math.min(...popup.rows.map(row=>row.right))<=1,'菜单项目右侧对齐');
+        for(let i=1;i<popup.rows.length;i++)assert.ok(popup.rows[i].top>=popup.rows[i-1].bottom-1,'菜单项目垂直排列且不重叠');
         await h.shot('actions-'+width+'-'+(list?'list':'grid'));
+        await closeCardMenu(menu);
       }
     }
     await page.setViewportSize({width:1280,height:900});
@@ -635,7 +707,7 @@ try {
       const layout=await card(item.recId).evaluate(card=>{
         const rect=e=>{const r=e.getBoundingClientRect();return {x:r.x,right:r.right,cy:r.y+r.height/2,height:r.height,width:r.width}};
         return {card:rect(card),monitor:rect(card.querySelector('.card-monitor-row')),tags:rect(card.querySelector('.card-tags')),
-          controls:[...card.querySelectorAll('.card-actions button')].map(rect),subtitle:card.querySelectorAll('.card-subtitle').length,
+          controls:[...card.querySelectorAll('.card-actions > button.card-record,.card-menu > summary')].map(rect),subtitle:card.querySelectorAll('.card-subtitle').length,
           emptySpeed:card.querySelectorAll('.card-speed').length,overflow:document.documentElement.scrollWidth>innerWidth+1};
       });
       assert.ok(Math.abs(layout.monitor.cy-layout.tags.cy)<=1,'监控状态与原画/格式应处于同一行');
@@ -659,7 +731,7 @@ try {
     await visible(card('fixture-5').getByRole('button', { name: '自动识别主播', exact: true }));
     h.failRecording('fixture-5', '播放地址返回 HTTP 404');
     await visible(card('fixture-5').locator('.card-recording-error'));
-    assert.equal(await card('fixture-5').locator('.badge').innerText(), '录制异常');
+    assert.equal(await card('fixture-5').locator('.card-state .ui-badge').innerText(), '录制异常');
     assert.match(await card('fixture-5').locator('.card-recording-error').innerText(), /录制失败：播放地址返回 HTTP 404/);
     assert.equal(await card('fixture-5').getByRole('button', { name: '单次录制', exact: true }).isEnabled(), true);
     for (const width of [1280, 800, 375]) {
@@ -681,11 +753,11 @@ try {
     await page.getByRole('button', { name: '网格视图', exact: true }).click();
     await card('fixture-5').getByRole('button', { name: '单次录制', exact: true }).click();
     await hidden(card('fixture-5').locator('.card-recording-error'));
-    assert.equal(await card('fixture-5').locator('.badge').innerText(), '录制中');
+    assert.equal(await card('fixture-5').locator('.card-state .ui-badge').innerText(), '录制中');
     await card('fixture-5').getByRole('button', { name: '停止录制', exact: true }).click();
     await visible(card('fixture-5').getByRole('button', { name: '单次录制', exact: true }));
     assert.equal(await card('fixture-5').locator('.card-recording-error').count(), 0);
-    assert.equal(await card('fixture-5').locator('.badge').innerText(), '直播未录制');
+    assert.equal(await card('fixture-5').locator('.card-state .ui-badge').innerText(), '直播未录制');
     Object.assign(record('fixture-5'), original);
     h.emit('update', record('fixture-5'));
     await visible(card('fixture-5').getByRole('button', { name: original.streamerName, exact: true }));
@@ -705,12 +777,13 @@ try {
       item.monitorStatus=false;h.emit('update',item);
       await visible(card(item.recId).getByText('监控已暂停',{exact:true}));
       assert.equal(await card(item.recId).locator('.card-recording-status').innerText(),'录制中');
-      await navigate('总览');await visible(card(item.recId).locator('.card-recording-status'));
+      await navigate('总览');
+      await visible(page.locator(`.overview-task-row[data-rec-id="${item.recId}"] .overview-task-status`).getByText('录制中',{exact:true}));
       await navigate('录制任务');
       Object.assign(item,{isRecording:false,isLive:false,monitorStatus:true,liveTitle:null});h.emit('update',item);
       await hidden(card(item.recId).locator('.card-recording-status'));
       assert.equal(await card(item.recId).locator('.card-subtitle').count(),0);
-      assert.equal(await card(item.recId).locator('.badge').innerText(),'等待开播');
+      assert.equal(await card(item.recId).locator('.card-state .ui-badge').innerText(),'等待开播');
     } finally {Object.assign(item,original);h.emit('update',item);}
   });
   await step('录制与录后处理分离，历史完成结果隐藏且处理来源明确', async () => {
@@ -732,7 +805,7 @@ try {
       assert.equal(await card(item.recId).locator('.card-recording-status').innerText(),'录制中');
       Object.assign(job,{state:'failed',finishedAt:Math.floor(Date.now()/1000),message:'转换失败，原 TS 保留'});h.emit('mediaJob',job);
       await visible(card(item.recId).locator('.card-media-job[data-state=failed]'));
-      assert.equal(await card(item.recId).locator('.badge').innerText(),'录制中');
+      assert.equal(await card(item.recId).locator('.card-state .ui-badge').innerText(),'录制中');
       assert.equal(await card(item.recId).locator('.card-recording-error').count(),0);
       for(const [width,list,dark] of [[1280,true,false],[1280,false,true],[420,true,true],[420,false,false]]) {
         await page.setViewportSize({width,height:900});
@@ -753,7 +826,7 @@ try {
       await visible(card(item.recId).locator('.card-media-job'));
       assert.equal(await card(item.recId).locator('.card-media-job-source').textContent(),'历史目录/历史录像_2026-09-27.ts');
       assert.equal(await card(item.recId).locator('.media-job-detail').innerText(),'耗时未知');
-      assert.equal(await card(item.recId).locator('.badge').innerText(),'等待开播');
+      assert.equal(await card(item.recId).locator('.card-state .ui-badge').innerText(),'等待开播');
       for(const width of [1280,420]) {
         await page.setViewportSize({width,height:900});
         for(const list of [true,false]) {
@@ -778,6 +851,10 @@ try {
         {...base,id:'zero-time',source:'zero.ts',startedAt:100,finishedAt:100},
         {...base,id:'saved-time',source:'saved.ts',startedAt:100,elapsedSeconds:7}];
       await go(page,h.base,'/storage');
+      const history=page.locator('details.media-history');
+      await visible(history);
+      assert.equal(await history.getAttribute('open'),null,'完成记录默认折叠');
+      await openMediaHistory();
       const row=source=>page.locator('.media-job-row').filter({hasText:source}).locator('.media-job-detail');
       await visible(row('unknown.ts'));
       assert.equal(await row('unknown.ts').innerText(),'耗时未知');
@@ -793,7 +870,7 @@ try {
     await filter('录制中').click();await visible(card(r.recId));
     await filter('直播未录制').click();await hidden(card(r.recId));
     Object.assign(r,{isRecording:false});h.emit('update',r);await visible(card(r.recId));
-    assert.equal(await card(r.recId).locator('.badge').innerText(),'直播未录制');
+    assert.equal(await card(r.recId).locator('.card-state .ui-badge').innerText(),'直播未录制');
     Object.assign(r,{checkState:'rechecking',recordedSeconds:2584.9});h.emit('update',r);await hidden(card(r.recId));
     await all();await visible(card(r.recId).getByText('录制结束，复核中',{exact:true}));
     assert.equal(await card(r.recId).locator('.card-check-error').count(),0);
@@ -802,40 +879,67 @@ try {
     await filter('直播未录制').click();await hidden(card(r.recId));
     Object.assign(r,{isLive:false,liveTitle:null,checkError:null});h.emit('update',r);
     await filter('等待开播').click();await visible(card(r.recId));
-    assert.equal(await card(r.recId).locator('.badge').innerText(),'等待开播');
+    assert.equal(await card(r.recId).locator('.card-state .ui-badge').innerText(),'等待开播');
     assert.equal(await card(r.recId).locator('.card-check-error').count(),0);
-    const counts=await page.locator('.filter-tab span').allTextContents();
+    const counts=await page.locator('.filter-tab .filter-count').allTextContents();
     assert.equal(counts.slice(1).reduce((a,n)=>a+Number(n),0),Number(counts[0]));
     Object.assign(r,original);h.emit('update',r);await all();
   });
   await step('删除确认、取消与 SSE 删除后无信号生命周期错误', async () => {
     const before = requests('DELETE', '/api/recordings/fixture-7').length;
-    await card('fixture-7').getByRole('button', { name: '删除任务' }).click();
+    await cardMenuAction(card('fixture-7'), '移除任务');
     const modal = dialog('移除直播间'); await visible(modal);
     await modal.getByRole('button', { name: '取消', exact: true }).click(); await hidden(modal);
     assert.equal(requests('DELETE', '/api/recordings/fixture-7').length, before);
-    await card('fixture-7').getByRole('button', { name: '删除任务' }).click();
-    await modal.getByRole('button', { name: '确认删除' }).click();
+    await cardMenuAction(card('fixture-7'), '移除任务');
+    await modal.getByRole('button', { name: '确认移除' }).click();
     await hidden(card('fixture-7'));
     await waitState(() => requests('DELETE', '/api/recordings/fixture-7').length, (n) => n === before + 1, '仅删除选定任务');
+    await waitState(() => page.getByRole('textbox',{name:'搜索直播间',exact:true}).isEnabled(), Boolean, '卡片删除后父层操作计数仍须释放');
     assert.ok(record('fixture-8'));
   });
-  await step('任务次要操作统一图标，悬停与键盘焦点显示禁用原因', async () => {
-    const tools=card('fixture-1').locator('.card-tools');
+  await step('同名任务菜单互斥，Escape 关闭并恢复入口焦点，不触发业务操作', async () => {
+    const mutations=()=>state.requests.filter(request=>/^(POST|PUT|PATCH|DELETE)$/.test(request.method)).length;
+    const before=mutations();
+    const first=await openCardMenu(card('fixture-1'));
+    const second=await openCardMenu(card('fixture-5'));
+    await waitState(()=>first.evaluate(node=>node.open),value=>!value,'打开第二个同名菜单关闭第一个');
+    assert.equal(await page.locator('details.card-menu[open]').count(),1);
+    assert.equal(await second.evaluate(node=>node.open),true);
+    await closeCardMenu(second);
+    assert.equal(await page.locator('details.card-menu[open]').count(),0);
+    const editable=card('fixture-2');
+    const trigger=editable.locator('details.card-menu > summary');
+    for(const attempt of [1,2]) {
+      await cardMenuAction(editable,'编辑任务');
+      const modal=dialog('编辑直播间');
+      await visible(modal);
+      await page.keyboard.press('Escape');
+      await hidden(modal);
+      assert.equal(await trigger.evaluate(node=>node===document.activeElement),true,
+        `第 ${attempt} 次编辑关闭后焦点必须回到该卡片的可见菜单入口，而不是 BODY`);
+      assert.equal(await editable.locator('details.card-menu').evaluate(node=>node.open),false);
+    }
+    assert.equal(mutations(),before,'打开和关闭菜单不提交任务操作');
+  });
+  await step('任务菜单图标与文字齐全，悬停与键盘焦点显示禁用原因', async () => {
+    const menu=await openCardMenu(card('fixture-1'));
+    const tools=menu.locator('.card-menu-panel');
     assert.equal(await tools.getByRole('button').count(),4);
-    const bounds=await tools.getByRole('button').evaluateAll(nodes=>nodes.map(node=>({width:node.getBoundingClientRect().width,height:node.getBoundingClientRect().height,text:node.textContent.trim()})));
-    assert.ok(bounds.every(item=>item.width===bounds[0].width&&item.height===bounds[0].height&&item.text===''));
+    const bounds=await tools.getByRole('button').evaluateAll(nodes=>nodes.map(node=>({width:node.getBoundingClientRect().width,height:node.getBoundingClientRect().height,text:node.textContent.trim(),icon:!!node.querySelector('svg')})));
+    assert.ok(bounds.every(item=>item.width===bounds[0].width&&item.height===bounds[0].height&&item.height>=24&&item.text.length>0&&item.icon),'四个次要动作保留等宽尺寸、图标与可读标签');
     const edit=tools.getByRole('button',{name:'编辑任务'});assert.equal(await edit.isDisabled(),true);
     const hint=edit.locator('..');await hint.focus();
     assert.equal(await hint.evaluate(node=>getComputedStyle(node,'::after').visibility),'visible');
     assert.match(await hint.getAttribute('data-tooltip'),/请先停止录制/);
     await tools.getByRole('button',{name:'预览录制文件'}).hover();
     await h.shot('card-icon-toolbar');
+    await closeCardMenu(menu);
   });
   await step('TS 录后与录中预览实际播放，关闭后释放播放器', async () => {
     for(const live of [false,true]) {
       state.previewLive=live;
-      await card('fixture-1').getByRole('button',{name:'预览录制文件'}).click();const modal=dialog('录制预览');
+      await cardMenuAction(card('fixture-1'), '预览录制文件');const modal=dialog('录制预览');
       await visible(modal.getByLabel('录制视频预览'));
       assert.equal(await modal.locator('.directory-note,.modal-actions').count(),0);
       assert.equal(await modal.getByRole('button',{name:'转为 MP4',exact:true}).count(),0);
@@ -863,7 +967,7 @@ try {
     state.previewLive=false;
   });
   await step('全屏内操作及退出全屏保持同一个预览和播放位置', async () => {
-    await card('fixture-1').getByRole('button',{name:'预览录制文件'}).click();const modal=dialog('录制预览');
+    await cardMenuAction(card('fixture-1'), '预览录制文件');const modal=dialog('录制预览');
     await page.waitForFunction(()=>document.querySelector('video')?.readyState>=2);
     const source=await modal.locator('.media-preview').getAttribute('data-path');
     await modal.getByRole('button',{name:'暂停',exact:true}).click();
@@ -880,7 +984,7 @@ try {
     await modal.getByRole('button',{name:'关闭对话框',exact:true}).click();await hidden(modal);
   });
   await step('悬浮预览跨页保留同一播放器，设置可操作并支持暂停恢复', async () => {
-    await card('fixture-1').getByRole('button',{name:'预览录制文件'}).click();const modal=dialog('录制预览');
+    await cardMenuAction(card('fixture-1'), '预览录制文件');const modal=dialog('录制预览');
     await page.waitForFunction(()=>document.querySelector('video')?.currentTime>.2);
     const original=await page.locator('video').evaluate(v=>{window.miniPreviewVideo=v;return {time:v.currentTime,loads:v.dataset.segmentLoads};});
     await modal.getByRole('button',{name:'最小化预览',exact:true}).click();
@@ -914,7 +1018,7 @@ try {
   await step('任务预览同步改名和下播，删除后取消轮询且迟到结果不复活', async () => {
     const rec={...seedRecordings()[0],recId:'preview-state-regression',streamerName:'预览同步回归'};
     state.recordings.push(rec);h.emit('update',rec);await navigate('录制任务');
-    await visible(card(rec.recId));await card(rec.recId).getByRole('button',{name:'预览录制文件',exact:true}).click();
+    await visible(card(rec.recId));await cardMenuAction(card(rec.recId), '预览录制文件');
     const modal=dialog('录制预览');await page.waitForFunction(()=>document.querySelector('video')?.currentTime>.1);
     await modal.getByRole('button',{name:'暂停',exact:true}).click();
     const before=await page.locator('video').evaluate(v=>{window.synchronizedPreview=v;return v.currentTime;});
@@ -939,7 +1043,7 @@ try {
     const rec={...seedRecordings()[0],recId:'preview-timeout-regression',streamerName:'预览超时恢复'};
     state.recordings.push(rec);h.emit('update',rec);await navigate('录制任务');await visible(card(rec.recId));
     const endpoint='/api/recordings/'+rec.recId+'/files';h.delayNext('GET',endpoint,12500);
-    await card(rec.recId).getByRole('button',{name:'预览录制文件',exact:true}).click();const modal=dialog('录制预览');
+    await cardMenuAction(card(rec.recId), '预览录制文件');const modal=dialog('录制预览');
     await eventually(()=>modal.locator('[role="alert"]').count(),count=>count===1,'单次超时必须显示错误',14500);
     assert.equal(await modal.locator('.loading-state').count(),0);
     await eventually(()=>modal.locator('video').count(),count=>count===1,'下一次轮询恢复播放',6000);
@@ -973,17 +1077,17 @@ try {
     await h.shot('10-storage');
     await page.getByRole('button', { name: '音频', exact: true }).click();
     assert.equal(await page.locator('.file-table tbody tr').count(), 1);
-    await page.getByRole('button', { name: /^清晨片段.wav/ }).click();
+    await page.locator('.file-table tr[data-path="清晨片段.wav"]').getByRole('button', { name: '清晨片段.wav', exact: true }).click();
     const modal = dialog('媒体预览');
     await visible(modal.getByLabel('录制音频预览'));
     await page.waitForFunction(() => document.querySelector('audio')?.readyState >= 1);
     await modal.getByRole('button', { name: '关闭对话框' }).click(); await hidden(modal);
     assert.equal(await page.locator('audio').count(), 0);
     await page.getByRole('button', { name: '全部文件', exact: true }).click();
-    await page.getByRole('button', { name: /^云间电台.*文件夹/ }).click();
-    await visible(page.getByRole('button', { name: /^周末音乐.ts/ }));
+    await page.locator('.file-table tr[data-path="云间电台"]').getByRole('button', { name: '云间电台', exact: true }).click();
+    await visible(page.locator('.file-table tr[data-path="云间电台/周末音乐.ts"]').getByRole('button', { name: '周末音乐.ts', exact: true }));
     await page.getByRole('button', { name: '返回媒体库根目录' }).click();
-    await visible(page.getByRole('button', { name: /^录制说明.txt/ }));
+    await visible(page.locator('.file-table tr[data-path="录制说明.txt"]').getByRole('button', { name: '录制说明.txt', exact: true }));
   });
   await step('媒体库先返回目录，体积异步查询且不阻塞切页', async () => {
     state.storageSizeDelay=1800;
@@ -1003,7 +1107,7 @@ try {
     await modal.getByRole('button', { name: '取消', exact: true }).click();
     assert.ok(state.files.some((f) => f.name === '录制说明.txt'));
     await page.getByRole('button', { name: '回收录制说明.txt', exact: true }).click();
-    await modal.getByRole('button', { name: '移至回收站' }).click(); await hidden(modal);
+    await modal.getByRole('button', { name: '移到回收站', exact: true }).click(); await hidden(modal);
     await waitState(() => state.files.some((f) => f.name === '录制说明.txt'), (v) => !v, '模拟文件删除');
   });
   await step('媒体库转 MP4 显示状态并保留原 TS，拒绝同名覆盖', async () => {
@@ -1069,6 +1173,7 @@ try {
       active.stagePercent=58;h.emit('mediaJob',active);
       await waitState(()=>current.locator('progress').getAttribute('value'),v=>v==='58','校验进度刷新');
       assert.equal(await latest.getAttribute('data-instance-check'),'retained');
+      await openMediaHistory();
       await page.getByRole('button',{name:'展开全部记录',exact:true}).click();
       assert.equal(await page.locator('.media-history .media-job-row').count(),18);
       await page.getByRole('button',{name:'收起较早记录',exact:true}).click();
@@ -1083,6 +1188,7 @@ try {
       const failed=seedMediaJob({source:'retry-fixture.ts',output:'retry-fixture.mp4',state:'failed',message:'MP4 完整解码校验失败：reference picture missing；原 TS 保留'});
       state.mediaJobs=[failed];
       await go(page,h.base,'/storage');
+      await openMediaHistory();
       const row=page.locator('.media-job-row[data-state=failed]');
       await row.locator('summary').click();
       await visible(row.getByText(/reference picture missing/));
@@ -1115,6 +1221,7 @@ try {
       assert.equal(await compact.locator('.card-media-job-source').isVisible(),false,'路径不再占据卡片主体');
       assert.equal(await compact.locator('.media-job-heading').innerText(),'校验未通过 · 未清理源文件');
       await navigate('媒体库');
+      await openMediaHistory();
       const row=page.locator('.media-job-row[data-job-id="'+failed.id+'"]');
       await row.getByRole('button',{name:'保留 TS 重试',exact:true}).click();
       await waitState(()=>state.mediaJobs.at(-1)?.state,v=>v==='complete','手动重试成功');
@@ -1148,19 +1255,21 @@ try {
   await step('异步预览期间切页，不访问已销毁信号', async () => {
     await navigate('录制任务');
     h.delayNext('GET', '/api/recordings/fixture-1/files', 700);
-    await card('fixture-1').getByRole('button', { name: '预览录制文件' }).click();
+    await cardMenuAction(card('fixture-1'), '预览录制文件');
     await page.keyboard.press('Escape');
     await navigate('总览');
     await visible(page.getByRole('heading', { name: '录制工作台', exact: true }));
   });
   await step('区分解析不可用与后端断线，保留任务并自动恢复', async () => {
     state.resolverReady = false;
-    await visible(page.locator('.workbench-service').getByText('解析暂不可用', { exact: true }));
+    await visible(page.locator('.overview-service').getByText('解析暂不可用', { exact: true }));
+    await navigate('录制任务');
     assert.equal(await card('fixture-2').getByRole('button', { name: '单次录制', exact: true }).isDisabled(), true);
+    await navigate('总览');
     const count = state.recordings.length;
     h.setOffline(true);
     await visible(page.locator('.connection-banner'));
-    assert.equal(await page.locator('.recording-card').count(), Math.min(count, 6));
+    assert.equal(await page.locator('.overview-task-row').count(), Math.min(count, 6));
     h.setOffline(false); state.resolverReady = true;
     await hidden(page.locator('.connection-banner'));
     await visible(page.getByText('本地实时更新', { exact: true }));
@@ -1206,18 +1315,18 @@ try {
           const statusCount = requests('GET', '/api/status').length;
           latestGate.resolve(); await latestDone.promise;
           await visible(page.locator('.connection-banner'));
-          await hidden(page.locator('.skeleton-grid'));
+          await hidden(page.locator('.overview-loading'));
           if (newestFirst) await finishOld();
           await waitState(() => count, n => n >= 3, '最新快照失败后自动重试');
           assert.ok(requests('GET', '/api/status').length > statusCount, '重试前已读取健康状态');
           await visible(page.locator('.connection-banner'));
-          assert.equal(await page.locator('.skeleton-grid').count(), 0);
-          assert.equal(await page.locator('.recording-card').count(), 0, '旧快照不得冒充初始化成功');
+          assert.equal(await page.locator('.overview-loading').count(), 0);
+          assert.equal(await page.locator('.overview-task-row').count(), 0, '旧快照不得冒充初始化成功');
           await h.shot(`startup-error-${oldStatus}-${newestFirst ? 'latest-first' : 'old-first'}`);
           const jobsRestored = page.waitForResponse(response => new URL(response.url()).pathname === '/api/media/jobs' && response.status() === 200);
           recoveryGate.resolve();
           await jobsRestored;
-          await waitState(() => page.locator('.recording-card').count(), n => n === Math.min(state.recordings.length, 6), '快照真实加载成功后恢复列表');
+          await waitState(() => page.locator('.overview-task-row').count(), n => n === Math.min(state.recordings.length, 6), '快照真实加载成功后恢复列表');
           await hidden(page.locator('.connection-banner'));
           assert.deepEqual(routeErrors, []);
         } finally {
@@ -1230,7 +1339,7 @@ try {
   await step('媒体队列快照失败保留已有任务，健康状态不会提前清除错误', async () => {
     const pattern = '**/api/media/jobs', recoveryGate = Promise.withResolvers();
     const routeErrors = [];
-    const before = await page.locator('.recording-card').count();
+    const before = await page.locator('.overview-task-row').count();
     let count = 0;
     const handler = async route => {
       try {
@@ -1244,8 +1353,8 @@ try {
       await visible(page.locator('.connection-banner'));
       await waitState(() => count, n => n >= 2, '媒体队列失败后自动重试');
       await visible(page.locator('.connection-banner'));
-      assert.equal(await page.locator('.recording-card').count(), before);
-      assert.equal(await page.locator('.skeleton-grid').count(), 0);
+      assert.equal(await page.locator('.overview-task-row').count(), before);
+      assert.equal(await page.locator('.overview-loading').count(), 0);
       recoveryGate.resolve();
       await hidden(page.locator('.connection-banner'));
       assert.deepEqual(routeErrors, []);
@@ -1263,7 +1372,7 @@ try {
     await h.shot('native-shutdown-cancelled');
   });
   await step('真实视频画面截图、直播源预览与关闭清理',async()=>{
-    await navigate('录制任务');await card('fixture-1').getByRole('button',{name:'预览录制文件'}).click();const modal=dialog('录制预览');await visible(modal);
+    await navigate('录制任务');await cardMenuAction(card('fixture-1'), '预览录制文件');const modal=dialog('录制预览');await visible(modal);
     await page.waitForFunction(()=>document.querySelector('video')?.readyState>=2&&document.querySelector('video').videoWidth>0);
     const capture=modal.getByRole('button',{name:'保存截图',exact:true});
     const initialTheme=await page.locator('html').getAttribute('data-theme');
@@ -1312,18 +1421,24 @@ try {
       await h.shot('status-processing-english');
     } finally {state.mediaJobs=languageJobs;await go(page,h.base,'/recordings');}
     await page.keyboard.press('Control+5');await page.getByRole('button',{name:'Check for updates',exact:true}).click();
-    const release = page.getByRole('link', { name: apiContracts.updateCheck.release.tag_name, exact: true });
-    await visible(release);assert.equal(await release.getAttribute('href'),apiContracts.updateCheck.release.html_url);assert.equal(requests('GET','/api/tools/update').length,1);
+    const release = page.locator('a.about-release-link');
+    await visible(release);
+    assert.equal(await release.locator('strong').innerText(),apiContracts.updateCheck.release.tag_name);
+    await visible(release.getByText('View release notes',{exact:true}));
+    assert.equal(await release.getAttribute('href'),apiContracts.updateCheck.release.html_url);assert.equal(requests('GET','/api/tools/update').length,1);
     await page.keyboard.press('Control+,');await page.getByRole('button',{name:'Appearance and window',exact:true}).click();await page.getByRole('combobox',{name:'Interface language',exact:true}).selectOption('zh_CN');await waitState(()=>page.locator('html').getAttribute('lang'),value=>value==='zh-CN','恢复中文');
     assert.equal(state.requests.filter(request=>/\/(check|start)$/.test(request.path)).length,checks,'切页和重载不触发额外平台检查');
   });
   await step('工作台突出录制方案、实时耗时和待处理任务',async()=>{
     await navigate('总览');
-    await visible(page.getByRole('heading',{name:'当前录制方案',exact:true}));
-    await visible(page.getByText('转 MP4 · 校验后清理 TS',{exact:true}));
+    const policy = page.locator('details.overview-policy');
+    await visible(policy.locator('summary').getByText('当前录制方案', {exact:true}));
+    await policy.locator('summary').click();
+    assert.equal(await policy.evaluate(node => node.open), true);
+    await visible(policy.getByText('转 MP4 · 校验后清理 TS',{exact:true}));
     const selected=record('fixture-2');const original=structuredClone(selected);
     Object.assign(selected,{isRecording:false,recordingError:'工作台异常夹具'});h.emit('update',selected);
-    await waitState(()=>page.locator('.recording-card').first().getAttribute('data-rec-id'),id=>id==='fixture-2','失败任务置顶');
+    await waitState(()=>page.locator('.overview-task-row').first().getAttribute('data-rec-id'),id=>id==='fixture-2','工作台失败任务置顶');
     await h.shot('workbench-attention');
     await navigate('录制任务');await page.getByRole('button',{name:/^需关注/}).click();
     await visible(card('fixture-2'));assert.equal(await card('fixture-1').count(),0);
@@ -1353,9 +1468,9 @@ try {
     await visible(dialog('直播间信息').getByText('排队第 2 位 · 同平台请求间隔',{exact:true}));
     await page.keyboard.press('Escape');
     Object.assign(selected,{checkWaitReason:'cooldown',checkReadyAt:now+600});h.emit('update',selected);
-    await visible(card('fixture-2').locator('.badge').getByText('平台冷却中',{exact:true}));
+    await visible(card('fixture-2').locator('.card-state .ui-badge').getByText('平台冷却中',{exact:true}));
     await navigate('总览'); await visible(page.getByRole('region',{name:'检测队列',exact:true}));
-    assert.ok((await page.locator('.queue-overview').innerText()).includes('断流恢复'));
+    assert.ok((await page.locator('.overview-queue').innerText()).includes('断流恢复'));
     await navigate('偏好设置');await page.getByRole('button',{name:'网络与检测',exact:true}).click();
     const interval=page.getByRole('textbox',{name:/检测间隔/});await interval.fill('4500');
     await visible(page.getByText('4500 秒（75 分钟）',{exact:true}));
