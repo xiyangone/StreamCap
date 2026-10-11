@@ -124,15 +124,34 @@ macro_rules! tr_format { ($template:literal $(, $($rest:tt)*)?) => { $crate::app
 mod tests {
     use super::*;
     #[test]
-    fn embedded_verification_translations_are_complete() {
+    fn compact_workspace_labels_cover_both_languages_without_retired_themes() {
+        for key in ["直播间操作", "目录操作", "同名 MP4 已存在", "浅色", "深色"] {
+            assert!(EN
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| !value.is_empty() && value != key));
+        }
+        for key in ["跟随系统", "强调色", "晴空蓝", "鸢尾紫"] {
+            assert!(EN.get(key).is_none(), "retired option: {key}");
+        }
+    }
+
+    #[test]
+    fn preview_and_access_status_translations_are_complete() {
         for key in [
-            "待验证",
+            "验证受限",
+            "访问受限",
+            "小窗",
+            "小窗预览",
+            "切换小窗位置",
+            "小窗移到左侧",
+            "小窗移到右侧",
+            "预览来源",
+            "切换到录制文件",
+            "在媒体库查看文件",
             "检测异常",
-            "重新验证",
             "检测失败：{}",
-            "请在快手窗口完成验证",
-            "已打开快手验证窗口",
-            "等待手动验证",
+            "平台验证受限",
             "等待检测恢复",
             "有需要处理的任务，请查看下方提示。",
         ] {

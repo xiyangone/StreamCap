@@ -868,7 +868,6 @@ async fn update_cookies(
         .any(|key| crate::platforms::catalog::canonical_key(key) == "kuaishou")
     {
         state.resolver.kuaishou_session_changed().await;
-        state.store.emit("kuaishouSessionChanged", json!({}));
     }
     state.store.snack("Cookie 已保存");
     Ok(Json(json!({ "ok": true, "changed": changed })))

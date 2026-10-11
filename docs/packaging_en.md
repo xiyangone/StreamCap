@@ -59,7 +59,7 @@ The real-media runner uses a fresh profile, random API/CDP ports, listener ances
 
 Local events stay on one SSE connection with five-second heartbeats, a twenty-second watchdog and snapshot recovery; lag drops the stale broadcast backlog before resync. Switching to WebSocket does not provide upstream platform start notifications. Room detection retains user-configured intervals and platform backoff.
 
-Kuaishou 400002 preserves the official browser-inspection path rather than becoming HTTP 429. Visible human challenges take precedence over frequency text. Restricted pages remain visible for manual recovery without automatic reloads, including an inspection button during cooldown. Account-isolated application profiles persist across cookie refreshes; Edge profiles are not imported. Manual inspection has a thirty-second budget and one-window limit, never resets HTTP cooldown, and never starts a paused task. CAPTCHAs remain user-operated.
+Kuaishou uses native HTTP resolution and explicit QR login only. Business response 400002 means the current room content could not be read; it is neither HTTP 429 nor evidence that the room is offline. Manual CAPTCHA/browser-inspection windows, browser-cookie writeback and page-driven task recovery have been removed. Real HTTP rate limits still pause requests, and credential edits or login-session resets do not clear cooldowns. Access errors remain visible, QR login still requires explicit credential saving, and existing credentials or historical profiles are not deleted.
 
 Completed-file compatibility playback keeps one backpressured producer across the former 120-second boundary. Read-ahead targets thirty seconds and backward buffers are trimmed between thirty and sixty seconds, with possible network-block/decoder overshoot. Growing files still resume after the probed snapshot tail. Cold seeks retain decoder startup costs; arbitrary zero-latency seeking is not promised. Original media remains read-only.
 
@@ -67,7 +67,9 @@ Both verification scripts accept -ArtifactsDirectory pointing to a fresh project
 
 Committed room changes queue one paced check for monitored tasks, just like resuming monitoring. Cosmetic edits do not trigger extra platform requests. Normal checks retain the user interval: 4500 seconds means 75 minutes, not push-based detection. Paused, scheduled and notification-only behavior is preserved.
 
-Recording and library previews share one application-level panel. Minimize makes it a non-modal floating player that survives navigation; restore retains the decoder, position, pause and volume state. Closing releases preview resources without stopping recording. Native MP4 startup uses the actual first buffered timestamp rather than waiting at an unplayable zero timestamp.
+Recording and library previews share one application-level panel. Task cards and list rows expose Preview and Mini player directly, outside the overflow menu; active tasks on the overview also open the mini player directly. The floating player can switch between recordings and the existing live source, expand or close without starting a stream for every task. Navigation and expansion retain the decoder, position, pause and volume state. Closing releases preview resources without stopping recording. Native MP4 startup uses the actual first buffered timestamp rather than waiting at an unplayable zero timestamp.
+
+The overview has no right-hand machine-status, detection-queue or recording-policy panel; the library has no right-hand processing queue or history panel. Both use full-width content. Background queues and persistence are unchanged, and task cards retain processing progress and errors. Manual MP4 conversion from a library file row always keeps the source TS, regardless of the automatic cleanup preference.
 
 ## 2026-09-27 dependency update batch
 

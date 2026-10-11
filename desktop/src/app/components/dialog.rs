@@ -17,6 +17,7 @@ pub fn Dialog(
     let element = NodeRef::<html::Dialog>::new();
     let is_minimized = move || minimized.is_some_and(|value| value.get());
     let shown_minimized = StoredValue::new(false);
+    let docked_left = RwSignal::new(false);
     let close = move || {
         if !busy.is_some_and(|b| b.get_untracked()) {
             on_close.run(());
@@ -58,6 +59,7 @@ pub fn Dialog(
         <dialog node_ref=element class=if wide { "ui-modal-box modal modal-wide" } else { "ui-modal-box modal" }
             data-ui-component="dialog"
             class:preview-shell=minimized.is_some() class:modal-minimized=is_minimized
+            class:preview-docked-left=move || docked_left.get()
             aria-label=move || title.get() aria-modal=move || (!is_minimized()).to_string()
             aria-busy=move || busy.is_some_and(|value| value.get()).to_string()
             on:keydown=move |event: leptos::ev::KeyboardEvent| {
@@ -80,9 +82,18 @@ pub fn Dialog(
                 <div class="modal-header-actions">
                 {minimized.map(|value| view! {
                     <Show when=move || value.get() fallback=move || view! {
-                        <IconButton label=t("最小化预览") icon="minimize" on_click=Callback::new(move |_| value.set(true)) />
+                        <ActionButton label=t("小窗") aria_label=t("最小化预览").to_string()
+                            icon="picture-in-picture" variant="ghost" class="small preview-mode-button"
+                            on_click=Callback::new(move |_| value.set(true)) />
                     }>
-                        <IconButton label=t("恢复预览") icon="restore" on_click=Callback::new(move |_| value.set(false)) />
+                        <IconButton label=t("切换小窗位置") icon="arrow"
+                            aria_label=Signal::derive(move || if docked_left.get() { t("小窗移到右侧") } else { t("小窗移到左侧") }.to_string())
+                            on_click=Callback::new(move |_| docked_left.update(|left| *left = !*left))>
+                            {move || view! { <Icon name=if docked_left.get() { "arrow" } else { "back" } size=18 /> }}
+                        </IconButton>
+                        <ActionButton label=t("展开") aria_label=t("恢复预览").to_string()
+                            icon="restore" variant="ghost" class="small preview-mode-button"
+                            on_click=Callback::new(move |_| value.set(false)) />
                     </Show>
                 })}
                 <IconButton label=t("关闭对话框") icon="close"

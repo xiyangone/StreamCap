@@ -160,9 +160,24 @@ pub struct PreviewState {
 }
 impl PreviewState {
     pub fn open_recording(self, recording: Recording) {
-        self.minimized.set(false);
-        self.target
-            .set(Some(PreviewTarget::Recording(recording.rec_id)));
+        self.open_recording_window(recording, false);
+    }
+    pub fn open_recording_mini(self, recording: Recording) {
+        self.open_recording_window(recording, true);
+    }
+    fn open_recording_window(self, recording: Recording, minimized: bool) {
+        batch(move || {
+            if !matches!(self.target.get_untracked(), Some(PreviewTarget::Recording(id)) if id == recording.rec_id)
+            {
+                self.target
+                    .set(Some(PreviewTarget::Recording(recording.rec_id)));
+            }
+            self.minimized.set(minimized);
+        });
+    }
+    pub fn recording_is_open(self, rec_id: &str, minimized: bool) -> bool {
+        matches!(self.target.get(), Some(PreviewTarget::Recording(id)) if id == rec_id)
+            && self.minimized.get() == minimized
     }
     pub fn open_file(self, file: StorageItem) {
         self.minimized.set(false);
@@ -200,9 +215,25 @@ pub fn PreviewHost() -> impl IntoView {
     });
     let files = RwSignal::new(Vec::<RecordingFile>::new());
     let playing = RwSignal::new(String::new());
+    let live_source = RwSignal::new(false);
+    let last_file = RwSignal::new(String::new());
+    let select_path = Callback::new(move |path: String| {
+        if playing.get_untracked() != path {
+            playing.set(path);
+        }
+    });
+    Effect::new(move |_| {
+        let path = playing.get();
+        if !path.is_empty() && !path.starts_with("live:") {
+            last_file.set(path);
+        }
+    });
     Effect::new(move |_| {
         if target.get().is_some_and(|rec| !rec.is_live) && playing.get().starts_with("live:") {
-            playing.set(String::new());
+            batch(move || {
+                live_source.set(false);
+                playing.set(String::new());
+            });
         }
     });
     let loading = RwSignal::new(false);
@@ -244,6 +275,8 @@ pub fn PreviewHost() -> impl IntoView {
         revision.set(generation);
         files.set(Vec::new());
         playing.set(String::new());
+        last_file.set(String::new());
+        live_source.set(false);
         error.set(None);
         let Some(rec_id) = current_id else {
             if let Some(PreviewTarget::File(file)) = preview.target.get_untracked() {
@@ -298,7 +331,7 @@ pub fn PreviewHost() -> impl IntoView {
                                 playing.set(String::new());
                             }
                         }
-                        if playing.get_untracked().is_empty() {
+                        if playing.get_untracked().is_empty() && !live_source.get_untracked() {
                             playing.set(
                                 result
                                     .files
@@ -332,15 +365,40 @@ pub fn PreviewHost() -> impl IntoView {
         <Dialog open=Signal::derive(move || preview.target.get().is_some()) title=Signal::derive(move || if target.get().is_some() { t("录制预览") } else { t("媒体预览") }) wide=true minimized=preview.minimized on_close=Callback::new(move |_| preview.close())>
             <Show when=move || target.get().is_some()>
             <div class="preview-heading">
-                <div class="preview-context"><Icon name="video" size=21 /><div><span class="preview-eyebrow">{t("录制文件")}</span><p class="preview-title">{move || target.get().map(|rec| rec.name()).unwrap_or_default()}</p></div></div>
+                <div class="preview-context"><Icon name="video" size=21 /><div><span class="preview-eyebrow">{move || if live_source.get() { t("直播源") } else { t("录制文件") }}</span><p class="preview-title">{move || target.get().map(|rec| rec.name()).unwrap_or_default()}</p></div></div>
+                <Show when=move || target.get().is_some_and(|rec| rec.is_recording)>
+                    <span class="ui-badge ui-badge-sm badge recording"><i class="status-dot" />{t("录制中")}</span>
+                </Show>
+            </div>
+            <div class="preview-sources" role="group" aria-label=t("预览来源")>
+                <ActionButton label=t("录制文件") icon="file" class="small preview-source"
+                    aria_label=t("切换到录制文件").to_string()
+                    pressed=Signal::derive(move || Some(!live_source.get()))
+                    on_click=Callback::new(move |_| {
+                        let remembered = last_file.get_untracked();
+                        let path = files.with_untracked(|files| {
+                            files.iter().find(|file| file.path == remembered).or_else(|| files.first())
+                                .map(|file| file.path.clone()).unwrap_or_default()
+                        });
+                        batch(move || {
+                            live_source.set(false);
+                            select_path.run(path);
+                        });
+                    }) />
                 <Show when=move || target.get().is_some_and(|rec| rec.is_live)>
-                    <ActionButton label=t("预览直播源") icon="video" class="small"
+                    <ActionButton label=t("直播源") icon="video" class="small preview-source"
+                        aria_label=t("预览直播源").to_string()
                         title=t("直播源缓存有效期 5 分钟，过期后请先手动检测。预览不会新增录制文件。")
-                        pressed=Signal::derive(move || Some(playing.get().starts_with("live:")))
+                        pressed=Signal::derive(move || Some(live_source.get()))
                         disabled=Signal::derive(move || !state.status.get().ok)
                         on_click=Callback::new(move |_| {
                             if !state.status.get_untracked().ok { return; }
-                            if let Some(rec)=target.get_untracked().filter(|rec| rec.is_live) { playing.set(format!("live:{}",rec.rec_id)); }
+                            if let Some(rec)=target.get_untracked().filter(|rec| rec.is_live) {
+                                batch(move || {
+                                    live_source.set(true);
+                                    select_path.run(format!("live:{}",rec.rec_id));
+                                });
+                            }
                         }) />
                 </Show>
             </div>
@@ -361,7 +419,12 @@ pub fn PreviewHost() -> impl IntoView {
                             <li><ActionButton label=t("播放录制文件") icon="file" class="preview-file"
                                 aria_label=Signal::derive(move || crate::tr_format!("播放{}", file.get().map(|file| file.name).unwrap_or_default()))
                                 pressed=Signal::derive(move || Some(playing.get() == path.get_value()))
-                                on_click=Callback::new(move |_| playing.set(path.get_value()))>
+                                on_click=Callback::new(move |_| {
+                                    batch(move || {
+                                        live_source.set(false);
+                                        select_path.run(path.get_value());
+                                    });
+                                })>
                                 <span class="preview-file-name">{move || file.get().map(|file| file.name).unwrap_or_default()}</span>
                                 <small>{move || file.get().map(|file| human_size(file.size)).unwrap_or_default()}<br />
                                     {move || file.get().map(|file| crate::app::labels::modified_time(Some(file.modified))).unwrap_or_default()}</small>

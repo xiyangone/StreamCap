@@ -465,6 +465,189 @@ async fn settings_read_and_write_roundtrip() {
 }
 
 #[tokio::test]
+async fn settings_theme_roundtrip_persists_only_explicit_light_and_dark_changes() {
+    let (base, guard) = start_backend().await;
+    let client = reqwest::Client::new();
+    let workspace = Workspace::from_repo_root(guard.path());
+    let settings = get_json(&format!("{base}/api/settings")).await;
+    assert_eq!(settings["defaultConfig"]["theme_mode"], "light");
+    assert_eq!(settings["userConfig"]["theme_mode"], "light");
+    assert!(settings["defaultConfig"].get("theme_color").is_none());
+    assert!(settings["userConfig"].get("theme_color").is_none());
+    let mut expected: Value =
+        serde_json::from_slice(&std::fs::read(workspace.user_settings_path()).unwrap()).unwrap();
+    let defaults_before = std::fs::read(workspace.default_settings_path()).unwrap();
+
+    for mode in ["dark", "light"] {
+        let response = client
+            .put(format!("{base}/api/settings"))
+            .json(&json!({"userConfig":{"theme_mode":mode}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["changed"],
+            json!(["theme_mode"])
+        );
+        let settings = get_json(&format!("{base}/api/settings")).await;
+        assert_eq!(settings["userConfig"]["theme_mode"], mode);
+        expected["theme_mode"] = json!(mode);
+        let persisted: Value =
+            serde_json::from_slice(&std::fs::read(workspace.user_settings_path()).unwrap())
+                .unwrap();
+        assert_eq!(persisted, expected);
+        let reloaded = streamcap_core::ConfigStore::load(workspace.clone()).unwrap();
+        assert_eq!(reloaded.get_str("theme_mode", "invalid"), mode);
+        assert!(reloaded.get("theme_color").is_none());
+        assert_eq!(
+            std::fs::read(workspace.default_settings_path()).unwrap(),
+            defaults_before
+        );
+    }
+}
+
+#[tokio::test]
+async fn settings_theme_rejects_system_invalid_values_and_accent_writes_atomically() {
+    let (base, guard) = start_backend().await;
+    let client = reqwest::Client::new();
+    let path = guard.path().join("config/user_settings.json");
+    let before = std::fs::read(&path).unwrap();
+    let settings_before = get_json(&format!("{base}/api/settings")).await;
+    for patch in [
+        json!({"theme_mode":"system","language":"en"}),
+        json!({"theme_mode":"sepia","language":"en"}),
+        json!({"theme_mode":"","language":"en"}),
+        json!({"theme_mode":true,"language":"en"}),
+        json!({"theme_mode":42,"language":"en"}),
+        json!({"theme_mode":null,"language":"en"}),
+        json!({"theme_color":"blue","theme_mode":"dark","language":"en"}),
+        json!({"theme_color":"red","theme_mode":"dark","language":"en"}),
+        json!({"theme_color":null,"theme_mode":"dark","language":"en"}),
+        json!({"theme_color":false,"theme_mode":"dark","language":"en"}),
+        json!({"theme_color":{},"theme_mode":"dark","language":"en"}),
+    ] {
+        let response = client
+            .put(format!("{base}/api/settings"))
+            .json(&json!({"userConfig":patch}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            get_json(&format!("{base}/api/settings")).await,
+            settings_before
+        );
+    }
+}
+
+#[tokio::test]
+async fn settings_theme_legacy_reads_ignore_accents_without_migrating_stored_preferences() {
+    for legacy_mode in [
+        json!("system"),
+        json!("sepia"),
+        json!(""),
+        Value::Null,
+        json!(true),
+        json!(42),
+        json!({}),
+    ] {
+        let guard = tempfile::tempdir().unwrap();
+        let workspace = Workspace::from_repo_root(guard.path());
+        seed_defaults(&workspace);
+        let defaults = json!({
+            "theme_mode":legacy_mode.clone(),
+            "theme_color":"purple",
+            "extension_default":{"keep":true}
+        });
+        let mut stored = json!({
+            "theme_mode":legacy_mode,
+            "theme_color":"red",
+            "video_format":"TS",
+            "language":"zh_CN",
+            "extension_setting":{"keep":["unchanged",42]}
+        });
+        let defaults_before = serde_json::to_vec_pretty(&defaults).unwrap();
+        let settings_before = serde_json::to_vec_pretty(&stored).unwrap();
+        std::fs::write(workspace.default_settings_path(), &defaults_before).unwrap();
+        std::fs::write(workspace.user_settings_path(), &settings_before).unwrap();
+        let state = bootstrap(workspace.clone()).await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = router(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = reqwest::Client::new();
+
+        let settings = get_json(&format!("{base}/api/settings")).await;
+        assert_eq!(settings["defaultConfig"]["theme_mode"], "light");
+        assert_eq!(settings["userConfig"]["theme_mode"], "light");
+        assert!(settings["defaultConfig"].get("theme_color").is_none());
+        assert!(settings["userConfig"].get("theme_color").is_none());
+        assert_eq!(
+            settings["defaultConfig"]["extension_default"],
+            defaults["extension_default"]
+        );
+        assert_eq!(
+            settings["userConfig"]["extension_setting"],
+            stored["extension_setting"]
+        );
+        {
+            let config = state.config.read().await;
+            assert_eq!(config.get("theme_mode"), Some(&json!("light")));
+            assert!(config.get("theme_color").is_none());
+        }
+        assert_eq!(
+            std::fs::read(workspace.user_settings_path()).unwrap(),
+            settings_before
+        );
+        assert_eq!(
+            std::fs::read(workspace.default_settings_path()).unwrap(),
+            defaults_before
+        );
+
+        for patch in [json!({"video_format":"MKV"}), json!({"theme_mode":"light"})] {
+            let response = client
+                .put(format!("{base}/api/settings"))
+                .json(&json!({"userConfig":patch}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            assert_eq!(
+                response.json::<Value>().await.unwrap()["changed"],
+                json!(patch.as_object().unwrap().keys().collect::<Vec<_>>())
+            );
+            stored
+                .as_object_mut()
+                .unwrap()
+                .extend(patch.as_object().unwrap().clone());
+            let persisted: Value =
+                serde_json::from_slice(&std::fs::read(workspace.user_settings_path()).unwrap())
+                    .unwrap();
+            assert_eq!(persisted, stored);
+            assert_eq!(
+                std::fs::read(workspace.default_settings_path()).unwrap(),
+                defaults_before
+            );
+            let settings = get_json(&format!("{base}/api/settings")).await;
+            assert_eq!(settings["userConfig"]["theme_mode"], "light");
+            assert!(settings["userConfig"].get("theme_color").is_none());
+            assert_eq!(
+                settings["userConfig"]["extension_setting"],
+                stored["extension_setting"]
+            );
+        }
+
+        streamcap_core::api::shutdown(&state).await.unwrap();
+        server.abort();
+        let _ = server.await;
+    }
+}
+
+#[tokio::test]
 async fn settings_only_broadcast_changed_inherited_tasks_and_skip_noop_updates() {
     let directory = tempfile::tempdir().unwrap();
     let workspace = Workspace::from_repo_root(directory.path());

@@ -6,7 +6,6 @@ fn main() {
             "desktop_close_choice",
             "desktop_theme",
             "desktop_smoke_tray_quit",
-            "desktop_kuaishou_verification",
         ]),
     ))
     .expect("Tauri build and command permission generation failed");

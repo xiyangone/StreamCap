@@ -17,13 +17,37 @@ const fetchFixture = route => {
   // Route.fetch bypasses context routing; never contact the application's default port.
   return route.fetch({ url: h.base + url.pathname + url.search, maxRedirects: 0, timeout: 5000 });
 };
-async function openMediaHistory() {
-  const history = page.locator('details.media-history');
-  const trigger = history.locator('summary').first();
-  await visible(trigger);
-  if (await history.getAttribute('open') === null) await trigger.click();
-  await waitState(() => history.evaluate(node => node.open), Boolean, '用户展开处理记录');
-  return history;
+async function openRecordingPreview(target) {
+  const button = target.getByRole('button', { name: '预览录制文件', exact: true });
+  await visible(button);
+  assert.equal(await target.locator('.card-menu-panel').getByRole('button', { name: '预览录制文件', exact: true }).count(), 0, '预览不再藏在二级菜单');
+  await button.click();
+}
+async function readFixtureJobs() {
+  const response = await fetch(h.base + '/api/media/jobs');
+  assert.equal(response.status, 200, '只读取当前隔离夹具的媒体队列');
+  return (await response.json()).jobs;
+}
+async function assertFullWidthPage(route) {
+  const home = route === '/home';
+  const container = page.locator(home ? '.home-page' : '.storage-page');
+  const removed = home
+    ? '.overview-aside, .overview-health, .overview-queue-section, .overview-policy'
+    : '.file-jobs-sidebar, .media-jobs, .media-history, .media-history-attention';
+  assert.equal(await container.locator(removed).count(), 0, '侧栏必须从 DOM 删除，而不是折叠或隐藏');
+  const surface = container.locator(home ? '.overview-main' : '.file-manager');
+  await visible(surface);
+  const outer = await container.boundingBox(), inner = await surface.boundingBox();
+  assert.ok(outer && inner && inner.width > 0);
+  assert.ok(Math.abs(inner.x - outer.x) <= 1 && Math.abs(inner.width - outer.width) <= 1, '主体占满页面宽度，不为已删除侧栏预留空列');
+  if (!home) {
+    const table = container.locator('.file-table');
+    await visible(table);
+    const tableBounds = await table.boundingBox(), viewport = await container.locator('.table-container').boundingBox();
+    assert.ok(viewport && Math.abs(viewport.width - (inner.width - 2)) <= 1, '文件表除面板边框外占满文件管理器');
+    const listClientWidth=await container.locator('.table-container').evaluate(node=>node.clientWidth);
+    if (inner.width >= 620) assert.ok(tableBounds && Math.abs(tableBounds.width - listClientWidth) <= 1, '桌面文件表除系统滚动槽外占满主体宽度');
+  }
 }
 let failure;
 async function step(name, action) {
@@ -70,15 +94,16 @@ try {
   await step('真实 WASM 启动、初始任务与 SSE 连接', async () => {
     await go(page, h.base, '/home');
     await waitState(() => page.locator('.overview-task-row').count(), (n) => n === 6, '工作台初始任务数量');
+    await assertFullWidthPage('/home');
     await visible(page.getByText('本地实时更新', { exact: true }));
     const layout = await inspectLayout(page);
     assert.equal(layout.dialogs, 0);
-    assert.equal(layout.surface.background, 'rgb(255, 255, 255)');
+    assert.equal(layout.surface.background, 'rgba(255, 255, 255, 0.76)');
     assert.ok(layout.surface.width > 0 && layout.surface.height > 0, '工作台实际承载区可见');
     assert.equal(layout.bodyOverflow, false);
     assert.equal(layout.contentOverflow, false);
     assert.deepEqual(layout.overflow, []);
-    assert.equal(layout.surface.backdrop, 'none');
+    assert.match(layout.surface.backdrop, /blur\(18px\)/);
     assert.equal(layout.baseFontSize, 16);
     assert.equal(layout.bodyFontSize, 14);
     assert.equal(layout.headingFontSize, 25);
@@ -86,14 +111,15 @@ try {
     await navigate('录制任务');
     await waitState(() => page.locator('.recording-card').count(), (n) => n === 6, '任务页显示同一初始集合');
   });
-  await step('快手冷却和登录受限仍保留人工检查入口', async () => {
+  await step('快手访问异常不再显示人工检查入口', async () => {
     const target=state.recordings[1];
     const saved=structuredClone(target);
     try {
-      for(const accessState of ['cooldown','loginRequired','pageCheck']) {
-        Object.assign(target,{platformKey:'kuaishou',isRecording:false,checkState:'idle',accessState,verificationRequired:false,checkError:'本地人工检查回归'});
+      for(const accessState of ['cooldown','loginRequired','unavailable']) {
+        Object.assign(target,{platformKey:'kuaishou',isRecording:false,checkState:'idle',accessState,verificationRequired:false,checkError:'本地访问受限回归'});
         h.emit('update',target);
-        await visible(card(target.recId).getByRole('button',{name:'检查页面',exact:true}));
+        assert.equal(await card(target.recId).getByRole('button',{name:/^(检查页面|重新验证)$/}).count(),0);
+        await visible(card(target.recId).getByText('检测失败：本地访问受限回归',{exact:true}));
       }
     } finally {Object.assign(target,saved);h.emit('update',target);}
   });
@@ -130,7 +156,7 @@ try {
     await page.route(pattern, handler);
     const modal = dialog('录制预览');
     try {
-      await cardMenuAction(card('fixture-1'), '预览录制文件');
+      await openRecordingPreview(card('fixture-1'));
       await visible(modal.locator('.loading-state'));
       await waitState(() => modal.locator('.preview-file').count(), n => n > 0, '慢响应首次预览列表');
       await hidden(modal.locator('.loading-state'));
@@ -178,7 +204,7 @@ try {
   });
   await step('旧媒体队列快照不能回退 SSE 已完成状态', async () => {
     const original = structuredClone(state.mediaJobs);
-    await cardMenuAction(card('fixture-1'), '预览录制文件');
+    await openRecordingPreview(card('fixture-1'));
     const modal = dialog('录制预览');
     await visible(modal.locator('.media-preview'));
     const source = await modal.locator('.media-preview').getAttribute('data-path');
@@ -214,7 +240,7 @@ try {
     await page.getByRole('button', { name: '切换到深色' }).click();
     await waitTheme(page, 'dark');
     const bg = await page.locator('body').evaluate((e) => getComputedStyle(e).backgroundColor);
-    assert.equal(bg, themeColors.dark.surface);
+    assert.equal(bg, themeColors.dark.canvas);
     await h.shot('02-home-dark');
     await page.getByRole('button', { name: '切换到浅色' }).click();
     await waitTheme(page, 'light');
@@ -431,41 +457,45 @@ try {
     await setSwitch(toggle,false);await page.locator('.settings-savebar').getByRole('button',{name:'保存修改'}).click();
     await waitState(()=>state.userConfig.convert_to_mp4,v=>v===false,'关闭转换设置');await hidden(page.locator('.settings-savebar'));
   });
-  await step('系统主题随系统实时变化，强调色与持久化', async () => {
+  await step('仅有亮暗主题，系统变化不改用户选择且不保留多强调色', async () => {
     await page.getByRole('button', { name: '外观与窗口', exact: true }).click();
-    await page.getByRole('button', { name: '跟随系统', exact: true }).click();
-    await waitState(() => state.userConfig.theme_mode, (v) => v === 'system', '主题保存');
+    assert.equal(await page.locator('.theme-option').count(), 2);
+    assert.equal(await page.getByRole('button', { name: '跟随系统', exact: true }).count(), 0);
+    assert.equal(await page.locator('.accent-options').count(), 0);
+    await page.getByRole('button', { name: '浅色', exact: true }).click();
+    await waitState(() => state.userConfig.theme_mode, (v) => v === 'light', '主题保存');
     await page.emulateMedia({ colorScheme: 'dark' });
+    await waitTheme(page, 'light');
+    await page.getByRole('button', { name: '深色', exact: true }).click();
     await waitTheme(page, 'dark');
     await visible(page.getByRole('button', { name: '切换到浅色' }));
     assert.equal(await page.evaluate(()=>typeof window.__TAURI__), 'undefined');
-    await page.getByRole('button', { name: '鸢尾紫' }).click();
-    await page.waitForFunction(() => document.documentElement.dataset.accent === 'purple');
-    await h.shot('08-settings-dark-purple');
+    assert.equal(await page.locator('html').getAttribute('data-accent'), null);
+    await h.shot('08-settings-dark-glass');
     await page.emulateMedia({ colorScheme: 'light' });
-    await waitTheme(page, 'light');
-    await page.getByRole('button', { name: '晴空蓝' }).click();
+    await waitTheme(page, 'dark');
     await page.getByRole('button', { name: '浅色', exact: true }).click();
     await waitState(() => state.userConfig.theme_mode, (v) => v === 'light', '浅色恢复');
   });
-  await step('快速切换主题和强调色串行合并，最后选择不会被旧写入覆盖', async () => {
+  await step('快速切换亮暗串行合并，最后选择不会被旧写入覆盖', async () => {
     const before = requests('PUT', '/api/settings').length;
     h.delayNext('PUT', '/api/settings', 900);
     await page.getByRole('button', { name: '深色', exact: true }).click();
     await waitState(() => requests('PUT', '/api/settings').length, count => count === before + 1, '首个外观请求在途');
-    await page.getByRole('button', { name: '鸢尾紫', exact: true }).click();
+    await page.getByRole('button', { name: '浅色', exact: true }).click();
+    await page.getByRole('button', { name: '深色', exact: true }).click();
     await page.getByRole('button', { name: '浅色', exact: true }).click();
     await waitTheme(page, 'light');
     await page.waitForTimeout(100);
     assert.equal(requests('PUT', '/api/settings').length, before + 1, '旧写入完成前不能发出并行写入');
-    await waitState(() => [state.userConfig.theme_mode, state.userConfig.theme_color].join('/'), value => value === 'light/purple', '最后外观持久化');
+    await waitState(() => requests('PUT', '/api/settings').length, count => count === before + 2, '旧写入结束后才发送最终主题');
+    await waitState(() => state.userConfig.theme_mode, value => value === 'light', '最后外观持久化');
     await page.waitForTimeout(120);
     assert.equal(requests('PUT', '/api/settings').length, before + 2, '中间外观应合并为最后一次选择');
     await waitTheme(page, 'light');
-    assert.equal(await page.locator('html').getAttribute('data-accent'), 'purple');
-    assert.deepEqual(await page.evaluate(() => JSON.parse(localStorage.getItem('streamcap.appearance'))), { theme: 'light', accent: 'purple' });
-    await page.getByRole('button', { name: '晴空蓝', exact: true }).click();
-    await waitState(() => state.userConfig.theme_color, value => value === 'blue', '恢复强调色');
+    assert.equal(await page.locator('html').getAttribute('data-accent'), null);
+    assert.deepEqual(await page.evaluate(() => JSON.parse(localStorage.getItem('streamcap.appearance'))), { theme: 'light' });
+    assert.ok(requests('PUT', '/api/settings').slice(before).every(request => !Object.hasOwn(request.body.userConfig, 'theme_color')), '外观保存不再写入强调色');
   });
   await step('窗口一体化、原生按钮、关闭取消与托盘偏好',async()=>{
     const bounds=await page.locator('.app-shell').boundingBox();assert.equal(bounds.x,0);assert.equal(bounds.y,0);
@@ -618,11 +648,11 @@ try {
     await visible(page.getByText('模拟 FFmpeg 启动失败', { exact: true }));
     assert.equal(record('fixture-5').isRecording, false);
   });
-  await step('快手待验证不冒充未开播或录制失败，并保留手动验证入口', async () => {
+  await step('快手验证受限不冒充未开播或录制失败，且不再打开验证窗口', async () => {
     const original=structuredClone(record('fixture-5'));
     Object.assign(record('fixture-5'),{platformKey:'kuaishou',platform:'快手直播',checkError:'快手需要完成滑块验证（400002）',verificationRequired:true,isLive:true,isRecording:false,recordingError:null});h.emit('update',record('fixture-5'));
-    await visible(card('fixture-5').getByText('待验证',{exact:true}));
-    await visible(card('fixture-5').getByText('请在快手窗口完成验证',{exact:true}));
+    await visible(card('fixture-5').getByText('验证受限',{exact:true}));
+    await visible(card('fixture-5').getByText('检测失败：快手需要完成滑块验证（400002）',{exact:true}));
     const attentionCount=state.recordings.filter(r=>!r.isRecording&&(r.verificationRequired||r.checkError||r.recordingError)).length;
     const attentionTab=page.getByRole('button',{name:/^需关注/});
     assert.ok((await attentionTab.innerText()).includes(String(attentionCount)));
@@ -630,7 +660,7 @@ try {
     await visible(card('fixture-5'));
     await navigate('总览');
     assert.equal(await page.locator('.overview-summary > div').filter({has:page.getByText('需关注',{exact:true})}).locator('dd').innerText(),String(attentionCount));
-    await visible(page.getByText('有需要处理的任务，请查看下方提示。',{exact:true}));
+    await visible(page.locator('.overview-task-row[data-rec-id="fixture-5"] .overview-task-detail').getByText('快手需要完成滑块验证（400002）',{exact:true}));
     assert.equal(await page.locator('.overview-task-row').first().getAttribute('data-rec-id'),'fixture-5');
     await navigate('录制任务');
     assert.equal(await card('fixture-5').getByRole('button',{name:'单次录制',exact:true}).isDisabled(),true);
@@ -638,27 +668,27 @@ try {
     assert.equal(await verificationMenu.getByRole('button',{name:'检测直播状态',exact:true}).isDisabled(),true);
     await closeCardMenu(verificationMenu);
     assert.equal(await card('fixture-5').locator('.card-recording-error').count(),0);
-    await card('fixture-5').getByRole('button',{name:'重新验证',exact:true}).click();
-    await waitState(()=>state.native.verification,v=>v?.active===true&&v.recId==='fixture-5','只打开当前快手验证入口');
-    await h.shot('kuaishou-verification-required');
+    assert.equal(await card('fixture-5').getByRole('button',{name:/^(检查页面|重新验证)$/}).count(),0);
+    assert.equal(state.native.calls.some(call=>call.command==='desktop_kuaishou_verification'),false,'访问错误不调用已移除的原生命令');
+    await h.shot('kuaishou-access-restricted');
     Object.assign(record('fixture-5'),original);h.emit('update',record('fixture-5'));
     await hidden(card('fixture-5').getByRole('button',{name:'重新验证',exact:true}));
   });
-  await step('限流、页面检查和登录提示不再冒充验证码', async () => {
+  await step('限流、访问受限和登录提示不再冒充验证码', async () => {
     const original=structuredClone(record('fixture-5'));
-    for(const [access,label,inspect] of [['cooldown','平台冷却中',true],['pageCheck','页面待检查',true],['loginRequired','需要登录',true],['loginPrompt','登录提示',true]]){
+    for(const [access,label] of [['cooldown','平台冷却中'],['unavailable','访问受限'],['loginRequired','需要登录'],['loginPrompt','登录提示']]){
       Object.assign(record('fixture-5'),{platformKey:'kuaishou',platform:'快手直播',accessState:access,checkError:'页面暂不可读',verificationRequired:false,isLive:true,isRecording:false,recordingError:null});h.emit('update',record('fixture-5'));
       await visible(card('fixture-5').getByText(label,{exact:true}));
       assert.equal(await card('fixture-5').getByRole('button',{name:'重新验证',exact:true}).count(),0);
       assert.equal(await card('fixture-5').getByText('请在快手窗口完成验证',{exact:true}).count(),0);
-      assert.equal(await card('fixture-5').getByRole('button',{name:'检查页面',exact:true}).count(),inspect?1:0);
+      assert.equal(await card('fixture-5').getByRole('button',{name:'检查页面',exact:true}).count(),0);
       assert.equal(record('fixture-5').isLive,true,'an unreadable page is not evidence of offline');
     }
     Object.assign(record('fixture-5'),original,{accessState:original.accessState??''});h.emit('update',record('fixture-5'));
   });
   await step('卡片操作区在列表和网格、宽窄窗口保持对齐', async () => {
-    for(const width of [1280,800,420]) {
-      await page.setViewportSize({width,height:960});
+    for(const [width,height] of [[1280,960],[800,600],[420,960]]) {
+      await page.setViewportSize({width,height});
       for(const list of [true,false]) {
         await page.getByRole('button',{name:list?'列表视图':'网格视图',exact:true}).click();
         const target=card('fixture-5');await target.scrollIntoViewIfNeeded();
@@ -677,12 +707,17 @@ try {
         const menu=await openCardMenu(target);
         const popup=await menu.locator('.card-menu-panel').evaluate(node=>{
           const box=node.getBoundingClientRect();
-          return {left:box.left,right:box.right,top:box.top,viewport:innerWidth,
-            rows:[...node.querySelectorAll('button')].map(button=>{const r=button.getBoundingClientRect();return {left:r.left,right:r.right,top:r.top,bottom:r.bottom};})};
+          const trigger=node.closest('.card-menu').querySelector('summary').getBoundingClientRect();
+          const viewport=node.closest('#main-content').getBoundingClientRect();
+          return {left:box.left,right:box.right,top:box.top,bottom:box.bottom,viewport:innerWidth,
+            trigger:{top:trigger.top,bottom:trigger.bottom},viewportTop:viewport.top,viewportBottom:viewport.bottom,
+            rows:[...node.querySelectorAll('button')].map(button=>{const r=button.getBoundingClientRect(),hit=document.elementFromPoint(r.x+r.width/2,r.y+r.height/2);return {left:r.left,right:r.right,top:r.top,bottom:r.bottom,hit:hit===button||button.contains(hit)};})};
         });
-        assert.equal(popup.rows.length,4);
+        assert.equal(popup.rows.length,3,'预览前置后，菜单只保留检测、编辑和移除');
+        assert.ok(popup.rows.every(row=>row.hit),'菜单操作不被相邻玻璃卡片遮挡');
         assert.ok(popup.left>=0&&popup.right<=popup.viewport+1,'菜单不得横向溢出窗口');
-        assert.ok(popup.top>=layout.tools[0].bottom,'展开的次要动作与主操作分区、不重叠');
+        assert.ok(popup.top>=popup.trigger.bottom||popup.bottom<=popup.trigger.top,'展开的次要动作与主操作分区、不重叠；同帧测量避免滚动前后坐标混用');
+        assert.ok(popup.top>=popup.viewportTop-1&&popup.bottom<=popup.viewportBottom+1,'菜单每一项都在主内容可视区内');
         assert.ok(Math.max(...popup.rows.map(row=>row.left))-Math.min(...popup.rows.map(row=>row.left))<=1,'菜单项目左侧对齐');
         assert.ok(Math.max(...popup.rows.map(row=>row.right))-Math.min(...popup.rows.map(row=>row.right))<=1,'菜单项目右侧对齐');
         for(let i=1;i<popup.rows.length;i++)assert.ok(popup.rows[i].top>=popup.rows[i-1].bottom-1,'菜单项目垂直排列且不重叠');
@@ -823,17 +858,16 @@ try {
         message:'MP4 已生成并校验，源 TS 已清理'});h.emit('mediaJob',job);
       await hidden(card(item.recId).locator('.card-media-job'));
       Object.assign(item,{isRecording:false,isLive:false,liveTitle:null});h.emit('update',item);
-      await visible(card(item.recId).locator('.card-media-job'));
-      assert.equal(await card(item.recId).locator('.card-media-job-source').textContent(),'历史目录/历史录像_2026-09-27.ts');
-      assert.equal(await card(item.recId).locator('.media-job-detail').innerText(),'耗时未知');
+      await hidden(card(item.recId).locator('.card-media-job'));
       assert.equal(await card(item.recId).locator('.card-state .ui-badge').innerText(),'等待开播');
       for(const width of [1280,420]) {
         await page.setViewportSize({width,height:900});
         for(const list of [true,false]) {
           await page.getByRole('button',{name:list?'列表视图':'网格视图',exact:true}).click();
           await card(item.recId).scrollIntoViewIfNeeded();
-          const layout=await card(item.recId).evaluate(el=>{const c=el.getBoundingClientRect(),m=el.querySelector('.card-media-job').getBoundingClientRect();return {inside:m.x>=c.x&&m.right<=c.right+1,overflow:document.documentElement.scrollWidth>innerWidth+1};});
-          assert.equal(layout.inside,true);assert.equal(layout.overflow,false);
+          assert.equal(await card(item.recId).locator('.card-media-job').count(),0);
+          const layout=await inspectLayout(page);
+          assert.equal(layout.contentOverflow,false);assert.deepEqual(layout.overflow,[]);
         }
       }
       await h.shot('status-history-narrow');
@@ -842,25 +876,32 @@ try {
       await page.setViewportSize({width:1280,height:900});await go(page,h.base,'/recordings');
     }
   });
-  await step('媒体库区分未知耗时、实测零耗时和缺失结束时间', async () => {
+  await step('已完成任务不论耗时数据是否完整都不显示完成描述，失败仍可查看', async () => {
     const originalJobs=structuredClone(state.mediaJobs);
+    const ids=['fixture-2','fixture-3','fixture-5'], originalRecords=ids.map(id=>structuredClone(record(id)));
     try {
-      const base={taskId:null,output:'history.mp4',state:'complete',message:'MP4 已生成并校验；原 TS 保留',
+      for(const id of ids)Object.assign(record(id),{isRecording:false});
+      const base={output:'history.mp4',state:'complete',message:'MP4 已生成并校验；原 TS 保留',
         sourceRemoved:false,deleteOriginal:false,elapsedSeconds:0,startedAt:null,finishedAt:null};
-      state.mediaJobs=[{...base,id:'unknown-time',source:'unknown.ts'},
-        {...base,id:'zero-time',source:'zero.ts',startedAt:100,finishedAt:100},
-        {...base,id:'saved-time',source:'saved.ts',startedAt:100,elapsedSeconds:7}];
-      await go(page,h.base,'/storage');
-      const history=page.locator('details.media-history');
-      await visible(history);
-      assert.equal(await history.getAttribute('open'),null,'完成记录默认折叠');
-      await openMediaHistory();
-      const row=source=>page.locator('.media-job-row').filter({hasText:source}).locator('.media-job-detail');
-      await visible(row('unknown.ts'));
-      assert.equal(await row('unknown.ts').innerText(),'耗时未知');
-      assert.equal(await row('zero.ts').innerText(),'耗时 00:00:00');
-      assert.equal(await row('saved.ts').innerText(),'耗时 00:00:07');
-    } finally {state.mediaJobs=originalJobs;await go(page,h.base,'/recordings');}
+      state.mediaJobs=[{...base,id:'unknown-time',taskId:ids[0],source:'unknown.ts'},
+        {...base,id:'zero-time',taskId:ids[1],source:'zero.ts',startedAt:100,finishedAt:100},
+        {...base,id:'saved-time',taskId:ids[2],source:'saved.ts',startedAt:100,elapsedSeconds:7}];
+      await go(page,h.base,'/recordings');
+      for(const id of ids){
+        const status=card(id).locator('.card-media-job');
+        await hidden(status);
+        assert.equal(await card(id).getByText('处理详情',{exact:true}).count(),0);
+      }
+      for(const [index,expected] of [[0,'耗时未知'],[1,'耗时 00:00:00'],[2,'耗时 00:00:07']]){
+        const job=state.mediaJobs[index];
+        Object.assign(job,{state:'failed',message:'转换失败，源 TS 保留'});h.emit('mediaJob',job);
+        const status=card(ids[index]).locator('.card-media-job');
+        await visible(status);
+        assert.equal(await status.locator('.media-job-detail').innerText(),expected);
+        await status.locator('summary').click();
+        await visible(status.getByText('转换失败，源 TS 保留',{exact:true}));
+      }
+    } finally {state.mediaJobs=originalJobs;for(const original of originalRecords)Object.assign(record(original.recId),original);await go(page,h.base,'/recordings');}
   });
   await step('录制、直播未录制和下播复核各归一类，旧直播状态不重复计数', async () => {
     const r=record('fixture-5'), original=structuredClone(r);
@@ -925,21 +966,21 @@ try {
   await step('任务菜单图标与文字齐全，悬停与键盘焦点显示禁用原因', async () => {
     const menu=await openCardMenu(card('fixture-1'));
     const tools=menu.locator('.card-menu-panel');
-    assert.equal(await tools.getByRole('button').count(),4);
+    assert.equal(await tools.getByRole('button').count(),3);
     const bounds=await tools.getByRole('button').evaluateAll(nodes=>nodes.map(node=>({width:node.getBoundingClientRect().width,height:node.getBoundingClientRect().height,text:node.textContent.trim(),icon:!!node.querySelector('svg')})));
-    assert.ok(bounds.every(item=>item.width===bounds[0].width&&item.height===bounds[0].height&&item.height>=24&&item.text.length>0&&item.icon),'四个次要动作保留等宽尺寸、图标与可读标签');
+    assert.ok(bounds.every(item=>item.width===bounds[0].width&&item.height===bounds[0].height&&item.height>=24&&item.text.length>0&&item.icon),'三个次要动作保留等宽尺寸、图标与可读标签');
     const edit=tools.getByRole('button',{name:'编辑任务'});assert.equal(await edit.isDisabled(),true);
     const hint=edit.locator('..');await hint.focus();
     assert.equal(await hint.evaluate(node=>getComputedStyle(node,'::after').visibility),'visible');
     assert.match(await hint.getAttribute('data-tooltip'),/请先停止录制/);
-    await tools.getByRole('button',{name:'预览录制文件'}).hover();
+    await tools.getByRole('button',{name:'检测直播状态'}).hover();
     await h.shot('card-icon-toolbar');
     await closeCardMenu(menu);
   });
   await step('TS 录后与录中预览实际播放，关闭后释放播放器', async () => {
     for(const live of [false,true]) {
       state.previewLive=live;
-      await cardMenuAction(card('fixture-1'), '预览录制文件');const modal=dialog('录制预览');
+      await openRecordingPreview(card('fixture-1'));const modal=dialog('录制预览');
       await visible(modal.getByLabel('录制视频预览'));
       assert.equal(await modal.locator('.directory-note,.modal-actions').count(),0);
       assert.equal(await modal.getByRole('button',{name:'转为 MP4',exact:true}).count(),0);
@@ -967,7 +1008,7 @@ try {
     state.previewLive=false;
   });
   await step('全屏内操作及退出全屏保持同一个预览和播放位置', async () => {
-    await cardMenuAction(card('fixture-1'), '预览录制文件');const modal=dialog('录制预览');
+    await openRecordingPreview(card('fixture-1'));const modal=dialog('录制预览');
     await page.waitForFunction(()=>document.querySelector('video')?.readyState>=2);
     const source=await modal.locator('.media-preview').getAttribute('data-path');
     await modal.getByRole('button',{name:'暂停',exact:true}).click();
@@ -983,22 +1024,102 @@ try {
     await visible(modal);assert.equal(await modal.locator('.media-preview').getAttribute('data-path'),source);
     await modal.getByRole('button',{name:'关闭对话框',exact:true}).click();await hidden(modal);
   });
-  await step('悬浮预览跨页保留同一播放器，设置可操作并支持暂停恢复', async () => {
-    await cardMenuAction(card('fixture-1'), '预览录制文件');const modal=dialog('录制预览');
+  await step('无文件时也能一键打开小窗，键盘可展开关闭且不自动拉直播源', async () => {
+    const pattern='**/api/recordings/fixture-1/files';
+    const sourceRequests=requests('GET','/api/recordings/fixture-1/preview').length;
+    const handler=route=>route.fulfill({contentType:'application/json',body:JSON.stringify({dir:null,files:[]})});
+    await page.route(pattern,handler);
+    const modal=dialog('录制预览');
+    try {
+      const trigger=card('fixture-1').getByRole('button',{name:'小窗预览',exact:true});
+      await trigger.focus();await trigger.press('Enter');
+      await visible(modal.getByText('还没有录制文件',{exact:true}));
+      assert.equal(await modal.evaluate(el=>el.matches(':modal')),false);
+      assert.equal(await modal.locator('video').count(),0);
+      assert.equal(requests('GET','/api/recordings/fixture-1/preview').length,sourceRequests);
+      await modal.getByRole('button',{name:'恢复预览',exact:true}).press('Enter');
+      assert.equal(await modal.evaluate(el=>el.matches(':modal')),true);
+      await page.keyboard.press('Escape');await hidden(modal);
+      assert.equal(await page.evaluate(async()=> (await import('/media-player.js')).activePlayerCount()),0);
+    } finally {
+      if(await modal.isVisible())await modal.getByRole('button',{name:'关闭对话框',exact:true}).click();
+      await page.unroute(pattern,handler);
+    }
+  });
+  await step('小窗直接切换直播源与录像，单实例播放且关闭不停止录制', async () => {
+    const current=record('fixture-1'), wasLive=current.isLive;
+    current.isLive=true;h.emit('update',current);
+    const stops=requests('POST','/api/recordings/fixture-1/stop').length;
+    await card('fixture-1').getByRole('button',{name:'小窗预览',exact:true}).click();
+    const modal=dialog('录制预览');
+    await page.waitForFunction(()=>document.querySelector('video')?.readyState>=2);
+    const file=await modal.locator('.media-preview').getAttribute('data-path');
+    for(const width of [1280,800,375]){
+      await page.setViewportSize({width,height:900});
+      const box=await modal.boundingBox();
+      assert.ok(box.x>=0&&box.y>=0&&box.x+box.width<=width+1&&box.y+box.height<=900,'小窗始终位于窗口内');
+      await visible(modal.getByRole('button',{name:'恢复预览',exact:true}));
+      await visible(modal.getByRole('button',{name:'预览直播源',exact:true}));
+      await visible(modal.getByRole('button',{name:'切换到录制文件',exact:true}));
+    }
+    await page.setViewportSize({width:1280,height:900});
+    await modal.getByRole('button',{name:'预览直播源',exact:true}).click();
+    await waitState(()=>modal.locator('.media-preview').getAttribute('data-path'),v=>v==='live:fixture-1','小窗内切换直播源');
+    await waitState(()=>modal.locator('.preview-eyebrow').textContent(),v=>v==='直播源','来源标题跟随实际播放内容');
+    await page.waitForFunction(()=>document.querySelector('video')?.readyState>=2);
+    assert.equal(await modal.evaluate(el=>el.matches(':modal')),false);
+    assert.equal(await page.evaluate(async()=> (await import('/media-player.js')).activePlayerCount()),1);
+    await modal.getByRole('button',{name:'切换到录制文件',exact:true}).click();
+    await waitState(()=>modal.locator('.media-preview').getAttribute('data-path'),v=>v===file,'回到原录制文件');
+    await waitState(()=>modal.locator('.preview-eyebrow').textContent(),v=>v==='录制文件','切回录像后恢复来源标题');
+    await page.waitForFunction(()=>document.querySelector('video')?.readyState>=2);
+    await modal.getByRole('button',{name:'暂停',exact:true}).click();
+    await page.locator('video').evaluate(v=>{window.sameTargetPreview=v;});
+    await openRecordingPreview(card('fixture-1'));
+    assert.equal(await modal.evaluate(el=>el.matches(':modal')),true);
+    assert.equal(await page.locator('video').evaluate(v=>v===window.sameTargetPreview&&v.paused),true,'同目标预览按钮只展开，不重载');
+    await modal.getByRole('button',{name:'关闭对话框',exact:true}).click();await hidden(modal);
+    assert.equal(await page.evaluate(async()=> (await import('/media-player.js')).activePlayerCount()),0);
+    await waitState(()=>state.activePreviews,n=>n===0,'关闭小窗释放媒体连接');
+    assert.equal(requests('POST','/api/recordings/fixture-1/stop').length,stops);
+    current.isLive=wasLive;h.emit('update',current);
+  });
+  await step('一键小窗跨页保留同一播放器，重复打开不重载，设置仍可操作', async () => {
+    const mutationsBefore=state.requests.filter(r=>/^(POST|PUT|DELETE|PATCH)$/.test(r.method)).length;
+    const miniButton=card('fixture-1').getByRole('button',{name:'小窗预览',exact:true});
+    await visible(miniButton);await miniButton.click();const modal=dialog('录制预览');
     await page.waitForFunction(()=>document.querySelector('video')?.currentTime>.2);
     const original=await page.locator('video').evaluate(v=>{window.miniPreviewVideo=v;return {time:v.currentTime,loads:v.dataset.segmentLoads};});
-    await modal.getByRole('button',{name:'最小化预览',exact:true}).click();
+    assert.equal(await miniButton.getAttribute('aria-pressed'),'true');
+    await miniButton.click();
+    assert.equal(await page.locator('video').evaluate(v=>v===window.miniPreviewVideo),true,'重复点击同一目标不重建播放器');
+    assert.equal(await page.evaluate(async()=> (await import('/media-player.js')).activePlayerCount()),1);
+    assert.equal(state.requests.filter(r=>/^(POST|PUT|DELETE|PATCH)$/.test(r.method)).length,mutationsBefore,'预览不启动或修改录制任务');
+    await visible(modal.getByRole('button',{name:'恢复预览',exact:true}));
     await page.waitForFunction(()=>document.querySelector('.preview-shell')?.getAttribute('aria-modal')==='false');
     assert.equal(await modal.evaluate(node=>node.matches(':modal')),false);
+    await h.shot('one-click-mini-preview');
     await navigate('偏好设置');await page.getByRole('button',{name:'网络与检测',exact:true}).click();
     const interval=page.getByRole('textbox',{name:/检测间隔/});const saved=await interval.inputValue();
     await interval.fill('31');assert.equal(await interval.inputValue(),'31');await interval.fill(saved);
     await page.waitForFunction(time=>{const v=document.querySelector('video');return v===window.miniPreviewVideo&&!v.paused&&v.currentTime>time+.1;},original.time);
     await modal.getByRole('button',{name:'暂停',exact:true}).click();
     const paused=await page.locator('video').evaluate(v=>v.currentTime);
-    await page.setViewportSize({width:620,height:760});
-    const box=await modal.boundingBox();assert.ok(box.x>=0&&box.y>=0&&box.x+box.width<=620&&box.y+box.height<=760);
-    await h.shot('mini-preview-settings-narrow');await page.setViewportSize({width:1280,height:900});
+    for(const [width,height] of [[800,600],[620,760]]) {
+      await page.setViewportSize({width,height});
+      const box=await modal.boundingBox();assert.ok(box.x>=0&&box.y>=0&&box.x+box.width<=width&&box.y+box.height<=height);
+      await h.shot('mini-preview-settings-right-'+width);
+      await modal.getByRole('button',{name:'小窗移到左侧',exact:true}).press('Enter');
+      await page.waitForFunction(()=>document.querySelector('.preview-shell')?.classList.contains('preview-docked-left'));
+      const moved=await modal.boundingBox();assert.ok(moved.x>=0&&moved.x<box.x&&moved.y>=0&&moved.x+moved.width<=width&&moved.y+moved.height<=height);
+      assert.equal(await page.locator('video').evaluate(v=>v===window.miniPreviewVideo&&v.paused),true,'停靠不重建播放器或恢复暂停的视频');
+      assert.equal(await page.evaluate(async()=>(await import('/media-player.js')).activePlayerCount()),1);
+      assert.ok(Math.abs(await page.locator('video').evaluate(v=>v.currentTime)-paused)<.1);
+      await interval.click({timeout:5000});assert.equal(await interval.evaluate(el=>el===document.activeElement),true,'切换停靠后可以用鼠标点击原本被遮挡的设置字段');
+      await h.shot('mini-preview-settings-left-'+width);
+      await modal.getByRole('button',{name:'小窗移到右侧',exact:true}).click();
+    }
+    await page.setViewportSize({width:1280,height:900});
     await modal.getByRole('button',{name:'恢复预览',exact:true}).click();
     assert.equal(await modal.evaluate(node=>node.matches(':modal')),true);
     assert.equal(await page.locator('video').evaluate(v=>v===window.miniPreviewVideo&&v.paused),true);
@@ -1018,7 +1139,7 @@ try {
   await step('任务预览同步改名和下播，删除后取消轮询且迟到结果不复活', async () => {
     const rec={...seedRecordings()[0],recId:'preview-state-regression',streamerName:'预览同步回归'};
     state.recordings.push(rec);h.emit('update',rec);await navigate('录制任务');
-    await visible(card(rec.recId));await cardMenuAction(card(rec.recId), '预览录制文件');
+    await visible(card(rec.recId));await openRecordingPreview(card(rec.recId));
     const modal=dialog('录制预览');await page.waitForFunction(()=>document.querySelector('video')?.currentTime>.1);
     await modal.getByRole('button',{name:'暂停',exact:true}).click();
     const before=await page.locator('video').evaluate(v=>{window.synchronizedPreview=v;return v.currentTime;});
@@ -1043,7 +1164,7 @@ try {
     const rec={...seedRecordings()[0],recId:'preview-timeout-regression',streamerName:'预览超时恢复'};
     state.recordings.push(rec);h.emit('update',rec);await navigate('录制任务');await visible(card(rec.recId));
     const endpoint='/api/recordings/'+rec.recId+'/files';h.delayNext('GET',endpoint,12500);
-    await cardMenuAction(card(rec.recId), '预览录制文件');const modal=dialog('录制预览');
+    await openRecordingPreview(card(rec.recId));const modal=dialog('录制预览');
     await eventually(()=>modal.locator('[role="alert"]').count(),count=>count===1,'单次超时必须显示错误',14500);
     assert.equal(await modal.locator('.loading-state').count(),0);
     await eventually(()=>modal.locator('video').count(),count=>count===1,'下一次轮询恢复播放',6000);
@@ -1074,6 +1195,7 @@ try {
   await step('媒体库筛选、目录导航与真正的内嵌音频加载', async () => {
     await navigate('媒体库');
     await waitState(() => page.locator('.file-table tbody tr').count(), (n) => n === 4, '根目录文件');
+    await assertFullWidthPage('/storage');
     await h.shot('10-storage');
     await page.getByRole('button', { name: '音频', exact: true }).click();
     assert.equal(await page.locator('.file-table tbody tr').count(), 1);
@@ -1119,18 +1241,45 @@ try {
     const convert=page.getByRole('button',{name:'转为MP4：海边日落.ts',exact:true});
     assert.equal(await convert.isDisabled(),true);assert.match(await convert.innerText(),/转 MP4/);
     assert.equal(await convert.getAttribute('title'),'同名 MP4 已存在');
+    const row=page.locator('.file-table tr[data-path="海边日落.ts"]');
+    const control=row.locator('.file-convert-control'), hint=control.getByRole('tooltip');
+    await page.getByRole('heading',{name:'媒体库',exact:true}).hover();
+    await hidden(hint);
+    const height=(await row.boundingBox()).height;
+    await control.hover();await visible(hint);
+    assert.equal((await row.boundingBox()).height,height,'悬停提示不撑高文件行');
+    await page.getByRole('heading',{name:'媒体库',exact:true}).hover();
+    await control.focus();await visible(hint);
+    assert.equal(await control.getAttribute('aria-label'),'同名 MP4 已存在');
+    assert.equal(await row.locator('.file-action-hint').count(),0);
+    await page.getByRole('button',{name:'刷新文件',exact:true}).focus();
+    await hidden(hint);
+    await h.shot('storage-compact-no-overwrite');
   });
-  await step('完整后处理队列保留超过八项任务并显示阶段进度', async () => {
+  await step('媒体库不展示侧栏，后台仍保留超过八项队列且任务卡显示进度', async () => {
     const original=structuredClone(state.mediaJobs);
     try {
+      state.mediaJobs=[];
       for(let i=0;i<12;i++){
-        const job={id:'full-queue-'+i,taskId:null,source:'queue-fixture-'+i+'.ts',output:'queue-fixture-'+i+'.mp4',state:i===0?'running':'waiting',deleteOriginal:false,sourceRemoved:false,message:i===0?'正在无损转封装为 MP4':'等待转 MP4；原 TS 保留',stagePercent:i===0?37:null,stageEtaSeconds:i===0?5:null,startedAt:i===0?Math.floor(Date.now()/1000)-2:null,finishedAt:null,elapsedSeconds:2,queuePosition:i===0?null:i};
-        state.mediaJobs.push(job);h.emit('mediaJob',job);
+        const job={id:'full-queue-'+i,taskId:i===0?'fixture-5':i===11?'fixture-6':null,source:'queue-fixture-'+i+'.ts',output:'queue-fixture-'+i+'.mp4',state:i===0?'running':'waiting',deleteOriginal:false,sourceRemoved:false,message:i===0?'正在无损转封装为 MP4':'等待转 MP4；原 TS 保留',stagePercent:i===0?37:null,stageEtaSeconds:i===0?5:null,startedAt:i===0?Math.floor(Date.now()/1000)-2:null,finishedAt:null,elapsedSeconds:2,queuePosition:i===0?null:i};
+        state.mediaJobs.push(job);
       }
-      await navigate('媒体库');
-      await waitState(()=>page.locator('.media-job-row').filter({hasText:'queue-fixture-'}).count(),n=>n===12,'所有待处理任务保持可见');
-      await visible(page.getByText('本阶段 37%',{exact:false}));
-      assert.equal(await page.getByRole('progressbar',{name:'本阶段进度',exact:true}).getAttribute('value'),'37');
+      await go(page,h.base,'/storage');
+      await assertFullWidthPage('/storage');
+      const stored=await readFixtureJobs();
+      assert.deepEqual(stored.map(job=>job.id),state.mediaJobs.map(job=>job.id),'没有队列栏不截断后台快照');
+      assert.equal(stored.length,12);
+      await navigate('录制任务');
+      const active=card('fixture-5').locator('.card-media-job'), tail=card('fixture-6').locator('.card-media-job');
+      await waitState(()=>active.getAttribute('data-job-id'),id=>id==='full-queue-0','最早活动任务未丢失');
+      await waitState(()=>tail.getAttribute('data-job-id'),id=>id==='full-queue-11','第十二项仍进入客户端任务状态');
+      await visible(active.getByText('本阶段 37%',{exact:false}));
+      assert.equal(await active.getByRole('progressbar',{name:'本阶段进度',exact:true}).getAttribute('value'),'37');
+      assert.equal(await tail.locator('.media-job-detail').innerText(),'等待处理 · 第 11 位');
+      await page.reload({waitUntil:'domcontentloaded'});
+      await waitState(()=>active.getAttribute('data-job-id'),id=>id==='full-queue-0','重载后活动任务仍在');
+      await waitState(()=>tail.getAttribute('data-job-id'),id=>id==='full-queue-11','重载后等待任务仍在');
+      assert.equal((await readFixtureJobs()).length,12);
       await h.shot('full-media-queue');
     } finally {state.mediaJobs=original;h.emit('resync',{});}
   });
@@ -1154,46 +1303,59 @@ try {
       await h.shot('processing-segment-priority');
     } finally {state.mediaJobs=originalJobs;await go(page,h.base,'/storage');}
   });
-  await step('活动队列优先，历史按需展开且秒级时钟不重建历史', async () => {
+  await step('侧栏移除后保留完整历史快照，任务卡活动状态与计时节点稳定', async () => {
     const original=structuredClone(state.mediaJobs);
     try {
-      const active=seedMediaJob({id:'stable-active',state:'verifying',message:'正在校验 MP4 完整性',source:'active.ts',startedAt:Math.floor(Date.now()/1000)-10,stagePercent:45});
-      const history=Array.from({length:18},(_,i)=>seedMediaJob({id:'history-'+i,source:`history-${i}.ts`,state:'complete',message:'MP4 已生成并校验；原 TS 保留',startedAt:100,finishedAt:105}));
+      const active=seedMediaJob({id:'stable-active',taskId:'fixture-5',state:'verifying',message:'正在校验 MP4 完整性',source:'active.ts',startedAt:Math.floor(Date.now()/1000)-10,stagePercent:45});
+      const history=Array.from({length:18},(_,i)=>seedMediaJob({id:'history-'+i,taskId:'fixture-5',source:`history-${i}.ts`,state:'complete',message:'MP4 已生成并校验；原 TS 保留',startedAt:100,finishedAt:105}));
       state.mediaJobs=[active,...history];
       await go(page,h.base,'/storage');
-      const current=page.locator('.media-active-jobs .media-job-row').first();
+      await assertFullWidthPage('/storage');
+      const fileRow=page.locator('.file-table tbody tr').first();
+      await fileRow.evaluate(el=>el.setAttribute('data-instance-check','retained'));
+      active.stagePercent=49;h.emit('mediaJob',active);
+      await visible(page.locator('.file-table'));
+      assert.equal(await fileRow.getAttribute('data-instance-check'),'retained','进度更新不重建文件行');
+      await navigate('录制任务');
+      const current=card('fixture-5').locator('.card-media-job');
       await visible(current);
       assert.equal(await current.getAttribute('data-job-id'),active.id);
-      assert.equal(await page.locator('.media-history .media-job-row').count(),8);
-      const latest=page.locator('.media-history .media-job-row').first();
-      await latest.evaluate(el=>el.setAttribute('data-instance-check','retained'));
+      await current.locator('summary').click();
+      await current.evaluate(el=>el.setAttribute('data-instance-check','retained'));
       const clock=await current.locator('.media-job-detail').innerText();
       await waitState(()=>current.locator('.media-job-detail').innerText(),text=>text!==clock,'处理计时刷新');
-      assert.equal(await latest.getAttribute('data-instance-check'),'retained');
+      assert.equal(await current.getAttribute('data-instance-check'),'retained');
+      assert.equal(await current.locator('details').getAttribute('open'),'');
       active.stagePercent=58;h.emit('mediaJob',active);
       await waitState(()=>current.locator('progress').getAttribute('value'),v=>v==='58','校验进度刷新');
-      assert.equal(await latest.getAttribute('data-instance-check'),'retained');
-      await openMediaHistory();
-      await page.getByRole('button',{name:'展开全部记录',exact:true}).click();
-      assert.equal(await page.locator('.media-history .media-job-row').count(),18);
-      await page.getByRole('button',{name:'收起较早记录',exact:true}).click();
-      assert.equal(await page.locator('.media-history .media-job-row').count(),8);
+      assert.equal(await current.getAttribute('data-instance-check'),'retained');
+      assert.deepEqual((await readFixtureJobs()).filter(job=>job.id.startsWith('history-')),history,'18条完成记录仍保留在后台快照中');
+      await page.reload({waitUntil:'domcontentloaded'});
+      await waitState(()=>current.getAttribute('data-job-id'),id=>id===active.id,'重载后完成历史不遮住活动任务');
+      assert.equal((await readFixtureJobs()).length,19);
       await h.shot('processing-active-and-history');
     } finally {state.mediaJobs=original;await go(page,h.base,'/storage');}
   });
-  await step('失败原因可展开，重试不删源且不重复提交', async () => {
+  await step('任务卡显示失败原因，文件行重试保留 TS 且不重复提交', async () => {
     const jobs=structuredClone(state.mediaJobs), files=structuredClone(state.files);
     try {
       state.files.push({name:'retry-fixture.ts',path:'retry-fixture.ts',isDir:false,size:4096});
-      const failed=seedMediaJob({source:'retry-fixture.ts',output:'retry-fixture.mp4',state:'failed',message:'MP4 完整解码校验失败：reference picture missing；原 TS 保留'});
+      const failed=seedMediaJob({taskId:'fixture-5',source:'retry-fixture.ts',output:'retry-fixture.mp4',state:'failed',message:'MP4 完整解码校验失败：reference picture missing；原 TS 保留'});
       state.mediaJobs=[failed];
-      await go(page,h.base,'/storage');
-      await openMediaHistory();
-      const row=page.locator('.media-job-row[data-state=failed]');
-      await row.locator('summary').click();
-      await visible(row.getByText(/reference picture missing/));
+      await go(page,h.base,'/recordings');
+      const status=card('fixture-5').locator('.card-media-job');
+      await visible(status);
+      assert.equal(await status.getAttribute('data-state'),'failed');
+      await status.locator('summary').click();
+      await visible(status.getByText(/reference picture missing/));
+      await status.getByRole('link',{name:'在媒体库查看文件',exact:true}).click();
+      await assertFullWidthPage('/storage');
+      const convert=page.locator('.file-table tr[data-path="retry-fixture.ts"]').getByRole('button',{name:'转为MP4：retry-fixture.ts',exact:true});
       const before=requests('POST','/api/media/remux').length;
-      await row.getByRole('button',{name:'保留 TS 重试',exact:true}).click();
+      h.delayNext('POST','/api/media/remux',700);
+      await convert.click();
+      await waitState(()=>convert.isDisabled(),Boolean,'文件行提交期间禁用重复转换');
+      await convert.evaluate(button=>{button.click();button.click();});
       await waitState(()=>state.mediaJobs.at(-1)?.state,v=>v==='complete','保留源文件重试完成');
       const writes=requests('POST','/api/media/remux').slice(before);
       assert.equal(writes.length,1);
@@ -1201,6 +1363,11 @@ try {
       assert.notEqual(writes[0].body.deleteOriginal,true);
       assert.ok(state.files.some(file=>file.path==='retry-fixture.ts'));
       await visible(page.getByRole('button',{name:/^retry-fixture.mp4/}));
+      await assertFullWidthPage('/storage');
+      assert.ok((await readFixtureJobs()).some(job=>job.id===failed.id&&job.state==='failed'),'成功后后台仍保留失败记录');
+      await navigate('录制任务');
+      await hidden(status);
+      assert.ok((await readFixtureJobs()).some(job=>job.source==='retry-fixture.ts'&&job.state==='complete'),'成功结果保留在后台，不常驻任务行');
       await h.shot('processing-safe-retry');
     } finally {state.mediaJobs=jobs;state.files=files;await go(page,h.base,'/storage');}
   });
@@ -1221,18 +1388,17 @@ try {
       assert.equal(await compact.locator('.card-media-job-source').isVisible(),false,'路径不再占据卡片主体');
       assert.equal(await compact.locator('.media-job-heading').innerText(),'校验未通过 · 未清理源文件');
       await navigate('媒体库');
-      await openMediaHistory();
-      const row=page.locator('.media-job-row[data-job-id="'+failed.id+'"]');
-      await row.getByRole('button',{name:'保留 TS 重试',exact:true}).click();
+      await assertFullWidthPage('/storage');
+      await page.locator('.file-table tr[data-path="task-retry.ts"]').getByRole('button',{name:'转为MP4：task-retry.ts',exact:true}).click();
       await waitState(()=>state.mediaJobs.at(-1)?.state,v=>v==='complete','手动重试成功');
       const latest=state.mediaJobs.at(-1);
       assert.equal(latest.taskId,item.recId);
       assert.equal(latest.deleteOriginal,false);
       await navigate('录制任务');
-      await waitState(()=>compact.getAttribute('data-job-id'),id=>id===latest.id,'任务显示最新成功结果');
-      assert.equal(await compact.getAttribute('data-state'),'complete');
+      await hidden(compact);
+      assert.ok((await readFixtureJobs()).some(job=>job.id===latest.id&&job.state==='complete'),'完成记录保留，但不遮蔽当前录制状态');
       assert.equal(await card('fixture-6').locator('.card-media-job').getAttribute('data-job-id'),other.id);
-      assert.equal(state.mediaJobs.find(job=>job.id===failed.id).state,'failed','不改写旧记录的结果');
+      assert.equal((await readFixtureJobs()).find(job=>job.id===failed.id).state,'failed','不改写旧记录的结果');
       assert.ok(state.files.some(file=>file.path===source),'手动重试不删源');
       await h.shot('task-retry-reconciled');
     } finally {state.mediaJobs=jobs;state.files=files;Object.assign(item,original);await go(page,h.base,'/storage');}
@@ -1240,32 +1406,52 @@ try {
   await step('历史队列满额替换时仍刷新新 MP4 且保留活动任务', async () => {
     const jobs=structuredClone(state.mediaJobs), files=structuredClone(state.files);
     try {
-      const active=seedMediaJob({id:'keep-running',source:'running.ts',state:'running'});
+      const active=seedMediaJob({id:'keep-running',taskId:'fixture-5',source:'running.ts',state:'running'});
       const history=Array.from({length:255},(_,i)=>seedMediaJob({id:'rollover-'+i,source:`rollover-${i}.ts`,state:'complete'}));
       state.mediaJobs=[active,...history];
       await go(page,h.base,'/storage');
-      await visible(page.locator('.media-active-jobs [data-job-id=keep-running]'));
+      await assertFullWidthPage('/storage');
+      const before=await readFixtureJobs();
+      assert.equal(before.length,256);
+      assert.equal(before.find(job=>job.id===active.id).state,'running');
       const fresh=seedMediaJob({id:'new-published-output',source:'new-source.ts',output:'new-output.mp4',state:'complete'});
       state.files.push({name:'new-output.mp4',path:'new-output.mp4',isDir:false,size:2048});
       state.mediaJobs.splice(1,1);state.mediaJobs.push(fresh);h.emit('mediaJob',fresh);
       await visible(page.getByRole('button',{name:/^new-output.mp4/}));
-      await visible(page.locator('.media-active-jobs [data-job-id=keep-running]'));
+      const after=await readFixtureJobs();
+      assert.equal(after.length,before.length,'满额替换保持队列快照长度');
+      assert.equal(after.find(job=>job.id===active.id).state,'running','活动任务未随旧历史移除');
+      assert.ok(after.some(job=>job.id===fresh.id));
+      await assertFullWidthPage('/storage');
+      await navigate('录制任务');
+      const status=card('fixture-5').locator('.card-media-job');
+      await waitState(()=>status.getAttribute('data-job-id'),id=>id===active.id,'客户端仍保留活动任务');
+      assert.equal(await status.getAttribute('data-state'),'running');
     } finally {state.mediaJobs=jobs;state.files=files;await go(page,h.base,'/storage');}
   });
   await step('异步预览期间切页，不访问已销毁信号', async () => {
     await navigate('录制任务');
     h.delayNext('GET', '/api/recordings/fixture-1/files', 700);
-    await cardMenuAction(card('fixture-1'), '预览录制文件');
+    await openRecordingPreview(card('fixture-1'));
     await page.keyboard.press('Escape');
     await navigate('总览');
     await visible(page.getByRole('heading', { name: '录制工作台', exact: true }));
   });
   await step('区分解析不可用与后端断线，保留任务并自动恢复', async () => {
     state.resolverReady = false;
-    await visible(page.locator('.overview-service').getByText('解析暂不可用', { exact: true }));
     await navigate('录制任务');
-    assert.equal(await card('fixture-2').getByRole('button', { name: '单次录制', exact: true }).isDisabled(), true);
+    await waitState(() => card('fixture-2').getByRole('button', { name: '单次录制', exact: true }).isDisabled(), Boolean, '解析未就绪时禁止启动录制');
+    await hidden(page.locator('.connection-banner'));
+    const menu = await openCardMenu(card('fixture-2'));
+    const check = menu.getByRole('button', { name: '检测直播状态', exact: true });
+    assert.equal(await check.isDisabled(), true);
+    const hint = check.locator('..');
+    await hint.focus();
+    assert.equal(await hint.getAttribute('data-tooltip'), '直播解析服务尚未就绪');
+    assert.equal(await hint.evaluate(node => getComputedStyle(node, '::after').visibility), 'visible');
+    await closeCardMenu(menu);
     await navigate('总览');
+    await assertFullWidthPage('/home');
     const count = state.recordings.length;
     h.setOffline(true);
     await visible(page.locator('.connection-banner'));
@@ -1372,7 +1558,7 @@ try {
     await h.shot('native-shutdown-cancelled');
   });
   await step('真实视频画面截图、直播源预览与关闭清理',async()=>{
-    await navigate('录制任务');await cardMenuAction(card('fixture-1'), '预览录制文件');const modal=dialog('录制预览');await visible(modal);
+    await navigate('录制任务');await openRecordingPreview(card('fixture-1'));const modal=dialog('录制预览');await visible(modal);
     await page.waitForFunction(()=>document.querySelector('video')?.readyState>=2&&document.querySelector('video').videoWidth>0);
     const capture=modal.getByRole('button',{name:'保存截图',exact:true});
     const initialTheme=await page.locator('html').getAttribute('data-theme');
@@ -1412,9 +1598,8 @@ try {
         state:'complete',message:'MP4 已生成并校验；原 TS 保留',sourceRemoved:false,deleteOriginal:false,
         elapsedSeconds:0,startedAt:null,finishedAt:null};
       state.mediaJobs.push(job);h.emit('mediaJob',job);
-      await visible(card('fixture-2').locator('.card-media-job'));
-      assert.equal(await card('fixture-2').locator('.card-media-job-source').textContent(),'english-history.ts');
-      assert.equal(await card('fixture-2').locator('.media-job-detail').innerText(),'Elapsed time unknown');
+      await hidden(card('fixture-2').locator('.card-media-job'));
+      assert.equal(await card('fixture-2').getByText('Elapsed time unknown',{exact:true}).count(),0);
       job.state='running';h.emit('mediaJob',job);
       await visible(card('fixture-2').locator('.card-media-job[data-state=running]'));
       assert.equal(await card('fixture-2').locator('.card-media-job-source').textContent(),'english-history.ts');
@@ -1429,21 +1614,25 @@ try {
     await page.keyboard.press('Control+,');await page.getByRole('button',{name:'Appearance and window',exact:true}).click();await page.getByRole('combobox',{name:'Interface language',exact:true}).selectOption('zh_CN');await waitState(()=>page.locator('html').getAttribute('lang'),value=>value==='zh-CN','恢复中文');
     assert.equal(state.requests.filter(request=>/\/(check|start)$/.test(request.path)).length,checks,'切页和重载不触发额外平台检查');
   });
-  await step('工作台突出录制方案、实时耗时和待处理任务',async()=>{
+  await step('工作台主体全宽，保留实时录制信息与失败原因且不再显示运行侧栏',async()=>{
     await navigate('总览');
-    const policy = page.locator('details.overview-policy');
-    await visible(policy.locator('summary').getByText('当前录制方案', {exact:true}));
-    await policy.locator('summary').click();
-    assert.equal(await policy.evaluate(node => node.open), true);
-    await visible(policy.getByText('转 MP4 · 校验后清理 TS',{exact:true}));
+    await assertFullWidthPage('/home');
+    const live=page.locator('.overview-task-row[data-rec-id="fixture-1"]');
+    await visible(live.getByRole('button',{name:'小窗预览',exact:true}));
+    assert.match(await live.locator('.overview-task-detail strong').innerText(),/^\d{2}:\d{2}:\d{2}$/);
     const selected=record('fixture-2');const original=structuredClone(selected);
     Object.assign(selected,{isRecording:false,recordingError:'工作台异常夹具'});h.emit('update',selected);
     await waitState(()=>page.locator('.overview-task-row').first().getAttribute('data-rec-id'),id=>id==='fixture-2','工作台失败任务置顶');
+    await visible(page.locator('.overview-task-row[data-rec-id="fixture-2"] .overview-task-detail').getByText('工作台异常夹具',{exact:true}));
     await h.shot('workbench-attention');
     await navigate('录制任务');await page.getByRole('button',{name:/^需关注/}).click();
     await visible(card('fixture-2'));assert.equal(await card('fixture-1').count(),0);
     await page.getByRole('button',{name:/^全部/}).click();
     Object.assign(selected,original);h.emit('update',selected);
+    await navigate('总览');
+    await hidden(page.locator('.overview-task-row').getByText('工作台异常夹具',{exact:true}));
+    await assertFullWidthPage('/home');
+    await navigate('录制任务');
   });
   await step('队列位置、等待原因、恢复倒计时和中英文展示不触发平台请求', async () => {
     await navigate('录制任务'); await page.getByRole('button',{name:/^全部/}).click();
@@ -1469,8 +1658,9 @@ try {
     await page.keyboard.press('Escape');
     Object.assign(selected,{checkWaitReason:'cooldown',checkReadyAt:now+600});h.emit('update',selected);
     await visible(card('fixture-2').locator('.card-state .ui-badge').getByText('平台冷却中',{exact:true}));
-    await navigate('总览'); await visible(page.getByRole('region',{name:'检测队列',exact:true}));
-    assert.ok((await page.locator('.overview-queue').innerText()).includes('断流恢复'));
+    await navigate('总览');
+    await assertFullWidthPage('/home');
+    await visible(page.locator('.overview-task-row[data-rec-id="fixture-6"] .overview-task-detail strong').getByText('恢复第 2/3 次 · 断流后退避等待',{exact:true}));
     await navigate('偏好设置');await page.getByRole('button',{name:'网络与检测',exact:true}).click();
     const interval=page.getByRole('textbox',{name:/检测间隔/});await interval.fill('4500');
     await visible(page.getByText('4500 秒（75 分钟）',{exact:true}));

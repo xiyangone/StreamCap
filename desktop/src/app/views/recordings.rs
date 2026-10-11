@@ -391,7 +391,7 @@ pub fn RecordingsView() -> impl IntoView {
             <div class="task-collection" class:task-collection-list=move || !state.grid_view.get()>
             <Show when=move || !state.grid_view.get() && !visible.get().is_empty()>
                 <div class="task-list-header" aria-hidden="true">
-                    <span class="task-selection-gutter" /><span class="task-identity-column">{t("直播间")}</span><span class="task-status-column">{t("状态")}</span><span class="task-config-column">{t("录制配置")}</span><span class="task-monitor-column">{t("自动检测")}</span><span class="task-actions-column">{t("操作")}</span>
+                    <span class="task-selection-gutter" /><span class="task-identity-column">{t("直播间")}</span><span class="task-status-column">{t("状态")}</span><span class="task-actions-column">{t("操作")}</span>
                 </div>
             </Show>
             <Show when=move || state.loading.get()><div class="skeleton-grid" aria-label=t("加载任务")><div class="skeleton" /><div class="skeleton" /><div class="skeleton" /></div></Show>
@@ -405,7 +405,7 @@ pub fn RecordingsView() -> impl IntoView {
                 </Show>
             </div></Show>
             <div class="cards-grid" class:list-view=move || !state.grid_view.get()>
-                <For each=move || visible.get() key=|id| id.clone() children=move |id| state.recording_untracked(&id).map(|rec| view! { <RecordingCard recording=rec selectable=true selected=selected locked=busy selection_locked=selection_locked on_busy_change=card_busy_changed on_edit=Callback::new(move |r| editing.set(Some(r))) on_info=Callback::new(move |r| info.set(Some(r))) on_preview=Callback::new(move |r| preview.open_recording(r)) /> }) />
+                <For each=move || visible.get() key=|id| id.clone() children=move |id| state.recording_untracked(&id).map(|rec| view! { <RecordingCard recording=rec selectable=true selected=selected locked=busy selection_locked=selection_locked on_busy_change=card_busy_changed on_edit=Callback::new(move |r| editing.set(Some(r))) on_info=Callback::new(move |r| info.set(Some(r))) on_preview=Callback::new(move |r| preview.open_recording(r)) on_mini_preview=Callback::new(move |r| preview.open_recording_mini(r)) /> }) />
             </div>
             </div>
             </section>

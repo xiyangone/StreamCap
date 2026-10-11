@@ -32,30 +32,6 @@ fn Shell() -> impl IntoView {
             },
         );
     }
-    let media_listener = window()
-        .match_media("(prefers-color-scheme: dark)")
-        .ok()
-        .flatten()
-        .map(|query| {
-            let observed = query.clone();
-            let handler = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
-                state.system_dark.set(observed.matches())
-            });
-            let _ =
-                query.add_event_listener_with_callback("change", handler.as_ref().unchecked_ref());
-            (query, handler)
-        });
-    let media_listener = StoredValue::new_local(media_listener);
-    on_cleanup(move || {
-        media_listener.update_value(|slot| {
-            if let Some((query, handler)) = slot.take() {
-                let _ = query.remove_event_listener_with_callback(
-                    "change",
-                    handler.as_ref().unchecked_ref(),
-                );
-            }
-        })
-    });
     let events = StoredValue::new_local(None::<gateway::EventConnection>);
     Effect::new(move |_| {
         let _ = state.events_revision.get();
@@ -68,17 +44,14 @@ fn Shell() -> impl IntoView {
     leptos::task::spawn_local_scoped_with_cancellation(gateway::poll_connection(state));
     Effect::new(move |_| {
         let theme = state.theme.get();
-        let accent = state.accent.get();
-        let resolved = if state.is_dark() { "dark" } else { "light" };
         desktop::apply_theme(&theme);
         if let Some(root) = document().document_element() {
-            let _ = root.set_attribute("data-theme", resolved);
-            let _ = root.set_attribute("data-accent", &accent);
+            let _ = root.set_attribute("data-theme", &theme);
         }
         if let Ok(Some(storage)) = window().local_storage() {
             let _ = storage.set_item(
                 "streamcap.appearance",
-                &serde_json::json!({"theme":theme,"accent":accent}).to_string(),
+                &serde_json::json!({"theme":theme}).to_string(),
             );
         }
     });

@@ -10,6 +10,8 @@ state.mediaJobs = [
 ];
 const cases = [];
 const dialogCases = [];
+const englishCases = [];
+const accessibilityCases = [];
 let failure;
 try {
   for (const width of [1280, 950, 800, 375]) {
@@ -35,16 +37,39 @@ try {
         assert.equal(await page.locator('.device-avatar').count(),0);
         assert.equal(await page.getByRole('group',{name:'窗口控制'}).getByRole('button').count(),3);
         assert.ok(layout.surface?.width > 0 && layout.surface.height > 0, '当前页面必须有实际可测的主内容承载区');
-        assert.equal(layout.surface.background, themeColors[theme].surface, '新版主内容底色必须不透明且实际加载');
+        assert.equal(layout.surface.background, themeColors[theme].surface, '主内容使用同一套高可读玻璃面板');
         assert.ok(layout.surface.left >= 0 && layout.surface.left + layout.surface.width <= width + 2, '主内容承载区不能越过窗口');
-        assert.equal(layout.surface.backdrop, 'none', '实色面板不叠加无效模糊');
+        assert.match(layout.surface.backdrop, /blur\(18px\)/, '玻璃模糊仅分配到主承载层');
         assert.equal(layout.baseFontSize, 16, '根字号必须实际加载');
         assert.equal(layout.bodyFontSize, 14, '正文基础字号必须实际加载');
         assert.equal(layout.headingFontSize, width <= 600 ? 23 : 25, '页头字号必须符合当前窗口的响应式排版');
-        assert.equal(await page.locator('.glass').count(),0,'旧玻璃组件路径已移除');
+        assert.equal(await page.locator('.glass').count(),0,'使用现有统一组件，不恢复另一套旧玻璃组件');
         assert.equal(await page.locator('.page-header').count(),1,'页面共用唯一标题结构');
+        if (path === '/home' || path === '/storage') {
+          const container = page.locator(path === '/home' ? '.home-page' : '.storage-page');
+          const removed = path === '/home'
+            ? '.overview-aside, .overview-health, .overview-queue-section, .overview-policy'
+            : '.file-jobs-sidebar, .media-jobs, .media-history, .media-history-attention';
+          assert.equal(await container.locator(removed).count(), 0, '右侧栏及替代折叠/计数区域完全不存在');
+          const pageBounds = await container.boundingBox();
+          assert.ok(pageBounds && Math.abs(layout.surface.left - pageBounds.x) <= 1 && Math.abs(layout.surface.width - pageBounds.width) <= 1, '主体铺满页面，不保留侧栏空列');
+          layout.fullWidth = true;
+        }
         if (path === '/home') layout.shortActions = await assertSingleLineActions(page.locator('.overview-task-action button:visible'));
-        if (path === '/storage') layout.shortActions = await assertSingleLineActions(page.locator('.file-row-actions button:visible'));
+        if (path === '/storage') {
+          layout.shortActions = await assertSingleLineActions(page.locator('.file-row-actions button:visible'));
+          const table = page.locator('.file-table');
+          await visible(table);
+          const viewport = await page.locator('.table-container').boundingBox(), tableBounds = await table.boundingBox();
+          assert.ok(viewport && Math.abs(viewport.width - (layout.surface.width - 2)) <= 1, '文件列表除面板边框外全宽');
+          const listClientWidth=await page.locator('.table-container').evaluate(node=>node.clientWidth);
+          if (layout.surface.width >= 620) assert.ok(tableBounds && Math.abs(tableBounds.width - listClientWidth) <= 1, '宽窗口文件表除系统滚动槽外占满主体');
+          assert.equal(await page.getByRole('button',{name:'转为MP4：海边日落.ts',exact:true}).count(),1,'文件行手动转换保留');
+          assert.equal(await page.locator('.file-action-hint').count(),0,'不保留撑高文件行的同名输出提示');
+          const rows=await page.locator('.file-table tbody tr').evaluateAll(nodes=>nodes.map(row=>({height:row.getBoundingClientRect().height,blur:getComputedStyle(row).backdropFilter})));
+          assert.ok(rows.every(row=>row.height<=60&&row.blur==='none'),'文件列表紧凑且每行不分配模糊层');
+          assert.equal(await table.locator('thead th').first().evaluate(node=>getComputedStyle(node).position),'sticky');
+        }
         if (path === '/recordings') {
           const actions = await page.locator('.card-record').evaluateAll(nodes => nodes.map(node => ({
             height: node.getBoundingClientRect().height,
@@ -59,10 +84,24 @@ try {
             const arrangement=await inspectLayout(page);
             assert.equal(arrangement.contentOverflow,false,`${mode} 不得横向溢出`);
             assert.deepEqual(arrangement.overflow,[],`${mode} 组件必须适配窗口`);
+            assert.equal(await page.getByRole('button',{name:'预览录制文件',exact:true}).count(),state.recordings.length,'所有任务常驻预览入口');
+            assert.equal(await page.getByRole('button',{name:'小窗预览',exact:true}).count(),state.recordings.length,'所有任务常驻小窗入口');
+            assert.equal(await page.locator('.card-menu-panel').getByRole('button',{name:'预览录制文件',exact:true}).count(),0,'预览不在二级菜单');
+            await assertSingleLineActions(page.locator('.card-preview-actions button:visible'));
             if(mode==='list' && width>=950) {
               const heights=await page.locator('.recording-card').evaluateAll(nodes=>nodes.map(node=>node.getBoundingClientRect().height));
               const limit = width >= 1200 ? 200 : 240;
               assert.ok(Math.max(...heights)<=limit,'分区操作与录后摘要仍应保持有限行高: '+JSON.stringify(heights));
+            }
+            if(mode==='list' && width>=1200) {
+              const idle=page.locator('.recording-card[data-rec-id="fixture-2"]');
+              assert.equal(await idle.locator('.card-media-job').count(),0,'完成信息不再占据普通行');
+              const density=await idle.evaluate(node=>{
+                const row=node.getBoundingClientRect();
+                const controls=[...node.querySelectorAll('.card-monitor-setting,.card-preview-actions,.card-actions')].map(element=>{const r=element.getBoundingClientRect();return r.y+r.height/2;});
+                return {height:row.height,spread:Math.max(...controls)-Math.min(...controls)};
+              });
+              assert.ok(density.height<=100&&density.spread<=2,'宽窗口普通任务行紧凑，检测/预览/录制横向对齐: '+JSON.stringify(density));
             }
             assert.equal(await page.locator('.card-media-job .card-media-job-source:visible').count(),0,'完整历史路径默认收进详情');
             await h.shot(`${theme}-${width}-recordings-${mode}`);
@@ -131,6 +170,57 @@ try {
   assert.deepEqual(state.files, filesBeforeDialogs, '弹窗视觉检查保留全部媒体源文件');
   assert.deepEqual(state.cookies, cookiesBeforeDialogs, '模拟二维码截图不保存或更改登录信息');
   assert.equal(mutationCount(), mutationsBeforeDialogs, '只打开、关闭弹窗，不提交业务写入');
+  state.userConfig.language='en';
+  await page.evaluate(()=>localStorage.setItem('streamcap.language','en'));
+  for (const width of [1280,1100,800,600]) {
+    await page.setViewportSize({width,height:800});
+    for (const theme of ['light','dark']) {
+      state.userConfig.theme_mode=theme;
+      state.userConfig.is_grid_view=false;
+      for (const path of ['/recordings','/storage','/settings']) {
+        await go(page,h.base,path);await waitTheme(page,theme);
+        await eventually(()=>page.locator('.content-area .loading-state:visible').count(),n=>n===0,'English route loaded');
+        if(path==='/settings') {
+          await page.getByRole('button',{name:'Appearance and window',exact:true}).click();
+          assert.equal(await page.locator('.theme-option').count(),2);
+          assert.equal(await page.locator('.accent-options').count(),0);
+        }
+        const layout=await inspectLayout(page);
+        assert.equal(layout.contentOverflow,false);assert.deepEqual(layout.overflow,[]);
+        if(path==='/recordings') {
+          await assertSingleLineActions(page.locator('.card-controls button:visible'));
+          await page.getByRole('button',{name:'Grid view',exact:true}).click();
+          const grid=await inspectLayout(page);
+          assert.equal(grid.contentOverflow,false);assert.deepEqual(grid.overflow,[]);
+          await assertSingleLineActions(page.locator('.card-controls button:visible'));
+          await page.getByRole('button',{name:'List view',exact:true}).click();
+        }
+        englishCases.push({width,theme,path,layout});
+        if(width===1100||width===600)await h.shot(`english-${theme}-${width}${path.replaceAll('/','-')}`);
+      }
+    }
+  }
+  assert.equal(englishCases.length,24);
+  state.userConfig.language='zh_CN';
+  await page.evaluate(()=>localStorage.setItem('streamcap.language','zh_CN'));
+  await page.setViewportSize({width:1280,height:900});
+  for(const theme of ['light','dark']) {
+    state.userConfig.theme_mode=theme;
+    await go(page,h.base,'/storage');await waitTheme(page,theme);
+    await page.emulateMedia({contrast:'more',reducedMotion:'reduce'});
+    const material=await page.locator('.file-manager').evaluate(node=>{
+      const style=getComputedStyle(node),color=style.backgroundColor;
+      return {color,backdrop:style.backdropFilter,sheen:style.backgroundImage,
+        motion:getComputedStyle(node.querySelector('button')).transitionDuration};
+    });
+    assert.equal(material.color,theme==='light'?'rgb(255, 255, 255)':'rgb(27, 31, 39)');
+    assert.match(material.backdrop,/blur\(0px\)/);
+    assert.ok(material.sheen.split(',').every(layer=>layer.trim()==='none'),'降低透明度时关闭所有高光图层');
+    assert.equal(material.motion,'0s');
+    accessibilityCases.push({theme,material});
+    await h.shot(`accessible-${theme}`);
+    await page.emulateMedia({contrast:'no-preference',reducedMotion:'no-preference'});
+  }
   await page.setViewportSize({ width: 1280, height: 900 });
   state.recordings = [];
   state.userConfig.theme_mode = 'light';
@@ -148,8 +238,8 @@ try {
   await h.shot('failure').catch(() => {});
   console.error(error.stack ?? error);
 } finally {
-  await h.report({ passed: !failure, cases, dialogCases, failure: failure ? String(failure.stack ?? failure) : null });
+  await h.report({ passed: !failure, cases, dialogCases, englishCases, accessibilityCases, failure: failure ? String(failure.stack ?? failure) : null });
   await h.close();
 }
-console.log(JSON.stringify({ passed: !failure, cases: cases.length, dialogs: dialogCases.length, artifacts: h.runDir }));
+console.log(JSON.stringify({ passed: !failure, cases: cases.length, dialogs: dialogCases.length, english: englishCases.length, accessibility: accessibilityCases.length, artifacts: h.runDir }));
 if (failure) process.exitCode = 1;

@@ -33,6 +33,7 @@ pub fn Icon(#[prop(into)] name: String, #[prop(optional)] size: u32) -> impl Int
         "back" => "M19 12H5m5-5-5 5 5 5",
         "close" => "m6 6 12 12M6 18 18 6",
         "minimize" => "M5 12h14",
+        "picture-in-picture" => "M3 4h18v16H3ZM12 11h6v6h-6Z",
         "maximize" => "M5 5h14v14H5Z",
         "restore" => "M8 8h11v11H8ZM5 15V5h10",
         "tray" => "M3 14v6h18v-6M12 3v12m-5-5 5 5 5-5",

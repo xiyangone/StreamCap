@@ -356,7 +356,7 @@ pub fn queue_label(record: &crate::api::gateway::Recording) -> String {
         return t("正在确认直播是否结束").into();
     }
     if record.verification_required || record.check_wait_reason == "verification" {
-        return t("等待手动验证或登录").into();
+        return t("平台访问受限，自动检测已暂停").into();
     }
     let reason = t(match record.check_wait_reason.as_str() {
         "platformBusy" => "等待同平台检测完成",
@@ -434,11 +434,11 @@ pub fn monitoring_label(record: &crate::api::gateway::Recording) -> &'static str
     } else if record.check_state == "recovering" {
         t("断流恢复中，监控保持开启")
     } else if record.verification_required {
-        t("等待手动验证")
+        t("平台验证受限")
     } else if record.access_state == "cooldown" {
         t("等待平台冷却")
-    } else if record.access_state == "pageCheck" {
-        t("等待页面检查")
+    } else if record.access_state == "unavailable" {
+        t("访问受限，等待下次检测")
     } else if record.access_state == "loginRequired" {
         t("请在设置中检查登录状态")
     } else if record.access_state == "loginPrompt" {
@@ -706,7 +706,7 @@ mod tests {
         record.scheduled_recording = Some(true);
         assert_eq!(monitoring_label(&record), "按时间段自动监控");
         record.verification_required = true;
-        assert_eq!(monitoring_label(&record), "等待手动验证");
+        assert_eq!(monitoring_label(&record), "平台验证受限");
         assert_eq!(recording_priority(&record), 0);
         assert!(record.needs_attention());
         record.verification_required = false;

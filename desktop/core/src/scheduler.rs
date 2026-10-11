@@ -81,6 +81,8 @@ struct CheckCompletion {
     expected: crate::model::Recording,
     recovering: bool,
     result: Result<CheckOutcome, String>,
+    // Keep the room occupied until its completion has rearmed the interval.
+    _operation: CheckLease,
 }
 
 fn retryable_recording_error(error: &str) -> bool {
@@ -104,12 +106,8 @@ fn retryable_recording_error(error: &str) -> bool {
             .any(|marker| error.contains(marker)))
 }
 
-fn requires_manual_access(record: &crate::model::Recording) -> bool {
-    record.verification_required
-        || matches!(
-            record.access_state.as_str(),
-            "captcha" | "loginRequired" | "loginPrompt"
-        )
+fn access_is_blocked(record: &crate::model::Recording) -> bool {
+    record.verification_required || record.access_state == "captcha"
 }
 
 fn next_window(record: &crate::model::Recording) -> CheckDeadline {
@@ -430,7 +428,7 @@ impl Scheduler {
                             && r.schedule_revision == request.revision
                             && r.monitor_status
                             && !r.is_recording
-                            && !requires_manual_access(r)
+                            && !access_is_blocked(r)
                     })
                 });
                 recovery.clone()
@@ -471,7 +469,7 @@ impl Scheduler {
                         .await;
                     continue;
                 }
-                if requires_manual_access(&record) {
+                if access_is_blocked(&record) {
                     self.show_wait(&record, "idle", "verification", None, None, None)
                         .await;
                     continue;
@@ -626,7 +624,7 @@ impl Scheduler {
                     r.schedule_revision != record.schedule_revision
                         || !r.monitor_status
                         || r.is_recording
-                        || requires_manual_access(&r)
+                        || access_is_blocked(&r)
                 }) {
                     continue;
                 }
@@ -667,7 +665,6 @@ impl Scheduler {
                 }
                 let scheduler = self.clone();
                 running.spawn(async move {
-                    let _operation = operation;
                     let result = scheduler
                         .check_with_permit(
                             record.rec_id.clone(),
@@ -679,6 +676,7 @@ impl Scheduler {
                         expected: record,
                         recovering,
                         result,
+                        _operation: operation,
                     }
                 });
             }
@@ -780,18 +778,24 @@ impl Scheduler {
         permit: Option<crate::pacing::Permit>,
         revision: Option<u64>,
     ) -> Result<CheckOutcome, String> {
-        if self.stopping.is_cancelled() {
-            return Err("应用正在退出".into());
-        }
-        if self.store.get(&rec_id).await.is_none() {
-            return Err(format!("任务不存在: {rec_id}"));
-        }
-        if let Some(rec) = self.store.get(&rec_id).await {
+        {
+            let _lifecycle = self.starting.lock().await;
+            if self.stopping.is_cancelled() {
+                return Err("应用正在退出".into());
+            }
+            let rec = self
+                .store
+                .get(&rec_id)
+                .await
+                .ok_or_else(|| format!("任务不存在: {rec_id}"))?;
+            if revision.is_some_and(|revision| revision != rec.schedule_revision) {
+                return Err("任务已更新，旧检测结果已丢弃".into());
+            }
             if !rec.monitor_status {
                 return Ok(CheckOutcome::MonitoringPaused);
             }
             if !crate::schedule::active(&rec)? {
-                self.stop_recording(&rec_id).await;
+                self.stop_recording_locked(&rec_id, true).await;
                 return Ok(CheckOutcome::OutsideSchedule);
             }
         }
@@ -804,67 +808,6 @@ impl Scheduler {
             Err(error) => return Ok(CheckOutcome::Failed(error)),
         };
         self.accept_resolved(&expected, &info, false).await
-    }
-
-    /// Accept data from the same official room after an explicit human verification action.
-    pub async fn report_kuaishou_access(&self, expected: &crate::model::Recording, error: &str) {
-        self.store
-            .update_when(
-                &expected.rec_id,
-                |r| {
-                    !self.stopping.is_cancelled()
-                        && r.platform_key.as_deref() == Some("kuaishou")
-                        && r.url == expected.url
-                        && r.schedule_revision == expected.schedule_revision
-                        && r.quality == expected.quality
-                        && r.recording_run == expected.recording_run
-                },
-                |r| {
-                    r.check_error = Some(error.into());
-                    r.verification_required =
-                        crate::platforms::kuaishou::verification_required(error);
-                    r.access_state = crate::platforms::kuaishou::access_state(error).into();
-                    r.check_state = "idle".into();
-                    r.last_check_at = Some(chrono::Utc::now().timestamp());
-                },
-            )
-            .await;
-    }
-
-    /// Accept data from the same official room after an explicit human verification action.
-    /// The original URL/quality and normal monitoring/schedule rules still apply.
-    pub async fn accept_verified(
-        &self,
-        expected: &crate::model::Recording,
-        info: &crate::resolver::StreamInfo,
-    ) -> Result<CheckOutcome, String> {
-        let _operation = self.begin_check(&expected.rec_id)?;
-        let lifecycle = self.starting.lock().await;
-        let current = self
-            .store
-            .get(&expected.rec_id)
-            .await
-            .ok_or("验证任务已移除")?;
-        if !current.same_schedule_as(expected)
-            || current.platform_key.as_deref() != Some("kuaishou")
-            || current.url != expected.url
-            || current.quality != expected.quality
-        {
-            return Err("任务已更新，验证结果未应用".into());
-        }
-        if !current.monitor_status || !crate::schedule::active(&current)? {
-            self.store
-                .apply_stream_info(&current.rec_id, info)
-                .await
-                .map_err(|_| "无法保存验证结果")?;
-            return Ok(if current.monitor_status {
-                CheckOutcome::OutsideSchedule
-            } else {
-                CheckOutcome::MonitoringPaused
-            });
-        }
-        drop(lifecycle);
-        self.accept_resolved(&current, info, false).await
     }
 
     async fn accept_resolved(
@@ -1819,7 +1762,7 @@ impl RoomCheck {
                 && r.monitor_status
                 && !r.is_recording
                 && r.only_notify_no_record != Some(true)
-                && !requires_manual_access(r)
+                && !access_is_blocked(r)
                 && crate::schedule::active(r).unwrap_or(false)
                 && !r
                     .check_error
@@ -1928,6 +1871,22 @@ impl RoomCheck {
     ) -> Result<(crate::model::Recording, crate::resolver::StreamInfo), String> {
         self.resolve_with_permit(rec_id, publish_failure, None, None)
             .await
+    }
+
+    fn observe_result(&self, key: &str, result: &Result<crate::resolver::StreamInfo, String>) {
+        if key == "kuaishou"
+            && result
+                .as_ref()
+                .is_err_and(|error| error == crate::platforms::kuaishou::RATE_LIMITED)
+        {
+            // The resolver also returns this error for cached cooldown rejections.
+            // Count the restriction once, without changing the user-facing error.
+            if self.pacer.status(key, 1).reason != "cooldown" {
+                self.pacer.result(key, &Err("HTTP 429".into()));
+            }
+        } else {
+            self.pacer.result(key, result);
+        }
     }
 
     async fn resolve_with_permit(
@@ -2053,15 +2012,13 @@ impl RoomCheck {
         }) {
             return Err("任务已更新，旧检测结果已丢弃".into());
         }
-        self.pacer.result(key, &result);
+        self.observe_result(key, &result);
         if let Err(error) = &result {
             if !publish_failure {
                 return Err(error.clone());
             }
             let verification =
                 key == "kuaishou" && crate::platforms::kuaishou::verification_required(error);
-            let page_check =
-                key == "kuaishou" && crate::platforms::kuaishou::page_check_required(error);
             let changed = rec.check_error.as_ref() != Some(error)
                 || rec.verification_required != verification;
             let updated = self
@@ -2098,12 +2055,6 @@ impl RoomCheck {
                     rec_id,
                     key,
                     verification
-                );
-            }
-            if page_check {
-                self.store.emit(
-                    "kuaishouVerificationRequired",
-                    serde_json::json!({"recId":rec_id}),
                 );
             }
         }
@@ -2315,7 +2266,7 @@ fn free_space_gb(path: &std::path::Path) -> Option<f64> {
     }
 }
 
-/// Shared proxy selection for platform requests, recording and the human verification window.
+/// Shared proxy selection for platform requests and recording.
 pub fn recording_proxy(
     config: &ConfigStore,
     platform: Option<&str>,
@@ -2367,6 +2318,72 @@ mod tests {
         for _ in 0..60 {
             tokio::task::yield_now().await;
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn normalized_kuaishou_limits_back_off_without_recounting_cached_rejections() {
+        use crate::platforms::kuaishou::{
+            ACCESS_UNAVAILABLE, LOGIN_PROMPT, PAGE_UNAVAILABLE, RATE_LIMITED,
+        };
+
+        let (_root, state, _) = finished_recording_fixture().await;
+        let checker = state.scheduler.room_check();
+        for error in [ACCESS_UNAVAILABLE, LOGIN_PROMPT, PAGE_UNAVAILABLE] {
+            checker.observe_result("kuaishou", &Err(error.into()));
+            assert_eq!(checker.pacer.status("kuaishou", 1).reason, "queue");
+        }
+        for seconds in [600, 1200, 2400, 4800, 9600, 14400, 14400] {
+            checker.observe_result("kuaishou", &Err(RATE_LIMITED.into()));
+            let gate = checker.pacer.status("kuaishou", 1);
+            assert_eq!(gate.reason, "cooldown");
+            assert_eq!(
+                gate.ready_at.unwrap() - Instant::now(),
+                Duration::from_secs(seconds)
+            );
+            tokio::time::advance(Duration::from_secs(5)).await;
+            checker.observe_result("kuaishou", &Err(RATE_LIMITED.into()));
+            assert_eq!(checker.pacer.status("kuaishou", 1).ready_at, gate.ready_at);
+            tokio::time::advance(Duration::from_secs(seconds - 5)).await;
+            assert_eq!(checker.pacer.status("kuaishou", 1).reason, "queue");
+        }
+        checker.observe_result("kuaishou", &Ok(crate::resolver::StreamInfo::default()));
+        checker.observe_result("kuaishou", &Err(RATE_LIMITED.into()));
+        assert_eq!(
+            checker.pacer.status("kuaishou", 1).ready_at.unwrap() - Instant::now(),
+            Duration::from_secs(600)
+        );
+        crate::api::shutdown(&state).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_scheduled_check_cannot_stop_an_edited_task_outside_its_window() {
+        let (_root, state, previous) = finished_recording_fixture().await;
+        state
+            .store
+            .update("finished", |record| {
+                record.schedule_revision += 1;
+                record.scheduled_recording = Some(true);
+                record.scheduled_start_time = Some(
+                    (chrono::Local::now() + chrono::Duration::hours(6))
+                        .format("%H:%M:%S")
+                        .to_string(),
+                );
+                record.monitor_hours = Some("0.1".into());
+            })
+            .await;
+        let edited = state.store.get("finished").await.unwrap();
+        assert!(!crate::schedule::active(&edited).unwrap());
+        let mut events = state.store.subscribe();
+        assert_eq!(
+            state
+                .scheduler
+                .check_with_permit("finished".into(), None, Some(previous.schedule_revision))
+                .await,
+            Err("任务已更新，旧检测结果已丢弃".into())
+        );
+        assert_eq!(state.store.get("finished").await.unwrap(), edited);
+        assert!(events.try_recv().is_err());
+        crate::api::shutdown(&state).await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -2558,7 +2575,8 @@ mod tests {
             .unwrap();
         let mut restricted =
             Recording::new("a".into(), "http://127.0.0.1:1/a.mp4".into(), "A".into());
-        restricted.platform_key = Some("restricted-fixture".into());
+        restricted.platform_key = Some("kuaishou".into());
+        // The mismatched loopback URL cannot reach a platform even if admission regresses.
         let mut scheduled =
             Recording::new("b".into(), "http://127.0.0.1:1/b.mp4".into(), "B".into());
         scheduled.scheduled_recording = Some(true);
@@ -2575,10 +2593,10 @@ mod tests {
             .insert(vec![restricted, scheduled, ready])
             .await
             .unwrap();
-        state
-            .scheduler
-            .pacer
-            .result("restricted-fixture", &Err("HTTP 429".into()));
+        state.scheduler.room_check().observe_result(
+            "kuaishou",
+            &Err(crate::platforms::kuaishou::RATE_LIMITED.into()),
+        );
         let (stop, rx) = tokio::sync::watch::channel(false);
         let task = tokio::spawn(state.scheduler.clone().run(rx));
         settle().await;
@@ -2860,8 +2878,21 @@ mod tests {
         for (error, wanted) in [
             ("平台返回空响应（未验证直播状态）", 3),
             ("平台返回 HTTP 429", 1),
+            (crate::platforms::kuaishou::ACCESS_UNAVAILABLE, 1),
+            (crate::platforms::kuaishou::PAGE_UNAVAILABLE, 1),
+            (crate::platforms::kuaishou::LOGIN_PROMPT, 1),
+            (crate::platforms::kuaishou::LOGIN_REQUIRED, 1),
+            (crate::platforms::kuaishou::VERIFICATION_REQUIRED, 1),
+            (crate::platforms::kuaishou::RATE_LIMITED, 1),
         ] {
             let (_dir, state, expected) = finished_recording_fixture().await;
+            state
+                .store
+                .update("finished", |record| {
+                    record.platform_key = Some("kuaishou".into());
+                    record.last_success_at = Some(123);
+                })
+                .await;
             let calls = std::cell::Cell::new(0);
             state
                 .scheduler
@@ -2879,6 +2910,20 @@ mod tests {
                 "unreadable is not proof of offline; UI excludes stale state"
             );
             assert!(current.recording_run.is_none());
+            assert_eq!(current.live_title, expected.live_title);
+            assert_eq!(current.last_success_at, Some(123));
+            assert_eq!(
+                current.access_state,
+                crate::platforms::kuaishou::access_state(error)
+            );
+            assert_eq!(
+                current.verification_required,
+                crate::platforms::kuaishou::verification_required(error)
+            );
+            if wanted == 1 {
+                assert!(current.recovery_at.is_none());
+                assert!(state.scheduler.recovery_requests.lock().unwrap().is_empty());
+            }
             crate::api::shutdown(&state).await.unwrap();
         }
     }

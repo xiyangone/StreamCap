@@ -106,26 +106,6 @@ impl Resolver {
     pub async fn kuaishou_session_changed(&self) {
         self.kuaishou.reset_session().await;
     }
-    pub async fn kuaishou_begin_page_check(
-        &self,
-        saved: Option<&str>,
-        interval: Duration,
-        manual: bool,
-    ) -> Result<tokio::sync::OwnedSemaphorePermit, String> {
-        self.kuaishou
-            .begin_page_check(saved, interval, manual)
-            .await
-    }
-    pub async fn kuaishou_page_problem(&self, error: &str) {
-        self.kuaishou.page_problem(error).await;
-    }
-    pub async fn kuaishou_page_session(
-        &self,
-        saved: Option<&str>,
-        page: &str,
-    ) -> Result<(), String> {
-        self.kuaishou.use_page_session(saved, page).await
-    }
     pub async fn healthy(&self) -> bool {
         !self.stop.is_cancelled()
     }

@@ -29,7 +29,7 @@ const defaults = {
   segmented_recording_enabled: false, loop_time_seconds: '600', convert_to_mp4: false, delete_original: false,
   live_save_path: 'X:/Fixture/Recordings', recording_space_threshold: '1.0',
   folder_name_platform: true, folder_name_author: true, folder_name_time: false,
-  filename_includes_title: true, theme_mode: 'light', theme_color: 'blue', is_grid_view: true, close_action: 'ask',
+  filename_includes_title: true, theme_mode: 'light', is_grid_view: true, close_action: 'ask',
 };
 const inheritance = {
   quality: ['quality', 'record_quality'], record_format: ['recordFormat', 'video_format'],
@@ -278,6 +278,9 @@ export async function createHarness(label, options = {}) {
       if (path === '/api/settings') {
         if (method === 'PUT') {
           const patch = body.userConfig ?? {};
+          if (Object.hasOwn(patch, 'theme_color') || Object.hasOwn(patch, 'theme_mode') && !['light','dark'].includes(patch.theme_mode)) {
+            json(res, {detail:'主题模式无效'}, 400); return;
+          }
           const changed = Object.keys(patch).filter(key => JSON.stringify(state.userConfig[key]) !== JSON.stringify(patch[key]));
           Object.assign(state.userConfig, patch);
           if (changed.some(key => Object.values(inheritance).some(([, setting]) => setting === key))) {
@@ -401,10 +404,6 @@ export async function createHarness(label, options = {}) {
     const native=state.native;native.calls.push({command,args:structuredClone(args)});let closeRequest;
     if(command==='desktop_ready')return {value:nativeStatus(),closeRequest:native.pending?{activeRecordings:state.recordings.filter(r=>r.isRecording).length,trayAvailable:native.trayAvailable}:undefined};
     if(command==='desktop_theme'){native.theme=args.theme;return {value:null};}
-    if(command==='desktop_kuaishou_verification'){
-      if(args.action!=='open'||!state.recordings.some(r=>r.recId===args.recId&&r.verificationRequired))throw Error('Invalid verification fixture request');
-      native.verification={active:true,recId:args.recId,busy:false};return {value:native.verification};
-    }
     if(command==='desktop_window_action'){
       if(args.action==='pick-directory')return {value:'X:/Fixture/Picked'};
       if(args.action==='cancel-shutdown'){native.systemShutdown=false;native.shutdownSeconds=null;state.quickShutdown=null;return {value:null,windowState:nativeStatus()};}
@@ -467,8 +466,8 @@ export async function eventually(read, predicate, message, timeout = 8000) {
 }
 
 export const themeColors = {
-  light: { surface: 'rgb(255, 255, 255)', text: 'rgb(38, 50, 68)', sidebar: 'rgb(246, 247, 249)' },
-  dark: { surface: 'rgb(27, 31, 39)', text: 'rgb(231, 235, 241)', sidebar: 'rgb(23, 27, 34)' },
+  light: { canvas: 'rgb(237, 240, 246)', surface: 'rgba(255, 255, 255, 0.76)', overlay: 'rgba(255, 255, 255, 0.96)', text: 'rgb(38, 50, 68)', sidebar: 'rgba(248, 250, 255, 0.76)' },
+  dark: { canvas: 'rgb(17, 21, 30)', surface: 'rgba(29, 35, 48, 0.8)', overlay: 'rgba(32, 39, 52, 0.97)', text: 'rgb(231, 235, 241)', sidebar: 'rgba(22, 28, 39, 0.82)' },
 };
 
 export async function waitTheme(page, theme) {
@@ -477,7 +476,7 @@ export async function waitTheme(page, theme) {
     const body = getComputedStyle(document.body);
     const sidebar = document.querySelector('.sidebar');
     return document.documentElement.dataset.theme === expected
-      && body.backgroundColor === colors.surface
+      && body.backgroundColor === colors.canvas
       && body.color === colors.text
       && sidebar && getComputedStyle(sidebar).backgroundColor === colors.sidebar;
   }, { expected: theme, colors: themeColors[theme] });
@@ -502,6 +501,11 @@ export async function openCardMenu(card) {
   if (!await menu.evaluate(node => node.open)) await trigger.click();
   await eventually(() => menu.evaluate(node => node.open), Boolean, 'Card action menu opens');
   await visible(menu.locator('.card-menu-panel'));
+  await eventually(() => menu.evaluate(node => {
+    const bounds = node.querySelector('.card-menu-panel').getBoundingClientRect();
+    const viewport = node.closest('#main-content').getBoundingClientRect();
+    return bounds.top >= viewport.top - 1 && bounds.bottom <= viewport.bottom + 1;
+  }), Boolean, 'The entire action menu fits inside the scroll viewport');
   return menu;
 }
 export async function closeCardMenu(menu) {
@@ -559,9 +563,9 @@ export async function assertDialogStyles(modal, theme, requiredControls = []) {
   });
   assert.ok(frame.width >= 300 && frame.height > 80, 'The dialog has a usable measured surface');
   assert.ok(frame.left >= 0 && frame.right <= frame.viewportWidth + 1 && frame.top >= 0 && frame.bottom <= frame.viewportHeight + 1, 'The dialog stays inside the viewport');
-  assert.equal(frame.background, themeColors[theme].surface, 'Dialog theme surface is opaque and compiled');
+  assert.equal(frame.background, themeColors[theme].overlay, 'Dialog uses the high-opacity glass overlay for readable content');
   assert.equal(frame.color, themeColors[theme].text);
-  assert.equal(frame.backdrop, 'none');
+  assert.match(frame.backdrop, /blur\(18px\)/, 'Dialog shares the bounded glass material');
   assert.equal(frame.border, 'solid');
   assert.ok(frame.borderWidth >= 1, 'Native dialog boundary remains visible');
   assert.equal(frame.overflow, false, 'Dialog controls must not cause horizontal scrolling');
@@ -623,7 +627,7 @@ export async function inspectLayout(page) {
     const content = document.querySelector('.content-area');
     const surfaces = {
       '/home': '.home-page .overview-main',
-      '/recordings': '.page .recording-card',
+      '/recordings': '.page .task-workspace',
       '/storage': '.page .file-manager',
       '/settings': '.page .settings-content',
       '/about': '.page .about-content',

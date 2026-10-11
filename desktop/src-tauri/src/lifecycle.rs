@@ -246,7 +246,6 @@ pub fn request_exit(app: &AppHandle) {
     if state.closing.swap(true, Ordering::SeqCst) {
         return;
     }
-    crate::kuaishou_verification::begin_shutdown(app);
     state.native_stop.cancel();
     state.native_tasks.close();
     state.server.request_shutdown();
@@ -268,14 +267,13 @@ pub fn request_exit(app: &AppHandle) {
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
         native_tasks.wait().await;
-        crate::kuaishou_verification::wait_shutdown(&handle).await;
         let outcome = server.shutdown().await;
         let ok = outcome.is_ok();
         if let Err(error) = &outcome {
             log::error!("退出保存失败: {error}");
         }
         if let Some(report) = report {
-            let value = serde_json::json!({"shutdownComplete":ok,"activeRecordings":server.state().engine.active_ids().await.len(),"pythonResolver":false,"pendingMediaJobs":server.state().scheduler.postprocess.pending(),"activePreviews":server.state().preview.active(),"verification":crate::kuaishou_verification::status(&handle)});
+            let value = serde_json::json!({"shutdownComplete":ok,"activeRecordings":server.state().engine.active_ids().await.len(),"pythonResolver":false,"pendingMediaJobs":server.state().scheduler.postprocess.pending(),"activePreviews":server.state().preview.active()});
             if let Err(error) = std::fs::write(
                 report,
                 serde_json::to_vec_pretty(&value).unwrap_or_default(),
@@ -361,10 +359,8 @@ pub fn start_native_events(
                     };
                     let state = app.state::<Lifecycle>();
                     if state.closing.load(Ordering::SeqCst) { continue; }
-                    if message.topic=="kuaishouSessionChanged" { crate::kuaishou_verification::session_changed(&app).await;continue; }
                     if state.is_smoke() { continue; }
                     match message.topic.as_str() {
-                        "kuaishouVerificationRequired" => { if let Some(id)=message.payload["recId"].as_str() { crate::kuaishou_verification::automatic(&app,id.to_owned()); } },
                         "nativeNotification" => {
                             let title = message.payload["title"].as_str().unwrap_or("StreamCap").chars().take(120).collect::<String>();
                             let body = message.payload["body"].as_str().unwrap_or("").chars().take(1000).collect::<String>();
@@ -564,20 +560,20 @@ pub fn runtime_script(address: std::net::SocketAddr) -> String {
 mod tests {
     use super::*;
     #[test]
-    fn native_event_receiver_keeps_detection_before_window_setup() {
+    fn native_event_receiver_keeps_notifications_before_window_setup() {
         let store = streamcap_core::store::Store::new(streamcap_core::Workspace::from_repo_root(
             std::env::temp_dir(),
         ));
         let mut events = store.subscribe();
         store.emit(
-            "kuaishouVerificationRequired",
-            serde_json::json!({"recId":"fixture-startup"}),
+            "nativeNotification",
+            serde_json::json!({"title":"StreamCap","body":"startup notification"}),
         );
         let event = events
             .try_recv()
-            .expect("startup verification must remain queued before the window event loop starts");
-        assert_eq!(event.topic, "kuaishouVerificationRequired");
-        assert_eq!(event.payload["recId"], "fixture-startup");
+            .expect("startup notification must remain queued before the window event loop starts");
+        assert_eq!(event.topic, "nativeNotification");
+        assert_eq!(event.payload["body"], "startup notification");
     }
     #[test]
     fn native_tasks_start_from_a_synchronous_thread_and_are_joined() {

@@ -4,7 +4,7 @@ use crate::{
     app::{
         components::{
             preview_state, ActionButton, ConfirmDialog, EmptyState, FormFeedback, Icon, IconButton,
-            MediaJobStatus, PageHeader,
+            PageHeader,
         },
         labels::{human_size, modified_time},
     },
@@ -149,37 +149,6 @@ pub fn StorageView() -> impl IntoView {
     let conversion_errors = RwSignal::new(std::collections::HashMap::<String, String>::new());
     let completed_jobs =
         Memo::new(move |_| state.media_jobs.with(|jobs| completed_output_keys(jobs)));
-    let show_all_history = RwSignal::new(false);
-    let active_jobs = Memo::new(move |_| {
-        state.media_jobs.with(|jobs| {
-            jobs.iter()
-                .filter(|job| job.pending() && job.state != "waiting")
-                .chain(jobs.iter().filter(|job| job.state == "waiting"))
-                .map(|job| job.id.clone())
-                .collect::<Vec<_>>()
-        })
-    });
-    let history_jobs = Memo::new(move |_| {
-        state.media_jobs.with(|jobs| {
-            jobs.iter()
-                .rev()
-                .filter(|job| !job.pending())
-                .map(|job| job.id.clone())
-                .collect::<Vec<_>>()
-        })
-    });
-    let visible_history = Memo::new(move |_| {
-        history_jobs.with(|ids| {
-            ids.iter()
-                .take(if show_all_history.get() {
-                    usize::MAX
-                } else {
-                    8
-                })
-                .cloned()
-                .collect::<Vec<_>>()
-        })
-    });
     Effect::new(move |_| {
         let folder = subfolder.get();
         let _ = reload.get();
@@ -384,19 +353,11 @@ pub fn StorageView() -> impl IntoView {
     });
     view! {
         <div class="page storage-page">
-            <PageHeader title=t("媒体库") subtitle=t("浏览录像、预览内容，查看每一次处理记录。")>
-                <IconButton label=t("刷新文件") icon="refresh" busy=loading
-                    disabled=busy on_click=Callback::new(move |_| reload.update(|n| *n = n.wrapping_add(1))) />
-            </PageHeader>
-            <div class="file-manager-layout" class:has-processing=move || !active_jobs.get().is_empty() || !history_jobs.get().is_empty()>
+            <PageHeader title=t("媒体库") subtitle=t("浏览、预览和整理录制文件。") />
             <section class="file-browser file-manager">
                 <header class="file-manager-toolbar">
-                <div class="file-root-line"><Icon name="folder" size=16 /><span class="file-root-label">{t("录制文件位置")}</span>
-                    <code class="file-root-value" title=move || listing.with(|list| list.root.clone())>{move || listing.with(|list| if list.root.is_empty() { t("正在读取…").to_string() } else { list.root.clone() })}</code>
-                <IconButton label=t("复制录制根目录") icon="copy" busy=copying disabled=Signal::derive(move || listing.get().root.is_empty())
-                    on_click=Callback::new(move |_| copy_path.run(listing.get_untracked().root)) />
-                </div>
-                <div class="file-browser-toolbar"><nav class="file-breadcrumb" aria-label=t("媒体库路径")>
+                <div class="file-browser-toolbar"><div class="file-location">
+                <nav class="file-breadcrumb" aria-label=t("媒体库路径")>
                     <ActionButton label=t("媒体库") icon="folder" variant="ghost" class="breadcrumb-action" aria_label=t("返回媒体库根目录").to_string()
                         disabled=busy on_click=Callback::new(move |_| { subfolder.set(String::new()); keyword.set(String::new()); }) />
                     {move || { let path = subfolder.get(); let mut prefix = String::new(); path.split('/').filter(|p| !p.is_empty()).map(|part| { if !prefix.is_empty() { prefix.push('/'); } prefix.push_str(part); let target = StoredValue::new(prefix.clone()); let label = part.to_string(); view! {
@@ -404,12 +365,23 @@ pub fn StorageView() -> impl IntoView {
                             current=Signal::derive(move || (subfolder.get() == target.get_value()).then_some("page")) disabled=busy
                             on_click=Callback::new(move |_| { subfolder.set(target.get_value()); keyword.set(String::new()); })><span>{label}</span></ActionButton>
                     } }).collect_view() }}
-                </nav><div class="search-field compact"><Icon name="search" size=17 /><input class="ui-input ui-input-sm" aria-label=t("搜索文件") placeholder=t("搜索当前目录…") prop:value=move || keyword.get() on:input=move |e| keyword.set(event_target_value(&e)) />
-                    <Show when=move || !keyword.get().is_empty()><IconButton label=t("清除搜索") icon="close" on_click=Callback::new(move |_| keyword.set(String::new())) /></Show>
+                </nav>
+                <div class="file-root-line"><span class="sr-only">{t("录制文件位置")}</span>
+                    <code class="file-root-value" title=move || listing.with(|list| list.root.clone())>{move || listing.with(|list| if list.root.is_empty() { t("正在读取…").to_string() } else { list.root.clone() })}</code>
+                </div></div>
+                <div class="file-directory-actions" role="group" aria-label=t("目录操作")>
+                    <IconButton label=t("复制录制根目录") icon="copy" busy=copying disabled=Signal::derive(move || listing.get().root.is_empty())
+                        on_click=Callback::new(move |_| copy_path.run(listing.get_untracked().root)) />
+                    <IconButton label=t("刷新文件") icon="refresh" busy=loading
+                        disabled=busy on_click=Callback::new(move |_| reload.update(|n| *n = n.wrapping_add(1))) />
                 </div></div>
                 <div class="file-filter-row"><div class="mini-tabs" role="group" aria-label=t("文件类型")>{[("all",t("全部文件")),("video",t("视频")),("audio",t("音频")),("folder",t("文件夹"))].into_iter().map(|(value,label)| view! {
                     <ActionButton label=label variant="ghost" pressed=Signal::derive(move || Some(filter.get() == value)) on_click=Callback::new(move |_| filter.set(value.into())) />
-                }).collect_view()}</div><div class="file-sort-controls"><label class="toolbar-field"><span>{t("排序")}</span><select class="ui-select ui-select-sm input" aria-label=t("媒体排序") prop:value=move || sort.get().value() on:change=move |e| sort.set(SortKey::parse(&event_target_value(&e)))><option value="name">{t("名称")}</option><option value="modified">{t("修改时间")}</option><option value="size">{t("大小")}</option></select></label>
+                }).collect_view()}</div>
+                <div class="search-field file-search"><Icon name="search" size=17 /><input class="ui-input ui-input-sm" aria-label=t("搜索文件") placeholder=t("搜索当前目录…") prop:value=move || keyword.get() on:input=move |e| keyword.set(event_target_value(&e)) />
+                    <Show when=move || !keyword.get().is_empty()><IconButton label=t("清除搜索") icon="close" on_click=Callback::new(move |_| keyword.set(String::new())) /></Show>
+                </div>
+                <div class="file-sort-controls"><label class="toolbar-field"><span class="sr-only">{t("排序")}</span><select class="ui-select ui-select-sm input" aria-label=t("媒体排序") prop:value=move || sort.get().value() on:change=move |e| sort.set(SortKey::parse(&event_target_value(&e)))><option value="name">{t("名称")}</option><option value="modified">{t("修改时间")}</option><option value="size">{t("大小")}</option></select></label>
                     <ActionButton label=Signal::derive(move || if descending.get() { t("降序") } else { t("升序") }) class="small" variant="ghost"
                         aria_label=t("切换排序方向").to_string() pressed=Signal::derive(move || Some(descending.get())) on_click=Callback::new(move |_| descending.update(|value| *value = !*value)) />
                 </div></div>
@@ -427,7 +399,11 @@ pub fn StorageView() -> impl IntoView {
                             }><EmptyState icon="folder" title=t("这里还没有文件") description=t("录制完成后可在这里浏览、预览和整理文件。") /></Show>
                         </Show>
                     }>
-                        <div class="table-container"><table class="ui-table ui-table-sm file-table"><thead><tr><th scope="col">{t("名称")}</th><th scope="col" class="file-size">{t("大小")}</th><th scope="col" class="file-date">{t("修改时间")}</th><th scope="col" class="file-actions">{t("操作")}</th></tr></thead><tbody>
+                        <div class="table-container"><table class="ui-table ui-table-sm file-table"><thead><tr>
+                            <th scope="col" aria-sort=move || if sort.get() == SortKey::Name { if descending.get() { "descending" } else { "ascending" } } else { "none" }>{t("名称")}</th>
+                            <th scope="col" class="file-size" aria-sort=move || if sort.get() == SortKey::Size { if descending.get() { "descending" } else { "ascending" } } else { "none" }>{t("大小")}</th>
+                            <th scope="col" class="file-date" aria-sort=move || if sort.get() == SortKey::Modified { if descending.get() { "descending" } else { "ascending" } } else { "none" }>{t("修改时间")}</th>
+                            <th scope="col" class="file-actions">{t("操作")}</th></tr></thead><tbody>
                             <For each=visible key=|item| item.path.clone() children=move |initial| {
                                 let icon = match kind(&initial) { "folder" => "folder", "audio" => "volume", "video" => "video", _ => "file" };
                                 let initial = StoredValue::new(initial);
@@ -438,6 +414,7 @@ pub fn StorageView() -> impl IntoView {
                                 }));
                                 let submitted = Signal::derive(move || item.with(|item| conversion_submissions.with(|paths| paths.contains(&item.path))));
                                 let processing = Memo::new(move |_| item.with(|item| state.media_jobs.with(|jobs| jobs.iter().any(|job| job.source == item.path && job.pending()))));
+                                let conversion_hint = Signal::derive(move || if exists.get() { t("同名 MP4 已存在") } else if processing.get() { t("处理中…") } else if !state.status.get().ok { t("本地服务未连接") } else { t("手动转换，保留源 TS") });
                                 let row_error = Signal::derive(move || item.with(|item| conversion_errors.with(|errors| errors.get(&item.path).cloned())));
                                 view! {
                                     <tr data-path=move || item.get().path>
@@ -446,25 +423,28 @@ pub fn StorageView() -> impl IntoView {
                                             disabled=Signal::derive(move || loading.get() || busy.get())
                                             on_click=Callback::new(move |_| enter.run(item.get_untracked()))>
                                             <span class="file-symbol" data-kind=move || item.with(kind)><Icon name=icon size=21 /></span>
-                                            <span class="file-name-copy"><strong>{move || item.get().name}</strong><small>{move || item.with(|item| if item.is_dir { t("文件夹").into() } else { item.name.rsplit('.').next().unwrap_or(t("文件")).to_ascii_uppercase() })}</small></span>
+                                            <span class="file-name-copy"><strong title=move || item.get().name>{move || item.get().name}</strong><small>{move || item.with(|item| if item.is_dir { t("文件夹").into() } else { item.name.rsplit('.').next().unwrap_or(t("文件")).to_ascii_uppercase() })}</small></span>
                                         </ActionButton></td>
                                         <td class="file-size">{move || item.with(|item| if item.size_known { human_size(item.size) } else if item.size_error.is_some() { t("体积不可用").into() } else { t("计算中…").into() })}</td>
                                         <td class="file-date">{move || modified_time(item.get().modified)}</td>
                                         <td class="file-actions"><div class="file-row-actions">
                                             <Show when=move || item.with(|item| !item.is_dir && item.name.to_ascii_lowercase().ends_with(".ts"))>
+                                                <span class="file-convert-control" role="group" aria-label=move || conversion_hint.get()
+                                                    tabindex=move || if exists.get() || processing.get() || !state.status.get().ok { "0" } else { "-1" }>
                                                 <ActionButton label=Signal::derive(move || if processing.get() { t("处理中…") } else { t("转 MP4") }) icon="file" class="small convert-action" variant="ghost"
                                                     aria_label=Signal::derive(move || crate::tr_format!("转为MP4：{}", item.get().name))
-                                                    title=Signal::derive(move || if exists.get() { t("同名 MP4 已存在") } else if processing.get() { t("处理中…") } else if !state.status.get().ok { t("本地服务未连接") } else { t("手动转换，保留源 TS") })
+                                                    title=conversion_hint
                                                     busy=submitted busy_label=t("正在提交…")
                                                     disabled=Signal::derive(move || exists.get() || processing.get() || loading.get() || busy.get() || !state.status.get().ok)
                                                     on_click=Callback::new(move |_| convert.run(item.get_untracked().path)) />
+                                                <span class="file-convert-hint" role="tooltip">{move || conversion_hint.get()}</span>
+                                                </span>
                                             </Show>
                                             <IconButton label=t("移至回收站") icon="trash" danger=true
                                                 aria_label=Signal::derive(move || crate::tr_format!("回收{}", item.get().name))
                                                 disabled=Signal::derive(move || busy.get() || loading.get() || submitted.get() || processing.get() || !state.status.get().ok)
                                                 on_click=Callback::new(move |_| { deleting.set(Some(item.get_untracked())); confirm.set(true); }) />
                                         </div>
-                                            <Show when=move || exists.get() && item.with(|item| !item.is_dir && item.name.to_ascii_lowercase().ends_with(".ts"))><small class="file-action-hint">{t("同名 MP4 已存在")}</small></Show>
                                             <FormFeedback error=row_error title=t("操作未完成") />
                                         </td>
                                     </tr>
@@ -479,36 +459,6 @@ pub fn StorageView() -> impl IntoView {
                     <span class="file-manager-total"><span>{t("当前目录大小")}</span><strong>{move || listing.with(|list| if list.total_size_known { human_size(list.total_size) } else if list.items.iter().any(|item| item.size_error.is_some()) { t("部分体积不可用").into() } else { t("体积计算中…").into() })}</strong></span>
                 </footer>
             </section>
-            <Show when=move || !active_jobs.get().is_empty() || !history_jobs.get().is_empty()>
-                <aside class="file-jobs-sidebar">
-                <details class="media-jobs queue-panel" aria-label=t("媒体处理任务") open>
-                    <summary class="queue-panel-heading"><span><Icon name="history" size=16 />{t("处理队列")}</span><span class="ui-badge ui-badge-sm">{move || active_jobs.get().len()}</span></summary>
-                    <p class="queue-caption">{t("正在处理的文件优先显示，原文件按转换设置保留。")}</p>
-                    <Show when=move || active_jobs.get().is_empty()><p class="queue-idle">{t("暂无正在处理的文件")}</p></Show>
-                    <div class="media-active-jobs">
-                        <For each=move || active_jobs.get() key=|id| id.clone() children=move |id| {
-                            let job = Memo::new(move |_| state.media_jobs.with(|jobs| jobs.iter().find(|job| job.id == id).cloned()));
-                            view! { <MediaJobStatus job=job /> }
-                        } />
-                    </div>
-                    <Show when=move || !history_jobs.get().is_empty()>
-                        <details class="media-history">
-                            <summary>{t("处理记录")}<span class="ui-badge ui-badge-sm">{move || history_jobs.get().len()}</span></summary>
-                            <For each=move || visible_history.get() key=|id| id.clone() children=move |id| {
-                                let job = Memo::new(move |_| state.media_jobs.with(|jobs| jobs.iter().find(|job| job.id == id).cloned()));
-                                view! { <MediaJobStatus job=job /> }
-                            } />
-                            <Show when=move || { history_jobs.get().len() > 8 }>
-                                <ActionButton label=Signal::derive(move || if show_all_history.get() { t("收起较早记录") } else { t("展开全部记录") })
-                                    class="small history-toggle" variant="ghost" pressed=Signal::derive(move || Some(show_all_history.get()))
-                                    on_click=Callback::new(move |_| show_all_history.update(|show| *show = !*show)) />
-                            </Show>
-                        </details>
-                    </Show>
-                </details>
-                </aside>
-            </Show>
-            </div>
         </div>
         <ConfirmDialog open=confirm title=t("移至回收站") confirm_text=t("移到回收站") busy_text=t("正在移入回收站…") hint=t("可在系统回收站恢复。无法回收时，原文件会保留。") description=Signal::derive(move || deleting.get().map(|item| if item.is_dir { crate::tr_format!("将移至回收站：“{}”及其目录内容。",item.name) } else { crate::tr_format!("将移至回收站：“{}”（{}）。",item.name,human_size(item.size)) }).unwrap_or_default()) busy=busy disabled=Signal::derive(move || loading.get() || !state.status.get().ok || conversion_submissions.with(|paths| !paths.is_empty())) on_confirm=remove />
     }

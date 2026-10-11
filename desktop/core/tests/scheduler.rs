@@ -73,65 +73,6 @@ async fn recording_progress_is_published_each_second_without_waiting_for_disk_sa
 }
 
 #[tokio::test]
-async fn browser_access_failures_are_runtime_only_and_preserve_last_verified_room() {
-    use streamcap_core::platforms::kuaishou;
-    let dir = tempfile::tempdir().unwrap();
-    let workspace = Workspace::from_repo_root(dir.path());
-    let state = bootstrap(workspace.clone()).await.unwrap();
-    let mut record = Recording::new(
-        "access".into(),
-        "https://live.kuaishou.com/u/fixture".into(),
-        "Fixture".into(),
-    );
-    record.platform_key = Some("kuaishou".into());
-    record.is_live = true;
-    record.live_title = Some("Last verified title".into());
-    record.last_success_at = Some(123);
-    state.store.insert(vec![record.clone()]).await.unwrap();
-    let before = std::fs::read(workspace.recordings_path()).unwrap();
-    for (error, access, captcha) in [
-        (kuaishou::PAGE_CHECK_REQUIRED, "pageCheck", false),
-        (kuaishou::RATE_LIMITED, "cooldown", false),
-        (kuaishou::LOGIN_PROMPT, "loginPrompt", false),
-        (kuaishou::LOGIN_REQUIRED, "loginRequired", false),
-        (kuaishou::VERIFICATION_REQUIRED, "captcha", true),
-    ] {
-        state.scheduler.report_kuaishou_access(&record, error).await;
-        let current = state.store.get("access").await.unwrap();
-        assert_eq!(current.access_state, access);
-        assert_eq!(current.verification_required, captcha);
-        assert!(current.is_live && !current.is_recording);
-        assert_eq!(current.live_title, record.live_title);
-        assert_eq!(current.last_success_at, Some(123));
-        assert_eq!(std::fs::read(workspace.recordings_path()).unwrap(), before);
-    }
-    state
-        .store
-        .update("access", |r| {
-            r.url = "https://live.kuaishou.com/u/replaced".into()
-        })
-        .await;
-    let current = state.store.get("access").await.unwrap();
-    state
-        .scheduler
-        .report_kuaishou_access(&record, kuaishou::RATE_LIMITED)
-        .await;
-    assert_eq!(state.store.get("access").await.unwrap(), current);
-    state
-        .store
-        .apply_stream_info("access", &streamcap_core::resolver::StreamInfo::default())
-        .await
-        .unwrap();
-    let recovered = state.store.get("access").await.unwrap();
-    assert!(
-        recovered.access_state.is_empty()
-            && !recovered.verification_required
-            && recovered.check_error.is_none()
-    );
-    streamcap_core::api::shutdown(&state).await.unwrap();
-}
-
-#[tokio::test]
 async fn checks_publish_queue_running_completion_and_preserve_success_on_failure() {
     let dir = tempfile::tempdir().unwrap();
     let state = bootstrap(Workspace::from_repo_root(dir.path()))
@@ -330,6 +271,158 @@ async fn settle_checks() {
     for _ in 0..40 {
         tokio::task::yield_now().await;
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn completed_automatic_checks_are_not_readmitted_before_the_interval() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = bootstrap(Workspace::from_repo_root(dir.path()))
+        .await
+        .unwrap();
+    state
+        .config
+        .write()
+        .await
+        .update_user_config(
+            json!({"loop_time_seconds":"30","platform_request_interval":"0"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+        .unwrap();
+    state
+        .store
+        .insert(
+            (0..7)
+                .map(|index| {
+                    let mut record = Recording::new(
+                        format!("batch-{index}"),
+                        format!("http://127.0.0.1:1/{index}.mp4"),
+                        "Fixture".into(),
+                    );
+                    record.only_notify_no_record = Some(true);
+                    record
+                })
+                .collect(),
+        )
+        .await
+        .unwrap();
+    let mut events = state.store.subscribe();
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(state.scheduler.clone().run(rx));
+    let mut counts = std::collections::HashMap::<String, usize>::new();
+    for (seconds, expected) in [(0, 1), (29, 1), (1, 2)] {
+        tokio::time::advance(Duration::from_secs(seconds)).await;
+        settle_checks().await;
+        while let Ok(event) = events.try_recv() {
+            if event.topic == "update" && event.payload["checkState"] == "checking" {
+                let id = event.payload["recId"].as_str().unwrap().to_owned();
+                *counts.entry(id).or_default() += 1;
+            }
+        }
+        for index in 0..7 {
+            assert_eq!(
+                counts.get(&format!("batch-{index}")).copied().unwrap_or(0),
+                expected,
+                "batch-{index}: each completed check must rearm before readmission"
+            );
+        }
+    }
+    stop.send(true).unwrap();
+    task.await.unwrap();
+    streamcap_core::api::shutdown(&state).await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn login_and_unknown_access_states_keep_standard_checks_without_unlocking_captcha() {
+    use streamcap_core::platforms::kuaishou::{
+        ACCESS_UNAVAILABLE, LOGIN_PROMPT, LOGIN_REQUIRED, PAGE_UNAVAILABLE, VERIFICATION_REQUIRED,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = bootstrap(Workspace::from_repo_root(dir.path()))
+        .await
+        .unwrap();
+    state
+        .config
+        .write()
+        .await
+        .update_user_config(
+            json!({"loop_time_seconds":"30","platform_request_interval":"0"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+        .unwrap();
+    let cases = [
+        ("prompt", LOGIN_PROMPT),
+        ("login", LOGIN_REQUIRED),
+        ("access", ACCESS_UNAVAILABLE),
+        ("page", PAGE_UNAVAILABLE),
+        ("captcha", VERIFICATION_REQUIRED),
+    ];
+    state
+        .store
+        .insert(
+            cases
+                .iter()
+                .map(|(id, error)| {
+                    let mut record = Recording::new(
+                        (*id).into(),
+                        format!("https://live.kuaishou.com/u/{id}"),
+                        "Fixture".into(),
+                    );
+                    record.platform_key = Some("kuaishou".into());
+                    // Resolver preflight rejects quality before any HTTP access.
+                    record.quality = Some("INVALID".into());
+                    record.check_error = Some((*error).into());
+                    record.access_state =
+                        streamcap_core::platforms::kuaishou::access_state(error).into();
+                    record.verification_required = *error == VERIFICATION_REQUIRED;
+                    record.is_live = true;
+                    record.live_title = Some("Last confirmed title".into());
+                    record.last_success_at = Some(123);
+                    record
+                })
+                .collect(),
+        )
+        .await
+        .unwrap();
+    let mut events = state.store.subscribe();
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(state.scheduler.clone().run(rx));
+    let mut counts = std::collections::HashMap::<String, usize>::new();
+    for (seconds, expected) in [(0, 1), (29, 1), (1, 2)] {
+        tokio::time::advance(Duration::from_secs(seconds)).await;
+        settle_checks().await;
+        while let Ok(event) = events.try_recv() {
+            assert_ne!(event.topic, "kuaishouVerificationRequired");
+            if event.topic == "update" && event.payload["checkState"] == "checking" {
+                let id = event.payload["recId"].as_str().unwrap().to_owned();
+                *counts.entry(id).or_default() += 1;
+            }
+        }
+        for (id, _) in cases {
+            assert_eq!(
+                counts.get(id).copied().unwrap_or(0),
+                if id == "captcha" { 0 } else { expected },
+                "{id}"
+            );
+            let current = state.store.get(id).await.unwrap();
+            assert!(current.monitor_status && current.is_live && !current.is_recording);
+            assert_eq!(current.live_title.as_deref(), Some("Last confirmed title"));
+            assert_eq!(current.last_success_at, Some(123));
+            assert!(current.recovery_at.is_none());
+            assert_eq!(current.verification_required, id == "captcha");
+            if id == "captcha" {
+                assert_eq!(current.access_state, "captcha");
+                assert_eq!(current.check_wait_reason, "verification");
+            }
+        }
+    }
+    stop.send(true).unwrap();
+    task.await.unwrap();
+    streamcap_core::api::shutdown(&state).await.unwrap();
 }
 
 #[tokio::test(start_paused = true)]
@@ -826,123 +919,45 @@ async fn queued_paused_and_outside_schedule_tasks_do_not_start_recording() {
 }
 
 #[tokio::test]
-async fn verified_kuaishou_room_keeps_monitoring_intent_and_runtime_state_out_of_storage() {
-    use streamcap_core::{resolver::StreamInfo, scheduler::CheckOutcome};
-    for monitor in [false, true] {
-        let dir = tempfile::tempdir().unwrap();
-        let workspace = Workspace::from_repo_root(dir.path());
-        let state = bootstrap(workspace.clone()).await.unwrap();
-        state
-            .config
-            .write()
-            .await
-            .update_user_config(
-                json!({"loop_time_seconds":"4500","convert_to_mp4":true,"delete_original":true})
-                    .as_object()
-                    .unwrap()
-                    .clone(),
-            )
-            .unwrap();
-        let mut record = Recording::new(
-            "verify".into(),
-            "https://live.kuaishou.com/u/fixture".into(),
-            "Fixture".into(),
-        );
-        record.platform_key = Some("kuaishou".into());
-        record.monitor_status = monitor;
-        record.only_notify_no_record = Some(true);
-        record.check_error =
-            Some(streamcap_core::platforms::kuaishou::VERIFICATION_REQUIRED.into());
-        record.verification_required = true;
-        state.store.insert(vec![record]).await.unwrap();
-        let expected = state.store.get("verify").await.unwrap();
-        let info = StreamInfo {
-            platform: "快手直播".into(),
-            anchor_name: "Fixture".into(),
-            is_live: true,
-            record_url: "https://media.invalid/verified.flv".into(),
-            ..Default::default()
-        };
-        let result = state
-            .scheduler
-            .accept_verified(&expected, &info)
-            .await
-            .unwrap();
-        assert_eq!(
-            result,
-            if monitor {
-                CheckOutcome::NotifyOnly
-            } else {
-                CheckOutcome::MonitoringPaused
-            }
-        );
-        let current = state.store.get("verify").await.unwrap();
-        assert_eq!(current.monitor_status, monitor);
-        assert!(current.is_live);
-        assert!(!current.is_recording);
-        assert!(current.check_error.is_none());
-        assert!(!current.verification_required);
-        assert!(state.engine.active_ids().await.is_empty());
-        state.store.persist().await.unwrap();
-        let stored = std::fs::read_to_string(workspace.recordings_path()).unwrap();
-        assert!(
-            !stored.contains("checkError")
-                && !stored.contains("verificationRequired")
-                && !stored.contains("check_error")
-        );
-        assert_eq!(
-            state.config.read().await.get_str("loop_time_seconds", ""),
-            "4500"
-        );
-        assert!(state.config.read().await.get_bool("delete_original", false));
-        state
-            .store
-            .update("verify", |r| {
-                r.url = "https://live.kuaishou.com/u/changed".into()
-            })
-            .await;
-        assert!(state
-            .scheduler
-            .accept_verified(&expected, &info)
-            .await
-            .unwrap_err()
-            .contains("已更新"));
-        streamcap_core::api::shutdown(&state).await.unwrap();
-    }
-}
-
-#[tokio::test]
-async fn human_access_report_is_pushed_without_overwriting_last_verified_live_state() {
+async fn failed_kuaishou_check_has_no_browser_event_or_credential_write() {
     let dir = tempfile::tempdir().unwrap();
-    let state = bootstrap(Workspace::from_repo_root(dir.path()))
-        .await
-        .unwrap();
+    let workspace = Workspace::from_repo_root(dir.path());
+    let state = bootstrap(workspace.clone()).await.unwrap();
     let mut record = Recording::new(
-        "human".into(),
-        "https://live.kuaishou.com/u/fixture".into(),
+        "access".into(),
+        "https://live.kuaishou.com/u/never-requested".into(),
         "Fixture".into(),
     );
     record.platform_key = Some("kuaishou".into());
+    // Invalid quality is rejected before the HTTP request, keeping this test fully offline.
+    record.quality = Some("INVALID".into());
     record.monitor_status = true;
     record.is_live = true;
-    state.store.insert(vec![record]).await.unwrap();
-    let expected = state.store.get("human").await.unwrap();
+    record.live_title = Some("Last verified title".into());
+    record.last_success_at = Some(123);
+    state.store.insert(vec![record.clone()]).await.unwrap();
+    let saved = std::fs::read(workspace.recordings_path()).unwrap();
+    let cookies = state.config.read().await.cookies_for_resolver().unwrap();
     let mut events = state.store.subscribe();
-    state
-        .scheduler
-        .report_kuaishou_access(
-            &expected,
-            streamcap_core::platforms::kuaishou::VERIFICATION_REQUIRED,
-        )
-        .await;
-    let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(event.topic, "update");
-    let actual = state.store.get("human").await.unwrap();
-    assert!(actual.is_live && actual.monitor_status && actual.verification_required);
-    assert_eq!(actual.access_state, "captcha");
-    assert!(!actual.is_recording);
+    assert!(matches!(
+        state.scheduler.check("access".into()).await.unwrap(),
+        streamcap_core::scheduler::CheckOutcome::Failed(_)
+    ));
+    let checked = state.store.get("access").await.unwrap();
+    assert!(checked.check_error.is_some());
+    assert!(checked.is_live && !checked.is_recording);
+    assert_eq!(checked.live_title, record.live_title);
+    assert_eq!(checked.last_success_at, Some(123));
+    assert_eq!(std::fs::read(workspace.recordings_path()).unwrap(), saved);
+    assert_eq!(
+        state.config.read().await.cookies_for_resolver().unwrap(),
+        cookies
+    );
+    let mut had_update = false;
+    while let Ok(event) = events.try_recv() {
+        assert_ne!(event.topic, "kuaishouVerificationRequired");
+        had_update |= event.topic == "update";
+    }
+    assert!(had_update);
     streamcap_core::api::shutdown(&state).await.unwrap();
 }

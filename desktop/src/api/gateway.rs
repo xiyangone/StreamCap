@@ -146,8 +146,8 @@ impl Recording {
             StatusKind::Verification
         } else if self.access_state == "cooldown" {
             StatusKind::Cooldown
-        } else if self.access_state == "pageCheck" {
-            StatusKind::PageCheck
+        } else if self.access_state == "unavailable" {
+            StatusKind::AccessRestricted
         } else if self.access_state == "loginRequired" {
             StatusKind::LoginRequired
         } else if self.access_state == "loginPrompt" {
@@ -185,7 +185,7 @@ pub enum TaskPhase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusKind {
     Cooldown,
-    PageCheck,
+    AccessRestricted,
     LoginRequired,
     LoginPrompt,
     Waiting,
@@ -205,7 +205,7 @@ impl StatusKind {
     pub fn label(self) -> &'static str {
         match self {
             Self::Cooldown => crate::app::i18n::t("平台冷却中"),
-            Self::PageCheck => crate::app::i18n::t("页面待检查"),
+            Self::AccessRestricted => crate::app::i18n::t("访问受限"),
             Self::LoginRequired => crate::app::i18n::t("需要登录"),
             Self::LoginPrompt => crate::app::i18n::t("登录提示"),
             Self::Waiting => crate::app::i18n::t("等待首检"),
@@ -214,7 +214,7 @@ impl StatusKind {
             Self::Rechecking => crate::app::i18n::t("录制结束，复核中"),
             Self::Recovering => crate::app::i18n::t("等待恢复录制"),
             Self::RecordingFailed => crate::app::i18n::t("录制异常"),
-            Self::Verification => crate::app::i18n::t("待验证"),
+            Self::Verification => crate::app::i18n::t("验证受限"),
             Self::CheckFailed => crate::app::i18n::t("检测异常"),
             Self::Recording => crate::app::i18n::t("录制中"),
             Self::Live => crate::app::i18n::t("直播未录制"),
@@ -229,7 +229,8 @@ impl StatusKind {
             | Self::RecordingFailed
             | Self::Cooldown
             | Self::LoginRequired
-            | Self::LoginPrompt => "badge attention",
+            | Self::LoginPrompt
+            | Self::AccessRestricted => "badge attention",
             Self::Recording => "badge recording",
             Self::Live => "badge live",
             Self::Monitoring
@@ -237,8 +238,7 @@ impl StatusKind {
             | Self::Queued
             | Self::Checking
             | Self::Rechecking
-            | Self::Recovering
-            | Self::PageCheck => "badge monitoring",
+            | Self::Recovering => "badge monitoring",
             Self::Stopped => "badge stopped",
         }
     }
@@ -286,7 +286,7 @@ mod detection_status_tests {
     #[test]
     fn page_rate_limit_login_and_captcha_have_distinct_statuses() {
         for (access, expected) in [
-            ("pageCheck", StatusKind::PageCheck),
+            ("unavailable", StatusKind::AccessRestricted),
             ("cooldown", StatusKind::Cooldown),
             ("loginRequired", StatusKind::LoginRequired),
             ("loginPrompt", StatusKind::LoginPrompt),
@@ -681,8 +681,6 @@ pub struct AppState {
     pub events_connected: RwSignal<bool>,
     pub events_revision: RwSignal<u32>,
     pub theme: RwSignal<String>,
-    pub system_dark: RwSignal<bool>,
-    pub accent: RwSignal<String>,
     pub grid_view: RwSignal<bool>,
     pub now: RwSignal<i64>,
 }
@@ -742,11 +740,7 @@ impl AppState {
         }
     }
     pub fn is_dark(self) -> bool {
-        match self.theme.get().as_str() {
-            "dark" => true,
-            "system" => self.system_dark.get(),
-            _ => false,
-        }
+        self.theme.get() == "dark"
     }
     pub fn notify(self, message: impl Into<String>) {
         self.publish_notice(Notice {
@@ -800,14 +794,8 @@ impl AppState {
             .with_value(|writes| writes.desired.clone());
         if let Some(desired) = desired {
             self.theme.set(desired.theme);
-            self.accent.set(desired.accent);
-        } else {
-            if let Some(theme) = settings.get("theme_mode").and_then(Value::as_str) {
-                self.theme.set(normalize_theme(theme));
-            }
-            if let Some(accent) = settings.get("theme_color").and_then(Value::as_str) {
-                self.accent.set(normalize_accent(accent));
-            }
+        } else if let Some(theme) = settings.get("theme_mode").and_then(Value::as_str) {
+            self.theme.set(normalize_theme(theme));
         }
         if let Some(grid) = settings.get("is_grid_view").and_then(Value::as_bool) {
             self.grid_view.set(grid);
@@ -885,7 +873,6 @@ impl SettingsSync {
 #[derive(Debug, Clone, PartialEq)]
 struct Appearance {
     theme: String,
-    accent: String,
 }
 #[derive(Default)]
 struct AppearanceWrites {
@@ -916,6 +903,14 @@ impl AppearanceWrites {
 #[cfg(test)]
 mod settings_sync_tests {
     use super::*;
+
+    #[test]
+    fn themes_resolve_to_explicit_light_or_dark_only() {
+        assert_eq!(normalize_theme("dark"), "dark");
+        for value in ["light", "system", "", "purple", "invalid"] {
+            assert_eq!(normalize_theme(value), "light");
+        }
+    }
 
     #[test]
     fn only_the_latest_settings_response_can_publish_success_or_failure() {
@@ -952,20 +947,14 @@ mod settings_sync_tests {
     fn appearance_writes_are_serial_and_coalesce_to_the_latest_choice() {
         let dark = Appearance {
             theme: "dark".into(),
-            accent: "blue".into(),
-        };
-        let purple = Appearance {
-            theme: "dark".into(),
-            accent: "purple".into(),
         };
         let light = Appearance {
             theme: "light".into(),
-            accent: "purple".into(),
         };
         let mut writes = AppearanceWrites::default();
         assert!(writes.push(dark.clone()));
         assert_eq!(writes.next(), Some(dark.clone()));
-        assert!(!writes.push(purple));
+        assert!(!writes.push(dark.clone()));
         assert!(!writes.push(light.clone()));
         writes.saved(&dark);
         assert_eq!(writes.desired, Some(light.clone()));
@@ -980,7 +969,6 @@ mod settings_sync_tests {
     fn a_failed_appearance_write_keeps_the_local_choice() {
         let local = Appearance {
             theme: "dark".into(),
-            accent: "red".into(),
         };
         let mut writes = AppearanceWrites::default();
         assert!(writes.push(local.clone()));
@@ -1014,20 +1002,10 @@ mod settings_sync_tests {
 }
 
 pub fn normalize_theme(value: &str) -> String {
-    if matches!(value, "light" | "dark" | "system") {
+    if matches!(value, "light" | "dark") {
         value.into()
     } else {
         "light".into()
-    }
-}
-pub fn normalize_accent(value: &str) -> String {
-    if matches!(
-        value,
-        "blue" | "teal" | "purple" | "green" | "orange" | "red" | "indigo"
-    ) {
-        value.into()
-    } else {
-        "blue".into()
     }
 }
 pub fn provide_app_state() -> AppState {
@@ -1077,16 +1055,6 @@ pub fn provide_app_state() -> AppState {
         events_revision: RwSignal::new(0),
         theme: RwSignal::new(normalize_theme(
             appearance["theme"].as_str().unwrap_or("light"),
-        )),
-        system_dark: RwSignal::new(
-            window()
-                .match_media("(prefers-color-scheme: dark)")
-                .ok()
-                .flatten()
-                .is_some_and(|query| query.matches()),
-        ),
-        accent: RwSignal::new(normalize_accent(
-            appearance["accent"].as_str().unwrap_or("blue"),
         )),
         grid_view: RwSignal::new(true),
         now: RwSignal::new((js_sys::Date::now() / 1000.0) as i64),
@@ -1515,7 +1483,6 @@ fn encode(value: &str) -> String {
 pub fn save_appearance(state: AppState) {
     let value = Appearance {
         theme: state.theme.get_untracked(),
-        accent: state.accent.get_untracked(),
     };
     state
         .settings_sync
@@ -1532,8 +1499,7 @@ pub fn save_appearance(state: AppState) {
             .appearance_writes
             .try_update_value(AppearanceWrites::next)
         {
-            match save_settings(json!({"theme_mode":value.theme,"theme_color":value.accent})).await
-            {
+            match save_settings(json!({"theme_mode":value.theme})).await {
                 Ok(()) => {
                     let _ = state
                         .appearance_writes

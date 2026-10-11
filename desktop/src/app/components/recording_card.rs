@@ -13,7 +13,6 @@ enum Action {
     Start,
     Stop,
     Monitor,
-    Verify,
 }
 
 /// Owned by the request, not the rendered card: removing a row must not release
@@ -54,6 +53,7 @@ pub fn RecordingCard(
     on_edit: Callback<Recording>,
     on_info: Callback<Recording>,
     on_preview: Callback<Recording>,
+    on_mini_preview: Callback<Recording>,
     #[prop(optional)] selectable: bool,
     #[prop(default = RwSignal::new(Vec::new()))] selected: RwSignal<Vec<String>>,
     #[prop(default = Signal::stored(false), into)] locked: Signal<bool>,
@@ -61,6 +61,7 @@ pub fn RecordingCard(
     #[prop(default = Callback::new(|_| {}))] on_busy_change: Callback<bool>,
 ) -> impl IntoView {
     let state = gateway::app_state();
+    let preview = super::preview_state();
     let initial = StoredValue::new(recording);
     let record = Memo::new(move |_| {
         initial
@@ -71,6 +72,7 @@ pub fn RecordingCard(
     let active_action = RwSignal::new(None::<Action>);
     let deleting = RwSignal::new(false);
     let menu = NodeRef::<html::Details>::new();
+    let menu_opens_up = RwSignal::new(false);
     let close_menu = Callback::new(move |_| {
         if let Some(menu) = menu.get() {
             // Dialogs must restore focus to the visible trigger, not a hidden menu item.
@@ -113,7 +115,6 @@ pub fn RecordingCard(
                     || matches!(rec.check_state.as_str(), "checking" | "rechecking")
             }
             Action::Stop => !rec.is_recording,
-            Action::Verify => !crate::api::desktop::state().available,
             Action::Monitor => false,
         };
         if unavailable {
@@ -124,10 +125,6 @@ pub fn RecordingCard(
         leptos::task::spawn_local(async move {
             let _operation = operation;
             let (result, message) = match action {
-                Action::Verify => (
-                    crate::api::desktop::verify_kuaishou(&rec.rec_id).await,
-                    t("已打开快手验证窗口"),
-                ),
                 Action::Check => (
                     gateway::check_recording(&rec.rec_id).await,
                     t("已更新直播状态"),
@@ -198,14 +195,7 @@ pub fn RecordingCard(
                     </Show>
                 <Show when=move || record.get().check_error.is_some() && record.get().check_state != "rechecking">
                     <div class="card-check-error" role="status" title=move || record.get().check_error.unwrap_or_default()>
-                        <span><Icon name="alert" size=14 />{move || if record.get().verification_required { t("请在快手窗口完成验证").to_string() } else { crate::tr_format!("检测失败：{}",record.get().check_error.unwrap_or_default()) }}</span>
-                        <Show when=move || record.get().platform_key.as_deref() == Some("kuaishou") && (record.get().verification_required || matches!(record.get().access_state.as_str(), "pageCheck" | "unavailable" | "loginPrompt" | "loginRequired" | "cooldown"))>
-                            <ActionButton label=Signal::derive(move || if record.get().verification_required { t("重新验证") } else { t("检查页面") })
-                                icon="shield" class="card-verify" busy_label=t("正在打开…")
-                                busy=Signal::derive(move || active_action.get() == Some(Action::Verify))
-                                disabled=Signal::derive(move || locked.get() || busy.get() || !state.status.get().ok || !crate::api::desktop::state().available)
-                                on_click=Callback::new(move |_| perform.run(Action::Verify)) />
-                        </Show>
+                        <span><Icon name="alert" size=14 />{move || crate::tr_format!("检测失败：{}",record.get().check_error.unwrap_or_default())}</span>
                     </div>
                 </Show>
                 <Show when=move || record.get().recording_error.as_ref().is_some_and(|error| !error.is_empty())>
@@ -232,6 +222,7 @@ pub fn RecordingCard(
                     <Show when=move || !record.get().monitor_status><span class="card-monitor-row"><span>{t("监控已暂停")}</span></span></Show>
                 </Show>
             </div>
+            <div class="card-controls" role="group" aria-label=t("直播间操作")>
             <div class="card-monitor-setting">
                 <ToggleSwitch label=t("自动检测") compact=true
                     hint=t("开启后自动检测开播并录制；关闭会停止监控和当前录制。")
@@ -241,6 +232,16 @@ pub fn RecordingCard(
                     on_change=Callback::new(move |enabled| {
                         if enabled != record.get_untracked().monitor_status { perform.run(Action::Monitor); }
                     }) />
+            </div>
+            <div class="card-preview-actions" role="group" aria-label=t("预览操作")>
+                <ActionButton label=t("预览") icon="eye" class="card-preview"
+                    aria_label=t("预览录制文件").to_string() title=t("预览录制文件")
+                    pressed=Signal::derive(move || Some(preview.recording_is_open(&record.get().rec_id, false)))
+                    on_click=Callback::new(move |_| on_preview.run(record.get_untracked())) />
+                <ActionButton label=t("小窗") icon="picture-in-picture" class="card-preview"
+                    aria_label=t("小窗预览").to_string() title=t("小窗预览")
+                    pressed=Signal::derive(move || Some(preview.recording_is_open(&record.get().rec_id, true)))
+                    on_click=Callback::new(move |_| on_mini_preview.run(record.get_untracked())) />
             </div>
             <div class="card-actions">
                     <Show when=move || active_action.get() != Some(Action::Start) && (record.get().is_recording || active_action.get() == Some(Action::Stop))
@@ -258,7 +259,23 @@ pub fn RecordingCard(
                             on_click=Callback::new(move |_| perform.run(Action::Stop)) />
                     </Show>
                 <details node_ref=menu class="ui-dropdown ui-dropdown-end card-menu card-tools" name="streamcap-task-menu"
+                    class:card-menu-above=move || menu_opens_up.get()
                     role="group" aria-label=t("任务操作")
+                    on:toggle=move |_| {
+                        let Some(menu) = menu.get() else { return; };
+                        if !menu.open() {
+                            menu_opens_up.set(false);
+                            return;
+                        }
+                        let Some(panel) = menu.query_selector(".card-menu-panel").ok().flatten() else { return; };
+                        let Some(content) = document().get_element_by_id("main-content") else { return; };
+                        let anchor = menu.get_bounding_client_rect();
+                        let viewport = content.get_bounding_client_rect();
+                        let needed = panel.get_bounding_client_rect().height() + 9.0;
+                        let below = viewport.bottom() - anchor.bottom();
+                        let above = anchor.top() - viewport.top();
+                        menu_opens_up.set(below < needed && above > below);
+                    }
                     on:keydown=move |event: leptos::ev::KeyboardEvent| {
                         if event.key() == "Escape" {
                             event.prevent_default();
@@ -268,13 +285,10 @@ pub fn RecordingCard(
                     <summary class="ui-btn ui-btn-ghost ui-btn-sm ui-btn-square" role="button" aria-label=t("更多操作") title=t("更多操作")><Icon name="more" size=18 /></summary>
                     <ul class="ui-menu ui-dropdown-content card-menu-panel">
                     <CardTool label=t("检测直播状态") icon="refresh"
-                        hint=Signal::derive(move || if locked.get() { t("正在执行批量操作") } else if checking() || active_action.get() == Some(Action::Check) { t("正在检测直播状态…") } else if busy.get() { t("操作正在进行，请稍候") } else if !state.status.get().ok { t("本地服务未连接") } else if record.get().verification_required { t("请先完成快手验证") } else if !state.status.get().resolver_ready { t("直播解析服务尚未就绪") } else if !record.get().monitor_status { t("请先开启自动检测") } else { t("检测状态（已开播时会启动录制）") }.to_string())
+                        hint=Signal::derive(move || if locked.get() { t("正在执行批量操作") } else if checking() || active_action.get() == Some(Action::Check) { t("正在检测直播状态…") } else if busy.get() { t("操作正在进行，请稍候") } else if !state.status.get().ok { t("本地服务未连接") } else if record.get().verification_required { t("平台验证受限，自动检测已暂停") } else if !state.status.get().resolver_ready { t("直播解析服务尚未就绪") } else if !record.get().monitor_status { t("请先开启自动检测") } else { t("检测状态（已开播时会启动录制）") }.to_string())
                         busy=Signal::derive(move || checking() || active_action.get() == Some(Action::Check))
                         disabled=Signal::derive(move || locked.get() || busy.get() || checking() || !state.status.get().ok || !record.get().monitor_status || record.get().verification_required || !state.status.get().resolver_ready)
                         on_click=Callback::new(move |_| { close_menu.run(()); perform.run(Action::Check); }) />
-                    <CardTool label=t("预览录制文件") icon="eye"
-                        hint=Signal::derive(move || t("预览录制文件").to_string()) disabled=Signal::derive(|| false)
-                        on_click=Callback::new(move |_| { close_menu.run(()); on_preview.run(record.get_untracked()); }) />
                     <CardTool label=t("编辑任务") icon="edit"
                         hint=Signal::derive(move || if locked.get() { t("正在执行批量操作") } else if record.get().is_recording { t("请先停止录制") } else if busy.get() { t("操作正在进行，请稍候") } else if !state.status.get().ok { t("本地服务未连接") } else { t("编辑任务") }.to_string())
                         disabled=Signal::derive(move || locked.get() || busy.get() || record.get().is_recording || !state.status.get().ok)
@@ -286,7 +300,8 @@ pub fn RecordingCard(
                     </ul>
                 </details>
             </div>
-            <MediaJobStatus job=media_job compact=true />
+            </div>
+            <MediaJobStatus job=media_job />
         </article>
         <ConfirmDialog open=deleting title=t("移除直播间") description=Signal::derive(move || crate::tr_format!("将从工作空间移除“{}”。已有录制文件不会被删除。", record.get().name()))
             busy=busy disabled=Signal::derive(move || locked.get() || record.get().is_recording || !state.status.get().ok) on_confirm=delete />

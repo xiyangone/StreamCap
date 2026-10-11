@@ -22,6 +22,14 @@ pub fn disable_unimplemented(values: &mut Map<String, Value>) {
         values.insert((*key).into(), Value::Bool(false));
     }
 }
+fn normalize_theme_settings(values: &mut Map<String, Value>) {
+    values.remove("theme_color");
+    if let Some(theme) = values.get_mut("theme_mode") {
+        if theme.as_str() != Some("dark") {
+            *theme = Value::String("light".into());
+        }
+    }
+}
 pub fn read_json_object(path: &Path) -> io::Result<Map<String, Value>> {
     if !path.exists() {
         return Ok(Map::new());
@@ -104,9 +112,12 @@ pub fn validate_settings(patch: &Map<String, Value>) -> io::Result<()> {
     }
     if patch
         .get("theme_mode")
-        .is_some_and(|v| !matches!(v.as_str(), Some("light" | "dark" | "system")))
+        .is_some_and(|v| !matches!(v.as_str(), Some("light" | "dark")))
     {
         return Err(invalid("主题模式无效"));
+    }
+    if patch.contains_key("theme_color") {
+        return Err(invalid("不支持配置主题强调色"));
     }
     if patch
         .get("close_action")
@@ -168,6 +179,7 @@ pub fn validate_settings(patch: &Map<String, Value>) -> io::Result<()> {
 #[derive(Debug, Clone)]
 pub struct ConfigStore {
     workspace: Workspace,
+    persisted_user_config: Map<String, Value>,
     user_config: Map<String, Value>,
     default_config: Map<String, Value>,
 }
@@ -178,20 +190,25 @@ impl ConfigStore {
         let mut default_config = native_defaults();
         default_config.extend(read_json_object(&workspace.default_settings_path())?);
         disable_unimplemented(&mut default_config);
-        let mut user_config = read_json_object(&workspace.user_settings_path())?;
+        normalize_theme_settings(&mut default_config);
+        let mut persisted_user_config = read_json_object(&workspace.user_settings_path())?;
 
         // 与 Python `init_user_config` 一致：首次运行（文件缺失或为空）时把默认设置复制为
         // 用户设置。否则设置页会读到空配置并渲染成空白表单。
-        if user_config.is_empty() && !default_config.is_empty() {
+        if persisted_user_config.is_empty() && !default_config.is_empty() {
             write_json(
                 &workspace.user_settings_path(),
                 &Value::Object(default_config.clone()),
             )?;
-            user_config = default_config.clone();
+            persisted_user_config = default_config.clone();
         }
 
+        // Normalize only the read view so unrelated saves retain historical settings on disk.
+        let mut user_config = persisted_user_config.clone();
+        normalize_theme_settings(&mut user_config);
         Ok(Self {
             workspace,
+            persisted_user_config,
             user_config,
             default_config,
         })
@@ -244,19 +261,21 @@ impl ConfigStore {
         validate_settings(&patch)?;
         let changed: Vec<String> = patch
             .iter()
-            .filter(|(key, value)| self.user_config.get(*key) != Some(*value))
+            .filter(|(key, value)| self.persisted_user_config.get(*key) != Some(*value))
             .map(|(key, _)| key.clone())
             .collect();
         if changed.is_empty() {
             return Ok(changed);
         }
-        let mut updated = self.user_config.clone();
+        let mut updated = self.persisted_user_config.clone();
         updated.extend(patch);
         write_json(
             &self.workspace.user_settings_path(),
             &Value::Object(updated.clone()),
         )?;
-        self.user_config = updated;
+        self.user_config = updated.clone();
+        normalize_theme_settings(&mut self.user_config);
+        self.persisted_user_config = updated;
         Ok(changed)
     }
 

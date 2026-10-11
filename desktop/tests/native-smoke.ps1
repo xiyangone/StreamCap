@@ -86,15 +86,25 @@ const openCardMenu=async card=>{
   await menu.locator('.card-menu-panel').waitFor({state:'visible'});
   return menu;
 };
-const cardMenuAction=async(card,name)=>{
-  const menu=await openCardMenu(card);
-  await menu.locator('.card-menu-panel').getByRole('button',{name,exact:true}).click();
-  await eventually(()=>menu.evaluate(node=>node.open),value=>!value,'native card action closes menu');
-};
 try {
   const browser=await chromium.connectOverCDP('http://127.0.0.1:'+port);
   page=browser.contexts().flatMap(context=>context.pages()).find(page=>page.url().includes('tauri.localhost'));
   if(!page)throw Error('The isolated native app webview was not found');
+  const targetSession=await browser.newBrowserCDPSession();
+  const windowTargets=targets=>targets.filter(target=>['page','webview'].includes(target.type));
+  const initialTargets=windowTargets((await targetSession.send('Target.getTargets')).targetInfos);
+  assert.equal(initialTargets.length,1,'the isolated app must start with only its main webview');
+  assert.ok(initialTargets[0].url.includes('tauri.localhost'));
+  const mainTargetId=initialTargets[0].targetId,unexpectedWindows=new Set();
+  targetSession.on('Target.targetCreated',({targetInfo})=>{
+    if(windowTargets([targetInfo]).length&&targetInfo.targetId!==mainTargetId)unexpectedWindows.add(targetInfo.targetId);
+  });
+  await targetSession.send('Target.setDiscoverTargets',{discover:true});
+  const assertNoVerificationWindow=async()=>{
+    const targets=windowTargets((await targetSession.send('Target.getTargets')).targetInfos);
+    assert.deepEqual(targets.map(target=>target.targetId),[mainTargetId],'no verification child webview may exist');
+    assert.equal(unexpectedWindows.size,0,'no transient or hidden verification child webview may be created');
+  };
   page.setDefaultTimeout(12000);
   const errors=[];page.on('pageerror',error=>{errors.push(String(error));diagnostic.push(String(error));});
   page.on('console',message=>{if(message.type()==='error')diagnostic.push(message.text());});
@@ -112,135 +122,19 @@ try {
   const shell=await page.locator('.app-shell').boundingBox();assert.equal(shell.x,0);assert.equal(shell.y,0);
   assert.equal(await page.locator('.sidebar').evaluate(el=>getComputedStyle(el).borderRadius),'0px');
   await page.screenshot({path:path.join(output,'native-window.png'),fullPage:true,animations:'disabled'});
-  // Actual WebView2 decoding and automatic conversion; only generated, loopback media is used.
-  let verificationMode='challenge',verificationRequests=0,verificationDelayMs=0;
-  const verificationSource=createServer((req,res)=>{
-    if(req.url!=='/kuaishou-fixture/room'){res.writeHead(404);res.end();return;}
-    verificationRequests++;
-    const room=['challenge','late-offline','text-challenge'].includes(verificationMode)?{author:{},liveStream:{},isLiving:false,errorType:{type:400002,title:'请完成滑块验证'}}:verificationMode==='stale-offline'?{author:{id:'fixture-verify',name:'验证夹具'},liveStream:{},isLiving:false,errorType:{type:400002,title:'请完成滑块验证'}}:{author:{id:'fixture-verify',name:'验证夹具'},liveStream:{},isLiving:false,errorType:{}};
-    if(['rate-limit','login-required','login-prompt'].includes(verificationMode)){room.author={};room.errorType={type:400002,title:verificationMode==='login-required'?'请先登录后观看':'请完成滑块验证',content:verificationMode==='rate-limit'?'请求过快，请稍后重试':''};}
-    const state={user:{userInfoQuery:{ownerInfo:{originUserId:'fixture-user',name:'验证账号'}}},liveroom:{playList:[room]}};
-    const send=()=>{if(res.destroyed)return;
-    res.writeHead(200,{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store',...(verificationMode==='public-offline'?{'Set-Cookie':['userId=; Path=/; Max-Age=0','site_proof=fixture-public; Path=/; SameSite=Lax']}:verificationMode!=='challenge'?{'Set-Cookie':'site_proof=fixture-verified; Path=/; SameSite=Lax'}:{})});
-    const delayed=verificationMode==='late-offline'?"setTimeout(()=>{window.__INITIAL_STATE__.liveroom.playList[0]={author:{id:'fixture-verify',name:'验证夹具'},isLiving:false,liveStream:{}};document.querySelector('.player').textContent='验证夹具 主播尚未开播，可以观看其他直播';},5500);":verificationMode==='transient-challenge'?"setTimeout(()=>{document.querySelector('.player').textContent='验证夹具 主播尚未开播，可以观看其他直播';},2500);":"";
-    const playerText=verificationMode==='text-challenge'?'请完成滑块验证':verificationMode==='rate-limit'?'请求过快，请稍后重试':verificationMode==='login-required'?'请先登录后观看':verificationMode==='login-prompt'?'页面加载中':verificationMode==='challenge'||verificationMode==='transient-challenge'?'<div class="captcha" style="width:300px;height:120px">请完成滑块验证</div>':verificationMode==='late-offline'?'页面加载中':'验证夹具 主播尚未开播，可以观看其他直播';
-    const loginPrompt=['login-prompt','public-login-prompt','rate-limit'].includes(verificationMode)?'<div role="dialog" class="login-panel" style="width:350px;height:250px">登录畅享蓝光直播画质 快手APP登录 手机号登录</div>':'';
-    res.end('<!doctype html><html><head><title>本机快手验证夹具</title></head><body><h1>本机验证夹具</h1><div class="live-room"><div class="swiper-slide-active"><div class="player">'+playerText+'</div></div></div>'+loginPrompt+'<div style="display:none"><div class="captcha" style="width:300px;height:120px">隐藏的验证码模板</div></div><script>window.__INITIAL_STATE__ = '+JSON.stringify(state)+';'+delayed+'document.currentScript.remove();</script></body></html>');};
-    if(verificationDelayMs)setTimeout(send,verificationDelayMs);else send();
-  });
-  await new Promise(resolve=>verificationSource.listen(0,'127.0.0.1',resolve));
-  const verificationUrl='http://127.0.0.1:'+verificationSource.address().port+'/kuaishou-fixture/room';
-  const verificationCall=args=>page.evaluate(async args=>(await import('/tauri-api/core.js')).invoke('desktop_kuaishou_verification',args),args);
-  const verificationStatus=()=>verificationCall({action:'status'});
-  const seedCookie='userId=fixture-user; kuaishou.live.web_st=fixture-session; did=fixture-device; did=stale-parent';
-  const setCookie=async cookie=>{const response=await fetch(base+'/api/cookies',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({cookies:{kuaishou:cookie}})});assert.equal(response.status,200);};
-  const readCookie=async()=>(await(await fetch(base+'/api/cookies')).json()).cookies.kuaishou;
-  await setCookie(seedCookie);
-  const verifyCreated=await fetch(base+'/api/recordings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:'https://live.kuaishou.com/u/fixture-verify',streamerName:'验证夹具'})});assert.equal(verifyCreated.status,200);
-  const verifyTask=(await verifyCreated.json()).created[0];
-  const paused=await fetch(base+'/api/recordings/'+verifyTask.recId+'/monitor',{method:'POST'});assert.equal(paused.status,200);
-  const openVerification=()=>verificationCall({action:'smoke-open',recId:verifyTask.recId,fixtureUrl:verificationUrl});
-  await openVerification();await openVerification();
-  const verificationPage=await eventually(()=>browser.contexts().flatMap(context=>context.pages()).find(candidate=>candidate.url()===verificationUrl),Boolean,'isolated verification window',20000);
-  await verificationPage.getByText('请完成滑块验证',{exact:true}).waitFor();
-  assert.equal(browser.contexts().flatMap(context=>context.pages()).filter(candidate=>candidate.url()===verificationUrl).length,1,'duplicate verification requests must share one window');
-  assert.ok(await verificationPage.evaluate(()=>document.cookie.includes('did=fixture-device')),'official page scripts retain access to their own device cookie');
-  const remoteIpcDenied=await verificationPage.evaluate(async()=>{if(!window.__TAURI_INTERNALS__?.invoke)return true;try{await window.__TAURI_INTERNALS__.invoke('desktop_window_action',{action:'close'});return false;}catch{return true;}});
-  assert.equal(remoteIpcDenied,true);assert.equal((await native()).closing,false);
-  const countBeforeVerify=verificationRequests;
-  await verificationCall({action:'complete'});
-  await eventually(verificationStatus,status=>status.active&&!status.busy,'challenge not mistaken for success');
-  assert.equal(verificationRequests,countBeforeVerify,'checking the current page must not force a second navigation');
-  assert.equal(await readCookie(),seedCookie,'challenge must not replace saved cookies');
-  await verificationPage.screenshot({path:path.join(output,'native-kuaishou-challenge.png'),fullPage:true});
-  await verificationPage.evaluate(()=>localStorage.setItem('streamcap-fixture-proof','persisted'));
-  await verificationCall({action:'smoke-close'});
-  await eventually(verificationStatus,status=>!status.active&&status.activeWorkers===0,'verification X cleans its window and workers');
-  assert.equal((await native()).closing,false);assert.equal(await readCookie(),seedCookie);
-  const requestsAfterClose=verificationRequests;await sleep(400);assert.equal(verificationRequests,requestsAfterClose,'cancelled verification must not continue network requests');
-  await openVerification();
-  const reopenedProofPage=await eventually(()=>browser.contexts().flatMap(context=>context.pages()).find(p=>p.url()===verificationUrl),Boolean,'persistent isolated verification profile');
-  assert.equal(await reopenedProofPage.evaluate(()=>localStorage.getItem('streamcap-fixture-proof')),'persisted');
-  await verificationCall({action:'smoke-close'});
-  await eventually(verificationStatus,s=>!s.active&&s.activeWorkers===0,'persistent proof check cleanup');
-  verificationDelayMs=1500;await openVerification();
-  const pendingVerification=await verificationCall({action:'complete'});assert.equal(pendingVerification.busy,true);
-  await verificationCall({action:'smoke-close'});
-  await eventually(verificationStatus,status=>!status.active&&status.activeWorkers===0,'X cancels an in-flight verification');
-  assert.equal(await readCookie(),seedCookie,'cancellation during verification does not save cookies');verificationDelayMs=0;
-  await openVerification();
-  const staleSessionPage=await eventually(()=>browser.contexts().flatMap(context=>context.pages()).find(candidate=>candidate.url()===verificationUrl),Boolean,'stale verification window',20000);
-  await staleSessionPage.waitForLoadState('domcontentloaded');
-  await setCookie(seedCookie+'; updated=elsewhere');
-  await eventually(verificationStatus,status=>!status.active&&status.activeWorkers===0,'external session update cancels stale verification');
-  assert.equal(await readCookie(),seedCookie+'; updated=elsewhere');
-  verificationMode='stale-offline';
-  await openVerification();
-  await eventually(verificationStatus,status=>!status.active&&status.activeWorkers===0,'rendered offline room clears stale challenge automatically',25000);
-  assert.ok((await readCookie()).includes('site_proof=fixture-verified'),'save only a verified same-site session');
-  assert.equal((await readCookie()).split(';').filter(pair=>pair.trim().startsWith('did=')).length,1,'saved browser and HTTP sessions use one identical device cookie');
-  const verifiedTask=(await(await fetch(base+'/api/recordings')).json()).find(task=>task.recId===verifyTask.recId);
-  assert.equal(verifiedTask.monitorStatus,false);assert.equal(verifiedTask.isRecording,false);assert.equal(verifiedTask.isLive,false);assert.equal(verifiedTask.verificationRequired,false);assert.equal(verifiedTask.checkError,null);
-  verificationMode='late-offline';
-  await openVerification();
-  const latePage=await eventually(()=>browser.contexts().flatMap(context=>context.pages()).find(candidate=>candidate.url()===verificationUrl),Boolean,'late same-document room',20000);
-  await latePage.getByText('页面加载中',{exact:true}).waitFor();
-  assert.equal(await latePage.evaluate(()=>document.documentElement.outerHTML.includes('window.__INITIAL_STATE__')),false,'real pages remove the SSR state script after execution');
-  const beforeLate=verificationRequests;
-  await eventually(verificationStatus,status=>!status.active&&status.activeWorkers===0,'same-document login or hydration completes after the old five-attempt deadline',20000);
-  assert.equal(verificationRequests,beforeLate,'local observation must not force extra room requests');
-  const stillPaused=(await(await fetch(base+'/api/recordings')).json()).find(task=>task.recId===verifyTask.recId);
-  assert.equal(stillPaused.monitorStatus,false);assert.equal(stillPaused.isRecording,false);assert.equal(stillPaused.verificationRequired,false);
-  const beforePublicCookie=await readCookie();verificationMode='public-offline';await openVerification();
-  await eventually(verificationStatus,status=>!status.active&&status.activeWorkers===0,'public offline room does not require an unnecessary login',15000);
-  assert.equal(await readCookie(),beforePublicCookie,'public room checks must never overwrite saved account identity');
-  verificationMode='late-offline';
-  const hiddenOpen=await verificationCall({action:'smoke-open-background',recId:verifyTask.recId,fixtureUrl:verificationUrl});
-  assert.equal(hiddenOpen.visible,false,'automatic room inspection must start hidden');
-  await eventually(async()=>{const state=await verificationStatus();assert.equal(state.visible,false,'offline room must never raise a verification window');return state;},state=>!state.active&&state.activeWorkers===0,'offline background inspection completes without any popup',20000);
-  verificationMode='transient-challenge';
-  const beforeTransient=verificationRequests;
-  const transientOpen=await verificationCall({action:'smoke-open-background',recId:verifyTask.recId,fixtureUrl:verificationUrl});
-  assert.equal(transientOpen.active,true,'the transient test must actually start a fresh inspection');
-  assert.equal(transientOpen.visible,false);
-  await eventually(async()=>{const state=await verificationStatus();assert.equal(state.visible,false,'a transient challenge must never flash the hidden window');return state;},state=>!state.active&&state.activeWorkers===0,'transient challenge clears while the window stays hidden',20000);
-  assert.equal(verificationRequests,beforeTransient+1,'stability observation must not reload the room');
-  verificationMode='public-login-prompt';
-  await verificationCall({action:'smoke-open-background',recId:verifyTask.recId,fixtureUrl:verificationUrl});
-  await eventually(async()=>{const status=await verificationStatus();assert.equal(status.visible,false);return status;},status=>!status.active&&status.activeWorkers===0,'readable public room remains valid despite an optional login prompt',15000);
-  for(const [mode,expected] of [['rate-limit','cooldown'],['login-required','loginRequired'],['login-prompt','loginPrompt']]){
-    await setCookie(await readCookie()); // Fresh local fixture scenario; never logs in or touches a real account.
-    const beforeProblemCookie=await readCookie();const count=verificationRequests;
-    const beforeProblem=(await(await fetch(base+'/api/recordings')).json()).find(task=>task.recId===verifyTask.recId);
-    verificationMode=mode;
-    const opened=await verificationCall({action:'smoke-open-background',recId:verifyTask.recId,fixtureUrl:verificationUrl});
-    assert.equal(opened.active,true);
-    await eventually(verificationStatus,status=>status.active&&status.visible&&!status.busy,mode+' keeps an inspectable official page',15000);
-    const checked=(await(await fetch(base+'/api/recordings')).json()).find(task=>task.recId===verifyTask.recId);
-    assert.equal(checked.accessState,expected);assert.equal(checked.verificationRequired,false);assert.equal(checked.isRecording,false);
-    assert.equal(checked.isLive,beforeProblem.isLive);assert.equal(checked.lastSuccessAt,beforeProblem.lastSuccessAt);
-    assert.equal(await readCookie(),beforeProblemCookie,'unreadable pages must never overwrite credentials');
-    assert.equal(verificationRequests,count+1,'one page request only');
-    await verificationCall({action:'smoke-close'});
-    await eventually(verificationStatus,status=>!status.active&&status.activeWorkers===0,mode+' explicit close releases the observer');
+  // Rejected IPC only: do not create platform tasks, sessions, or verification pages.
+  const removedActions=['status','open','smoke-open','smoke-open-background','complete','cancel','smoke-close'];
+  for(const action of removedActions){
+    const rejection=await page.evaluate(async action=>{
+      const {invoke}=await import('/tauri-api/core.js');
+      try{await invoke('desktop_kuaishou_verification',{action,recId:'removed-native-command'});return '';}
+      catch(error){return String(error);}
+    },action);
+    assert.match(rejection,/desktop_kuaishou_verification.*(?:not found|not allowed)|Command not found/i,action+' must be rejected before entering a command handler');
+    await assertNoVerificationWindow();
   }
-  await setCookie(await readCookie());
-  verificationMode='challenge';
-  await verificationCall({action:'smoke-open-background',recId:verifyTask.recId,fixtureUrl:verificationUrl});
-  await eventually(verificationStatus,state=>state.active&&state.visible,'only a real visible challenge surfaces the shared window',15000);
-  const captchaTask=(await(await fetch(base+'/api/recordings')).json()).find(task=>task.recId===verifyTask.recId);
-  assert.equal(captchaTask.accessState,'captcha');assert.equal(captchaTask.verificationRequired,true);
-  await verificationCall({action:'smoke-close'});
-  await eventually(verificationStatus,state=>!state.active&&state.activeWorkers===0,'challenge cancellation closes background observer');
-  await setCookie(await readCookie()); // Reset only the synthetic scenario's explicit dismissal.
-  verificationMode='text-challenge';
-  await verificationCall({action:'smoke-open-background',recId:verifyTask.recId,fixtureUrl:verificationUrl});
-  await eventually(async()=>{const status=await verificationStatus();return status.visible;},Boolean,'text-only access challenge surfaces only after stable observations',15000);
-  const textBlocked=(await(await fetch(base+'/api/recordings')).json()).find(task=>task.recId===verifyTask.recId);
-  assert.equal(textBlocked.verificationRequired,true);assert.equal(textBlocked.isRecording,false);
-  await verificationCall({action:'cancel'});
-  await eventually(verificationStatus,status=>!status.active&&status.activeWorkers===0,'text-only challenge cleanup');
-  const verificationValidation={persistentAccountProfile:true,textOnlyChallenge:true,singleWindow:true,remoteIpcDenied,challengeNotOffline:true,currentPageOnly:true,removedInitialScript:true,lateSameDocumentRecovery:true,hiddenChallengeIgnored:true,cookieScopeConsistent:true,publicRoomWithoutLogin:true,savedIdentityPreserved:true,offlineNoPopup:true,recoverablePageSurfaced:true,renderedOfflineAutoRecovery:true,cancelPreservesCookie:true,pendingCancelCleansWorkers:true,staleSessionCancelled:true,verifiedCookieSaved:true,pausedTaskNotStarted:true,rateLimitBeforeIdentity:true,loginPromptIsNotExpiredSession:true,loginRequiredIsNotCaptcha:true,accessFailureHasManualRecovery:true,transientChallengeNoPopup:true};
+  assert.equal((await native()).closing,false);
+  // Actual WebView2 decoding and automatic conversion; only generated, loopback media is used.
   const fixture=await fs.readFile(path.join(output,'native-preview.ts'));
   const mediaSource=createServer((_req,res)=>{res.writeHead(200,{'Content-Type':'video/mp2t','Content-Length':fixture.length});res.end(fixture);});
   await new Promise(resolve=>mediaSource.listen(0,'127.0.0.1',resolve));
@@ -256,7 +150,7 @@ try {
   await menuTrigger.press('Escape');
   await eventually(()=>firstMenu.evaluate(node=>node.open),value=>!value,'native Escape closes task menu');
   assert.equal(await menuTrigger.evaluate(node=>node===document.activeElement),true);
-  await cardMenuAction(mediaCard,'预览录制文件');const previewModal=page.getByRole('dialog',{name:'录制预览',exact:true});
+  await mediaCard.getByRole('button',{name:'预览录制文件',exact:true}).click();const previewModal=page.getByRole('dialog',{name:'录制预览',exact:true});
   await page.waitForFunction(()=>{const video=document.querySelector('video');return video?.videoWidth===160&&video.currentTime>0.5;},null,{timeout:20000});
   const liveSlider=previewModal.getByRole('slider',{name:'播放进度',exact:true});await liveSlider.waitFor();
   await eventually(()=>liveSlider.getAttribute('max'),value=>Number(value)>5,'growing recording timeline',18000);
@@ -290,7 +184,7 @@ try {
   await mediaCard.getByRole('button',{name:'停止录制',exact:true}).click();
   const completedJob=await eventually(async()=>{const response=await fetch(base+'/api/media/jobs');assert.equal(response.status,200);return (await response.json()).jobs.find(j=>j.taskId===mediaTask.recId&&j.state==='complete');},Boolean,'verified media job',25000);
   assert.equal(completedJob.deleteOriginal,deleteOriginal);assert.equal(completedJob.sourceRemoved,deleteOriginal);
-  await cardMenuAction(mediaCard,'预览录制文件');
+  await mediaCard.getByRole('button',{name:'预览录制文件',exact:true}).click();
   await previewModal.getByRole('listitem').filter({hasText:/\.mp4/}).getByRole('button').click();
   await page.waitForFunction(()=>{const video=document.querySelector('video');return video?.videoWidth===160&&video.currentTime>0.5;},null,{timeout:15000});
   await page.screenshot({path:path.join(output,'native-mp4-preview.png'),fullPage:true,animations:'disabled'});
@@ -341,10 +235,9 @@ try {
     setTimeout(()=>finish(false),1000);
   }));
   assert.equal(security.inlineScriptBlocked,true);
-  // Leave a verification window alive so both real exit paths must own and clean it.
-  verificationMode='challenge';await openVerification();
-  assert.equal((await verificationStatus()).active,true);
-  const result={passed:true,security,mediaValidation,verificationValidation,title:await page.title(),checks:['frameless-shell','maximize-restore','flush-layout','close-cancel','escape-cancel','tray-keeps-backend','remember-tray','close-preference-change',exitMode==='Tray'?'tray-menu-exit':'explicit-dialog-exit'],transport:stats,exitMode};
+  await assertNoVerificationWindow();
+  const nativeSurfaceValidation={removedCommandRejected:true,rejectedActions:removedActions,noVerificationSubwindow:true};
+  const result={passed:true,security,mediaValidation,nativeSurfaceValidation,title:await page.title(),checks:['frameless-shell','maximize-restore','flush-layout','close-cancel','escape-cancel','tray-keeps-backend','remember-tray','close-preference-change',exitMode==='Tray'?'tray-menu-exit':'explicit-dialog-exit'],transport:stats,exitMode};
   await fs.writeFile(path.join(output,'ui-result.json'),JSON.stringify(result,null,2));
   if(exitMode==='Tray') {
     await requestClose();await modal.getByRole('button',{name:/最小化到托盘/}).click();await modal.waitFor({state:'hidden'});
@@ -391,7 +284,7 @@ try {
     $process.WaitForExit()
     if ($process.ExitCode -ne 0) {throw "Application exit code=$($process.ExitCode)"}
     $shutdown = Get-Content -LiteralPath (Join-Path $profile 'shutdown.json') -Raw | ConvertFrom-Json
-    if (-not $shutdown.shutdownComplete -or $shutdown.activeRecordings -ne 0 -or $shutdown.pendingMediaJobs -ne 0 -or $shutdown.activePreviews -ne 0 -or $shutdown.verification.active -or $shutdown.verification.activeWorkers -ne 0) {throw 'Ordered shutdown incomplete'}
+    if (-not $shutdown.shutdownComplete -or $shutdown.activeRecordings -ne 0 -or $shutdown.pendingMediaJobs -ne 0 -or $shutdown.activePreviews -ne 0) {throw 'Ordered shutdown incomplete'}
     $remaining = @()
     for ($i=0;$i -lt 30;$i++) {
         $current = @{}

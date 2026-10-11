@@ -286,10 +286,6 @@ pub fn SettingsView() -> impl IntoView {
         state.theme.set(theme.into());
         gateway::save_appearance(state);
     });
-    let choose_accent = Callback::new(move |accent: &'static str| {
-        state.accent.set(accent.into());
-        gateway::save_appearance(state);
-    });
     let cookie_keys = move || {
         let search = cookie_search.get().to_lowercase();
         let mut keys: Vec<_> = PLATFORMS
@@ -448,16 +444,9 @@ pub fn SettingsView() -> impl IntoView {
                     <Show when=move || tab.get() == Tab::Appearance>
                         <LanguagePicker /><SettingsGroup title=t("外观") subtitle=t("窗口和内容使用同一套主题。") icon="sun">
                             <div class="theme-options" role="group" aria-label=t("主题模式")>
-                                {[("light",t("浅色"),"sun"),("dark",t("深色"),"moon"),("system",t("跟随系统"),"monitor")].into_iter().map(|(mode,label,icon)| view! {
+                                {[("light",t("浅色"),"sun"),("dark",t("深色"),"moon")].into_iter().map(|(mode,label,icon)| view! {
                                     <ActionButton label=label class="theme-option" variant="ghost" pressed=Signal::derive(move || Some(state.theme.get() == mode))
                                         on_click=Callback::new(move |_| choose_theme.run(mode))><span class="theme-preview" data-preview=mode><i /><i /><i /></span><span class="theme-option-label"><Icon name=icon size=17 />{label}<span class="theme-check"><Icon name="check" size=16 /></span></span></ActionButton>
-                                }).collect_view()}
-                            </div>
-                            <div class="settings-row"><div><strong>{t("强调色")}</strong><p>{t("用于主要按钮、选中状态和界面高亮。")}</p></div></div>
-                            <div class="accent-options" role="group" aria-label=t("强调色")>
-                                {[("blue",t("晴空蓝")),("teal",t("湖水青")),("purple",t("鸢尾紫")),("green",t("松林绿")),("orange",t("暖橙")),("red",t("珊瑚红")),("indigo",t("靛蓝"))].into_iter().map(|(color,label)| view! {
-                                    <span class="accent-choice" data-color=color><IconButton label=label icon="check" class="accent-swatch"
-                                        pressed=Signal::derive(move || Some(state.accent.get() == color)) on_click=Callback::new(move |_| choose_accent.run(color)) /></span>
                                 }).collect_view()}
                             </div>
                             <div class="settings-row"><div><strong>{t("默认任务视图")}</strong><p>{t("在网格卡片和紧凑列表之间切换。")}</p></div><div class="view-switch">

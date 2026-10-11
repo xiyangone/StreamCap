@@ -1017,35 +1017,32 @@ async fn committed_room_change_and_monitor_resume_start_without_manual_detection
 }
 
 #[tokio::test]
-async fn user_paused_verification_never_starts_a_live_recording() {
+async fn user_paused_restricted_task_stays_paused_without_a_verification_callback() {
     let directory = tempfile::tempdir().unwrap();
     let state = api::bootstrap(Workspace::from_repo_root(directory.path()))
         .await
         .unwrap();
     let mut record = Recording::new(
-        "paused-page".into(),
-        "https://live.kuaishou.com/u/fixture".into(),
+        "paused-access".into(),
+        "https://live.kuaishou.com/u/never-requested".into(),
         "Fixture".into(),
     );
     record.platform_key = Some("kuaishou".into());
     record.monitor_status = false;
+    record.verification_required = true;
+    record.access_state = "captcha".into();
     state.store.insert(vec![record]).await.unwrap();
-    let expected = state.store.get("paused-page").await.unwrap();
-    state
-        .scheduler
-        .accept_verified(
-            &expected,
-            &StreamInfo {
-                is_live: true,
-                anchor_name: "Fixture".into(),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-    let actual = state.store.get("paused-page").await.unwrap();
-    assert!(actual.is_live);
-    assert!(!actual.monitor_status && !actual.is_recording);
+    let mut events = state.store.subscribe();
+    assert_eq!(
+        state.scheduler.check("paused-access".into()).await.unwrap(),
+        streamcap_core::scheduler::CheckOutcome::MonitoringPaused
+    );
+    let actual = state.store.get("paused-access").await.unwrap();
+    assert!(!actual.monitor_status && !actual.is_recording && !actual.is_live);
+    assert!(actual.verification_required);
     assert!(state.engine.active_ids().await.is_empty());
+    while let Ok(event) = events.try_recv() {
+        assert_ne!(event.topic, "kuaishouVerificationRequired");
+    }
     api::shutdown(&state).await.unwrap();
 }
