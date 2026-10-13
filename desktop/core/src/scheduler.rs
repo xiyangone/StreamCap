@@ -1424,6 +1424,38 @@ impl Scheduler {
         }
     }
 
+    /// The settings API owns the lifecycle lock and has already invalidated idle checks.
+    pub(crate) async fn global_defaults_changed(
+        &self,
+        changes: &[(crate::model::Recording, crate::model::Recording)],
+    ) {
+        for (previous, current) in changes {
+            if current.is_recording || current.quality == previous.quality {
+                continue;
+            }
+            if let Some(token) = self
+                .checks
+                .lock()
+                .expect("active checks")
+                .get(&current.rec_id)
+            {
+                token.cancel();
+            }
+            self.recovery_requests
+                .lock()
+                .expect("recovery requests")
+                .remove(&current.rec_id);
+            if current.monitor_status {
+                self.request_monitoring([current.rec_id.clone()]);
+            } else {
+                self.monitor_requests
+                    .lock()
+                    .expect("monitor requests")
+                    .remove(&current.rec_id);
+            }
+        }
+    }
+
     /// All checks, including post-recording refreshes, share one resolver and pacer.
     fn room_check(&self) -> RoomCheck {
         RoomCheck {
@@ -1637,32 +1669,94 @@ impl Scheduler {
         })
     }
 
-    /// 磁盘剩余空间检查（对应 Python check_free_space）。
+    /// New-task admission follows the configured root; existing tasks follow their outputs.
     pub async fn check_free_space(&self) -> Result<(), String> {
-        let (root, threshold_gb) = {
+        self.check_free_space_with(|paths, minimum| async move {
+            tokio::task::spawn_blocking(move || {
+                crate::media_safety::check_recording_space(&paths, minimum)
+            })
+            .await
+            .map_err(|error| format!("磁盘空间检查未完成：{error}"))
+        })
+        .await
+    }
+
+    async fn check_free_space_with<F, Fut>(&self, mut probe: F) -> Result<(), String>
+    where
+        F: FnMut(Vec<PathBuf>, u64) -> Fut,
+        Fut: std::future::Future<Output = Result<Vec<Result<(), String>>, String>>,
+    {
+        loop {
+            let (root, minimum, processes) = {
+                let _lifecycle = tokio::select! { biased;
+                    _ = self.stopping.cancelled() => return Err("应用正在退出".into()),
+                    guard = self.starting.lock() => guard,
+                };
+                let config = self.config.read().await;
+                let root = config.recordings_root();
+                let minimum = crate::media_safety::minimum_bytes(
+                    &config.get_str("recording_space_threshold", "2.0"),
+                );
+                drop(config);
+                (root, minimum, self.engine.active_processes().await)
+            };
+            let paths = std::iter::once(root.clone())
+                .chain(processes.iter().map(|process| process.output_path.clone()))
+                .collect::<Vec<_>>();
+            // Stop waiting on shutdown; an already running filesystem call may still finish.
+            // It owns only this snapshot and cannot publish state after cancellation.
+            let result = tokio::select! { biased;
+                _ = self.stopping.cancelled() => return Err("应用正在退出".into()),
+                result = probe(paths, minimum) => result,
+            };
+            let _lifecycle = tokio::select! { biased;
+                _ = self.stopping.cancelled() => return Err("应用正在退出".into()),
+                guard = self.starting.lock() => guard,
+            };
             let config = self.config.read().await;
-            (
-                config.recordings_root(),
-                config.get_str("recording_space_threshold", "2.0"),
-            )
-        };
-        let threshold: f64 = threshold_gb.parse().unwrap_or(2.0);
-
-        if let Err(error) = crate::media_safety::require_space(
-            &root,
-            (threshold * 1024.0 * 1024.0 * 1024.0) as u64,
-            0,
-        ) {
-            self.recording_enabled.store(false, Ordering::Relaxed);
-            self.store.snack_error(format!("录制空间保护：{error}"));
-            for id in self.engine.active_ids().await {
-                self.stop_recording(&id).await;
+            let current_root = config.recordings_root();
+            let current_minimum = crate::media_safety::minimum_bytes(
+                &config.get_str("recording_space_threshold", "2.0"),
+            );
+            drop(config);
+            if self.stopping.is_cancelled() {
+                return Err("应用正在退出".into());
             }
-            return Err(error.to_string());
+            if current_root != root || current_minimum != minimum {
+                continue;
+            }
+            let results = result.inspect_err(|_| {
+                self.recording_enabled.store(false, Ordering::SeqCst);
+            })?;
+            return self.apply_space_results(&processes, &results).await;
         }
+    }
 
-        self.recording_enabled.store(true, Ordering::Relaxed);
-        Ok(())
+    /// Caller holds the lifecycle lock; index zero is the configured root's result.
+    async fn apply_space_results(
+        &self,
+        processes: &[Arc<crate::engine::RecorderProcess>],
+        results: &[Result<(), String>],
+    ) -> Result<(), String> {
+        self.recording_enabled
+            .store(results.first().is_some_and(Result::is_ok), Ordering::SeqCst);
+        for (process, result) in processes.iter().zip(results.iter().skip(1)) {
+            if result.is_err() && self.engine.is_current(process).await {
+                self.stop_recording_locked(&process.rec_id, true).await;
+            }
+        }
+        let errors = results
+            .iter()
+            .filter_map(|result| result.as_ref().err())
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            let error = errors.into_iter().collect::<Vec<_>>().join("；");
+            self.store.snack_error(format!("录制空间保护：{error}"));
+            Err(error)
+        }
     }
 }
 
@@ -2318,6 +2412,460 @@ mod tests {
         for _ in 0..60 {
             tokio::task::yield_now().await;
         }
+    }
+
+    async fn space_probe_fixture() -> (
+        tempfile::TempDir,
+        crate::api::ApiState,
+        crate::engine::RecordOptions,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{body::Body, routing::get, Router};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/fixture.flv", listener.local_addr().unwrap());
+        let app = Router::new().route(
+            "/fixture.flv",
+            get(|| async {
+                let chunks = futures::stream::unfold(0_u32, |index| async move {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    let bytes = if index == 0 {
+                        b"FLV\x01\x05\x00\x00\x00\x09".to_vec()
+                    } else {
+                        vec![0; 256]
+                    };
+                    Some((Ok::<_, std::io::Error>(bytes), index.wrapping_add(1)))
+                });
+                ([("content-type", "video/x-flv")], Body::from_stream(chunks))
+            }),
+        );
+        let source = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let root = tempfile::tempdir().unwrap();
+        let state = crate::api::bootstrap(Workspace::from_repo_root(root.path()))
+            .await
+            .unwrap();
+        let options = crate::engine::RecordOptions {
+            record_url: url.clone(),
+            save_path: root.path().join("original.flv").to_string_lossy().into(),
+            format: "FLV".into(),
+            segment_record: false,
+            segment_time: None,
+            headers: None,
+            proxy: None,
+            platform_key: Some("custom".into()),
+            video_bitrate: None,
+            is_overseas: false,
+        };
+        let process = state.engine.start_direct("space", &options).await.unwrap();
+        let mut record = Recording::new("space".into(), url, "Space fixture".into());
+        record.is_recording = true;
+        record.recording_run = Some(process.run_id);
+        state.store.insert(vec![record]).await.unwrap();
+        (root, state, options, source)
+    }
+
+    async fn delayed_space_probe_allows_stop(shutdown: bool) {
+        let (_root, state, _options, source) = space_probe_fixture().await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let (release, pending) = tokio::sync::oneshot::channel::<()>();
+        let mut pending = Some(pending);
+        let scheduler = state.scheduler.clone();
+        let ready = entered.clone();
+        let mut check = tokio::spawn(async move {
+            scheduler
+                .check_free_space_with(move |paths, _| {
+                    let pending = pending.take().expect("only one probe");
+                    let ready = ready.clone();
+                    async move {
+                        ready.notify_one();
+                        let _ = pending.await;
+                        Ok(vec![Ok(()); paths.len()])
+                    }
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        let stopped = tokio::time::timeout(Duration::from_secs(2), async {
+            if shutdown {
+                crate::api::shutdown(&state).await.unwrap();
+                true
+            } else {
+                state.scheduler.stop_recording("space").await
+            }
+        })
+        .await;
+        let inactive_before_release = !state.engine.is_recording("space").await;
+        let cancelled_before_release = if shutdown {
+            tokio::time::timeout(Duration::from_millis(100), &mut check)
+                .await
+                .ok()
+        } else {
+            None
+        };
+        let cancelled_without_probe = cancelled_before_release.is_some();
+        let _ = release.send(());
+        let checked = match cancelled_before_release {
+            Some(result) => result.unwrap(),
+            None => tokio::time::timeout(Duration::from_secs(2), check)
+                .await
+                .unwrap()
+                .unwrap(),
+        };
+        crate::api::shutdown(&state).await.unwrap();
+        source.abort();
+        let _ = source.await;
+        assert!(
+            stopped.is_ok_and(|stopped| stopped),
+            "stop waited for the probe"
+        );
+        assert!(inactive_before_release);
+        if shutdown {
+            assert!(cancelled_without_probe);
+            assert!(
+                checked.is_err(),
+                "shutdown must discard the unfinished probe"
+            );
+            assert!(!state.recording_enabled.load(Ordering::SeqCst));
+        } else {
+            assert!(checked.is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn space_probe_does_not_block_manual_stop() {
+        delayed_space_probe_allows_stop(false).await;
+    }
+
+    #[tokio::test]
+    async fn space_probe_does_not_block_shutdown() {
+        delayed_space_probe_allows_stop(true).await;
+    }
+
+    async fn changed_space_probe_config_is_discarded(change_root: bool, join_error: bool) {
+        let (root, state, _options, source) = space_probe_fixture().await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (release, pending) = tokio::sync::oneshot::channel::<()>();
+        let mut pending = Some(pending);
+        let scheduler = state.scheduler.clone();
+        let enabled = state.recording_enabled.clone();
+        let ready = entered.clone();
+        let observed = observations.clone();
+        let check = tokio::spawn(async move {
+            scheduler
+                .check_free_space_with(move |paths, minimum| {
+                    observed.lock().unwrap().push((
+                        paths[0].clone(),
+                        minimum,
+                        enabled.load(Ordering::SeqCst),
+                    ));
+                    let pending = pending.take();
+                    let ready = ready.clone();
+                    async move {
+                        if let Some(pending) = pending {
+                            ready.notify_one();
+                            let _ = pending.await;
+                            if join_error {
+                                let failed =
+                                    tokio::spawn(std::future::pending::<Vec<Result<(), String>>>());
+                                failed.abort();
+                                failed
+                                    .await
+                                    .map_err(|error| format!("磁盘空间检查未完成：{error}"))
+                            } else {
+                                Ok(vec![Err("stale volume failure".into()); paths.len()])
+                            }
+                        } else {
+                            Ok(vec![Ok(()); paths.len()])
+                        }
+                    }
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        let mutation = tokio::time::timeout(Duration::from_secs(2), async {
+            let _lifecycle = state.store.lifecycle_guard().await;
+            let mut config = state.config.write().await;
+            let patch = if change_root {
+                serde_json::json!({"live_save_path":root.path().join("new-destination")})
+            } else {
+                serde_json::json!({"recording_space_threshold":"0.25"})
+            };
+            config
+                .update_user_config(patch.as_object().unwrap().clone())
+                .unwrap();
+            (
+                config.recordings_root(),
+                crate::media_safety::minimum_bytes(
+                    &config.get_str("recording_space_threshold", "2.0"),
+                ),
+            )
+        })
+        .await;
+        let _ = release.send(());
+        let checked = tokio::time::timeout(Duration::from_secs(2), check)
+            .await
+            .unwrap()
+            .unwrap();
+        let still_recording = state.engine.is_recording("space").await;
+        let admission = state.recording_enabled.load(Ordering::SeqCst);
+        crate::api::shutdown(&state).await.unwrap();
+        source.abort();
+        let _ = source.await;
+        let expected = mutation.expect("settings must not wait for the probe");
+        assert!(checked.is_ok());
+        assert!(still_recording, "stale results stopped the active recorder");
+        assert!(admission);
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.len(), 2, "changed settings need a fresh probe");
+        assert_ne!((observations[0].0.clone(), observations[0].1), expected);
+        assert_eq!((observations[1].0.clone(), observations[1].1), expected);
+        assert!(observations[1].2, "a stale failure changed admission");
+    }
+
+    #[tokio::test]
+    async fn space_probe_discards_old_root_results_and_join_errors() {
+        for join_error in [false, true] {
+            changed_space_probe_config_is_discarded(true, join_error).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn space_probe_discards_old_threshold_results_and_join_errors() {
+        for join_error in [false, true] {
+            changed_space_probe_config_is_discarded(false, join_error).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn space_probe_does_not_stop_a_replacement_started_while_waiting() {
+        let (root, state, mut options, source) = space_probe_fixture().await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let (release, pending) = tokio::sync::oneshot::channel::<()>();
+        let mut pending = Some(pending);
+        let scheduler = state.scheduler.clone();
+        let ready = entered.clone();
+        let check = tokio::spawn(async move {
+            scheduler
+                .check_free_space_with(move |paths, _| {
+                    let pending = pending.take().expect("only one probe");
+                    let ready = ready.clone();
+                    async move {
+                        ready.notify_one();
+                        let _ = pending.await;
+                        assert_eq!(paths.len(), 2);
+                        Ok(vec![Ok(()), Err("old output volume full".into())])
+                    }
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        let replacement = tokio::time::timeout(Duration::from_secs(2), async {
+            assert!(state.scheduler.stop_recording("space").await);
+            let _lifecycle = state.store.lifecycle_guard().await;
+            options.save_path = root.path().join("replacement.flv").to_string_lossy().into();
+            let process = state.engine.start_direct("space", &options).await.unwrap();
+            state
+                .store
+                .update("space", |record| {
+                    record.is_recording = true;
+                    record.recording_run = Some(process.run_id);
+                })
+                .await;
+            process
+        })
+        .await;
+        let _ = release.send(());
+        let checked = tokio::time::timeout(Duration::from_secs(2), check)
+            .await
+            .unwrap()
+            .unwrap();
+        let current = match &replacement {
+            Ok(process) => state.engine.is_current(process).await,
+            Err(_) => false,
+        };
+        crate::api::shutdown(&state).await.unwrap();
+        source.abort();
+        let _ = source.await;
+        assert!(replacement.is_ok(), "replacement waited for the probe");
+        assert!(checked.is_err());
+        assert!(current, "an old result stopped the replacement recorder");
+    }
+
+    #[tokio::test]
+    async fn volume_results_stop_only_affected_recorders_and_never_a_replacement() {
+        use axum::{body::Body, routing::get, Router};
+        let app = Router::new().route(
+            "/fixture.flv",
+            get(|| async {
+                let chunks = futures::stream::unfold(0_u32, |index| async move {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    let bytes = if index == 0 {
+                        b"FLV\x01\x05\x00\x00\x00\x09".to_vec()
+                    } else {
+                        vec![0; 256]
+                    };
+                    Some((Ok::<_, std::io::Error>(bytes), index.wrapping_add(1)))
+                });
+                ([("content-type", "video/x-flv")], Body::from_stream(chunks))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/fixture.flv", listener.local_addr().unwrap());
+        let source = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let root = tempfile::tempdir().unwrap();
+        let state = crate::api::bootstrap(Workspace::from_repo_root(root.path()))
+            .await
+            .unwrap();
+        let options = |name: &str| crate::engine::RecordOptions {
+            record_url: url.clone(),
+            save_path: root.path().join(name).to_string_lossy().into(),
+            format: "FLV".into(),
+            segment_record: false,
+            segment_time: None,
+            headers: None,
+            proxy: None,
+            platform_key: Some("custom".into()),
+            video_bitrate: None,
+            is_overseas: false,
+        };
+        for id in ["a", "b"] {
+            let mut record = Recording::new(id.into(), format!("{url}?room={id}"), id.into());
+            record.is_recording = true;
+            state.store.insert(vec![record]).await.unwrap();
+            state
+                .engine
+                .start_direct(id, &options(&format!("{id}.flv")))
+                .await
+                .unwrap();
+        }
+        let mut processes = state.engine.active_processes().await;
+        processes.sort_by(|a, b| a.rec_id.cmp(&b.rec_id));
+        assert_eq!(
+            processes[0].output_path,
+            root.path().canonicalize().unwrap().join("a.flv")
+        );
+        let lifecycle = state.store.lifecycle_guard().await;
+        // Changing the destination to a full volume must not stop healthy, existing outputs.
+        assert!(state
+            .scheduler
+            .apply_space_results(
+                &processes,
+                &[Err("new destination full".into()), Ok(()), Ok(())],
+            )
+            .await
+            .is_err());
+        assert!(!state.recording_enabled.load(Ordering::SeqCst));
+        assert_eq!(state.engine.active_ids().await.len(), 2);
+        // Old volume A fills after the destination has moved to a healthy volume.
+        assert!(state
+            .scheduler
+            .apply_space_results(&processes, &[Ok(()), Err("old volume full".into()), Ok(())],)
+            .await
+            .is_err());
+        assert!(state.recording_enabled.load(Ordering::SeqCst));
+        assert!(!state.engine.is_recording("a").await);
+        assert!(state.engine.is_recording("b").await);
+        let replacement = state
+            .engine
+            .start_direct("a", &options("a-replacement.flv"))
+            .await
+            .unwrap();
+        assert!(state
+            .scheduler
+            .apply_space_results(
+                &processes,
+                &[Ok(()), Err("stale volume failure".into()), Ok(())],
+            )
+            .await
+            .is_err());
+        assert!(state.engine.is_current(&replacement).await);
+        drop(lifecycle);
+        crate::api::shutdown(&state).await.unwrap();
+        source.abort();
+        let _ = source.await;
+    }
+
+    #[tokio::test]
+    async fn inherited_quality_change_cancels_recheck_and_requeues_without_waiting_for_interval() {
+        let (_root, state, expected) = finished_recording_fixture().await;
+        let mut active = Recording::new(
+            "still-recording".into(),
+            "http://127.0.0.1:1/active.ts".into(),
+            "Active fixture".into(),
+        );
+        active.is_recording = true;
+        active.recording_run = Some(uuid::Uuid::new_v4());
+        active.quality = Some("OD".into());
+        active.inherited_fields.push("quality".into());
+        state.store.insert(vec![active.clone()]).await.unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let checker = state.scheduler.room_check();
+        let ready = entered.clone();
+        let unpark = release.clone();
+        let worker = tokio::spawn(async move {
+            checker
+                .refresh_finished_with("finished", expected.recording_run.unwrap(), || {
+                    let ready = ready.clone();
+                    let unpark = unpark.clone();
+                    async move {
+                        ready.notify_one();
+                        unpark.notified().await;
+                        Ok(crate::resolver::StreamInfo::default())
+                    }
+                })
+                .await;
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        assert_eq!(
+            state.store.get("finished").await.unwrap().check_state,
+            "rechecking"
+        );
+        let lifecycle = state.store.lifecycle_guard().await;
+        let affected = {
+            let mut config = state.config.write().await;
+            config
+                .update_user_config(
+                    serde_json::json!({"record_quality":"HD"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                )
+                .unwrap();
+            crate::store::apply_global_defaults(&state.store, &config).await
+        };
+        state.scheduler.global_defaults_changed(&affected).await;
+        drop(lifecycle);
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .unwrap()
+            .unwrap();
+        let current = state.store.get("finished").await.unwrap();
+        assert_eq!(current.quality.as_deref(), Some("HD"));
+        assert_eq!(current.check_state, "idle");
+        assert!(current.recording_run.is_none());
+        assert!(current.is_live, "the stale offline reply was discarded");
+        assert!(state.scheduler.checks.lock().unwrap().is_empty());
+        let still_recording = state.store.get("still-recording").await.unwrap();
+        assert!(still_recording.is_recording);
+        assert_eq!(still_recording.quality.as_deref(), Some("HD"));
+        assert_eq!(still_recording.recording_run, active.recording_run);
+        assert_eq!(still_recording.schedule_revision, active.schedule_revision);
+        assert!(
+            state.scheduler.monitor_requests.lock().unwrap()["finished"].instant <= Instant::now()
+        );
+        let operation = state.scheduler.begin_check("finished").unwrap();
+        drop(operation);
+        crate::api::shutdown(&state).await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]

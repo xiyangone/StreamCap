@@ -23,9 +23,64 @@ pub struct Lifecycle {
     report: Option<PathBuf>,
     native_stop: CancellationToken,
     native_tasks: TaskTracker,
-    shutdown_at: std::sync::Mutex<Option<std::time::Instant>>,
-    system_shutdown: AtomicBool,
-    power_committed: AtomicBool,
+    shutdown: std::sync::Mutex<ShutdownState>,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExitReason {
+    User,
+    Scheduled,
+}
+#[derive(Default)]
+struct ShutdownState {
+    at: Option<std::time::Instant>,
+    requested: bool,
+    committed: bool,
+}
+impl ShutdownState {
+    fn arm(&mut self, now: std::time::Instant) -> bool {
+        if self.requested || self.committed {
+            return false;
+        }
+        self.at = Some(now + std::time::Duration::from_secs(60));
+        self.requested = true;
+        true
+    }
+    fn begin_exit(&mut self, reason: ExitReason, now: std::time::Instant) -> bool {
+        match reason {
+            ExitReason::User => {
+                self.at = None;
+                self.requested = false;
+                true
+            }
+            ExitReason::Scheduled => {
+                if !self.requested || self.at.is_none_or(|at| at > now) {
+                    return false;
+                }
+                self.at = None;
+                true
+            }
+        }
+    }
+    fn cancel(&mut self) -> Result<(), String> {
+        if self.committed {
+            return Err("关机请求已提交给 Windows，不能再通过应用取消".into());
+        }
+        self.at = None;
+        self.requested = false;
+        Ok(())
+    }
+    fn commit(&mut self, reason: ExitReason, ready: bool) -> bool {
+        if reason != ExitReason::Scheduled
+            || !self.requested
+            || self.at.is_some()
+            || !ready
+            || self.committed
+        {
+            return false;
+        }
+        self.committed = true;
+        true
+    }
 }
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -73,9 +128,7 @@ impl Lifecycle {
             action: tokio::sync::Mutex::new(()),
             native_stop: CancellationToken::new(),
             native_tasks: TaskTracker::new(),
-            shutdown_at: std::sync::Mutex::new(None),
-            system_shutdown: AtomicBool::new(false),
-            power_committed: AtomicBool::new(false),
+            shutdown: std::sync::Mutex::new(ShutdownState::default()),
             report,
         }
     }
@@ -102,15 +155,15 @@ impl Lifecycle {
 }
 pub fn window_status(window: &WebviewWindow) -> WindowStatus {
     let lifecycle = window.state::<Lifecycle>();
-    let shutdown_seconds = lifecycle
-        .shutdown_at
-        .lock()
-        .expect("shutdown timer")
-        .map(|when| {
+    let (shutdown_seconds, system_shutdown) = {
+        let shutdown = lifecycle.shutdown.lock().expect("shutdown timer");
+        let seconds = shutdown.at.map(|when| {
             when.saturating_duration_since(std::time::Instant::now())
                 .as_secs()
                 .saturating_add(1)
         });
+        (seconds, shutdown.requested)
+    };
     WindowStatus {
         maximized: window.is_maximized().unwrap_or(false),
         visible: window.is_visible().unwrap_or(false),
@@ -119,7 +172,7 @@ pub fn window_status(window: &WebviewWindow) -> WindowStatus {
         closing: lifecycle.closing.load(Ordering::SeqCst),
         tray_available: lifecycle.tray_available.load(Ordering::SeqCst),
         shutdown_seconds,
-        system_shutdown: lifecycle.system_shutdown.load(Ordering::SeqCst),
+        system_shutdown,
     }
 }
 pub fn emit_window_status(window: &WebviewWindow) {
@@ -239,12 +292,21 @@ pub async fn resolve_close(
     Ok(window_status(window))
 }
 pub fn request_exit(app: &AppHandle) {
+    request_exit_with_reason(app, ExitReason::User);
+}
+fn request_exit_with_reason(app: &AppHandle, reason: ExitReason) {
     let Some(state) = app.try_state::<Lifecycle>() else {
         app.exit(1);
         return;
     };
-    if state.closing.swap(true, Ordering::SeqCst) {
-        return;
+    {
+        let mut shutdown = state.shutdown.lock().expect("shutdown timer");
+        if state.closing.load(Ordering::SeqCst)
+            || !shutdown.begin_exit(reason, std::time::Instant::now())
+        {
+            return;
+        }
+        state.closing.store(true, Ordering::SeqCst);
     }
     state.native_stop.cancel();
     state.native_tasks.close();
@@ -284,10 +346,6 @@ pub fn request_exit(app: &AppHandle) {
         if let Some(state) = handle.try_state::<Lifecycle>() {
             state.finished.store(true, Ordering::SeqCst);
         }
-        let shutdown_requested = handle
-            .state::<Lifecycle>()
-            .system_shutdown
-            .load(Ordering::SeqCst);
         let failed_media = server
             .state()
             .scheduler
@@ -302,17 +360,12 @@ pub fn request_exit(app: &AppHandle) {
                         | streamcap_core::model::MediaJobState::Cancelled
                 )
             });
-        let commit_shutdown = {
+        let (shutdown_requested, commit_shutdown) = {
             let state = handle.state::<Lifecycle>();
-            let _gate = state.shutdown_at.lock().expect("shutdown timer");
-            let commit = state.system_shutdown.load(Ordering::SeqCst)
-                && ok
-                && !failed_media
-                && !state.is_smoke();
-            if commit {
-                state.power_committed.store(true, Ordering::SeqCst);
-            }
-            commit
+            let mut shutdown = state.shutdown.lock().expect("shutdown timer");
+            let requested = shutdown.requested;
+            let commit = shutdown.commit(reason, ok && !failed_media && !state.is_smoke());
+            (requested, commit)
         };
         if commit_shutdown {
             if let Err(error) = power_off().await {
@@ -367,16 +420,13 @@ pub fn start_native_events(
                             if app.notification().builder().title(title).body(body).show().is_err() { state.server.state().store.snack_error("系统通知未送达，请检查 Windows 通知权限"); }
                         },
                         "shutdownSchedule" => {
-                            state.system_shutdown.store(false, Ordering::SeqCst);
-                            *state.shutdown_at.lock().expect("shutdown timer") = None;
+                            let _ = state.shutdown.lock().expect("shutdown timer").cancel();
                             if let Some(window)=app.get_webview_window("main"){emit_window_status(&window);}
                         },
                         "nativeShutdown" => {
-                            let mut when = state.shutdown_at.lock().expect("shutdown timer");
-                            if when.is_none() {
-                                *when = Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
-                                state.system_shutdown.store(true, Ordering::SeqCst);
-                                drop(when);
+                            let armed = state.shutdown.lock().expect("shutdown timer")
+                                .arm(std::time::Instant::now());
+                            if armed {
                                 let _ = show_main(&app);
                             }
                         },
@@ -385,11 +435,10 @@ pub fn start_native_events(
                 },
                 _ = timer.tick() => {
                     let state = app.state::<Lifecycle>();
-                    let when = *state.shutdown_at.lock().expect("shutdown timer");
+                    let when = state.shutdown.lock().expect("shutdown timer").at;
                     if when.is_some_and(|at| at <= std::time::Instant::now()) {
-                        *state.shutdown_at.lock().expect("shutdown timer") = None;
-                        request_exit(&app);
-                        break;
+                        request_exit_with_reason(&app, ExitReason::Scheduled);
+                        if state.closing.load(Ordering::SeqCst) { break; }
                     }
                     if when.is_some() { if let Some(window) = app.get_webview_window("main") { emit_window_status(&window); } }
                 }
@@ -400,12 +449,11 @@ pub fn start_native_events(
 pub fn cancel_shutdown(app: &AppHandle) -> Result<(), String> {
     let state = app.state::<Lifecycle>();
     {
-        let mut timer = state.shutdown_at.lock().map_err(|_| "关机状态异常")?;
-        if state.power_committed.load(Ordering::SeqCst) {
-            return Err("关机请求已提交给 Windows，不能再通过应用取消".into());
-        }
-        state.system_shutdown.store(false, Ordering::SeqCst);
-        *timer = None;
+        state
+            .shutdown
+            .lock()
+            .map_err(|_| "关机状态异常")?
+            .cancel()?;
     }
     state
         .server
@@ -559,6 +607,75 @@ pub fn runtime_script(address: std::net::SocketAddr) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ordinary_exit_never_commits_a_pending_or_overdue_shutdown() {
+        let now = std::time::Instant::now();
+        for delay in [0, 30, 60, 90] {
+            let mut shutdown = ShutdownState::default();
+            assert!(shutdown.arm(now));
+            assert!(shutdown.begin_exit(
+                ExitReason::User,
+                now + std::time::Duration::from_secs(delay)
+            ));
+            assert!(!shutdown.requested);
+            assert!(shutdown.at.is_none());
+            assert!(!shutdown.commit(ExitReason::User, true));
+            assert!(!shutdown.commit(ExitReason::Scheduled, true));
+        }
+    }
+    #[test]
+    fn scheduled_exit_requires_the_full_grace_period_and_successful_cleanup() {
+        let now = std::time::Instant::now();
+        let mut shutdown = ShutdownState::default();
+        assert!(shutdown.arm(now));
+        assert!(!shutdown.arm(now + std::time::Duration::from_secs(30)));
+        assert!(!shutdown.commit(ExitReason::Scheduled, true));
+        assert!(!shutdown.begin_exit(
+            ExitReason::Scheduled,
+            now + std::time::Duration::from_secs(59)
+        ));
+        assert!(shutdown.begin_exit(
+            ExitReason::Scheduled,
+            now + std::time::Duration::from_secs(60)
+        ));
+        assert!(!shutdown.commit(ExitReason::Scheduled, false));
+        assert!(!shutdown.commit(ExitReason::User, true));
+        assert!(shutdown.commit(ExitReason::Scheduled, true));
+        assert!(!shutdown.commit(ExitReason::Scheduled, true));
+        assert!(shutdown.cancel().is_err());
+    }
+    #[test]
+    fn shutdown_can_be_cancelled_during_cleanup_before_power_commit() {
+        let now = std::time::Instant::now();
+        let mut shutdown = ShutdownState::default();
+        shutdown.arm(now);
+        assert!(shutdown.begin_exit(
+            ExitReason::Scheduled,
+            now + std::time::Duration::from_secs(60)
+        ));
+        shutdown.cancel().unwrap();
+        assert!(!shutdown.commit(ExitReason::Scheduled, true));
+    }
+    #[test]
+    fn stale_timer_cannot_exit_after_cancellation_or_rearming() {
+        let now = std::time::Instant::now();
+        let mut shutdown = ShutdownState::default();
+        shutdown.arm(now);
+        shutdown.cancel().unwrap();
+        assert!(!shutdown.begin_exit(
+            ExitReason::Scheduled,
+            now + std::time::Duration::from_secs(60)
+        ));
+        assert!(shutdown.arm(now + std::time::Duration::from_secs(30)));
+        assert!(!shutdown.begin_exit(
+            ExitReason::Scheduled,
+            now + std::time::Duration::from_secs(60)
+        ));
+        assert!(shutdown.begin_exit(
+            ExitReason::Scheduled,
+            now + std::time::Duration::from_secs(90)
+        ));
+    }
     #[test]
     fn native_event_receiver_keeps_notifications_before_window_setup() {
         let store = streamcap_core::store::Store::new(streamcap_core::Workspace::from_repo_root(

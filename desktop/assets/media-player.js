@@ -30,9 +30,10 @@ export function attachMedia(video, apiOrigin, relativePath, onState, onCapture) 
   const abort = new AbortController();
   const removers = [];
   let disposed = false, player = null, generation = 0, mode = 'native', info = null;
-  let total = 0, offset = 0, nativeStart = 0, wantedPlay = true, scrubbing = false, changing = false, probing = false;
+  let total = 0, offset = 0, nativeStart = 0, wantedPlay = true, scrubbing = false, changing = false, probing = null;
   let dragTarget = 0, pendingTarget = null, lastDispatch = 0, seekStarted = 0, acceptedTarget = null;
   let poll = null, continuation = null, seekTimer = null, loadTimeout = null, animation = null;
+  let playbackRevision = 0;
   let controls, range, time, play, mute, latest, buffered, transport, hint, rate, volume, fullscreen, freeze, captureButton;
   let terminalError = false, compatibilityAttempted = false;
   let frameRequest = null, frameTicket = 0, frameReady = false, loadKind = 'initial';
@@ -56,6 +57,10 @@ export function attachMedia(video, apiOrigin, relativePath, onState, onCapture) 
   };
   const position = () => offset + (Number.isFinite(video.currentTime) ? video.currentTime : 0);
   const clamp = value => Math.max(mode === 'native' ? nativeStart : 0, Math.min(Number.isFinite(value) ? value : 0, Math.max(0, total - 0.12)));
+  const invalidateContinuation = () => {
+    clearTimeout(continuation); continuation = null;
+    return ++playbackRevision;
+  };
   const release = () => {
     if (!player) return;
     const old = player; player = null;
@@ -235,17 +240,20 @@ export function attachMedia(video, apiOrigin, relativePath, onState, onCapture) 
       else scheduleFlush();
     }
   };
-  const refreshInfo = async () => {
-    if (probing || disposed) return false;
-    probing = true;
-    try {
+  const refreshInfo = async (isCurrent = () => true) => {
+    if (disposed) return false;
+    // A newer user command can consume the same read without reviving its old caller.
+    if (!probing) probing = (async () => {
       const response = await fetch(apiOrigin + '/api/media/info?path=' + encodeURIComponent(relativePath), { signal: abort.signal });
       if (!response.ok) throw Error(label('无法读取媒体文件信息', 'Unable to read media information'));
-      const fresh = await response.json(); if (disposed) return false; info = fresh;
-      if (!timelineFormats.has(fresh.format) && fresh.nativeCompatible !== false && !(fresh.durationSeconds > 0)) return true;
-      if (Number.isFinite(fresh.durationSeconds) && fresh.durationSeconds > 0) { total = fresh.durationSeconds; render(); return true; }
-      update('ready', fresh.seekError || label('正在等待可播放的录制片段…', 'Waiting for recorded media…')); return false;
-    } finally { probing = false; }
+      return response.json();
+    })().finally(() => { probing = null; });
+    const fresh = await probing;
+    if (disposed || !isCurrent()) return false;
+    info = fresh;
+    if (!timelineFormats.has(fresh.format) && fresh.nativeCompatible !== false && !(fresh.durationSeconds > 0)) return true;
+    if (Number.isFinite(fresh.durationSeconds) && fresh.durationSeconds > 0) { total = fresh.durationSeconds; render(); return true; }
+    update('ready', fresh.seekError || label('正在等待可播放的录制片段…', 'Waiting for recorded media…')); return false;
   };
   const makePlayer = (url, live, version) => {
     const mpegts = window.mpegts;
@@ -318,7 +326,7 @@ export function attachMedia(video, apiOrigin, relativePath, onState, onCapture) 
   };
   const loadAt = (seconds, kind = 'seek') => {
     if (disposed || !(total > 0)) return;
-    clearTimeout(continuation); continuation = null;
+    invalidateContinuation();
     retainFrame(); changing = true; const version = ++generation; release(); video.pause();
     offset = clamp(seconds); acceptedTarget = offset; seekStarted = performance.now(); loadKind = kind;
     watchTargetFrame();
@@ -342,6 +350,7 @@ export function attachMedia(video, apiOrigin, relativePath, onState, onCapture) 
     if (disposed || pendingTarget == null || !(total > 0)) return;
     if (changing && acceptedTarget != null && Math.abs(pendingTarget - acceptedTarget) < 0.07) { pendingTarget = null; return; }
     if (changing && !force) return;
+    invalidateContinuation();
     const target = clamp(pendingTarget); pendingTarget = null; lastDispatch = performance.now();
     const bufferedTarget = mode === 'timeline' && hasBuffered(target);
     if (mode === 'native' || bufferedTarget) {
@@ -362,12 +371,14 @@ export function attachMedia(video, apiOrigin, relativePath, onState, onCapture) 
   }
   const requestSeek = (target, force = false) => {
     if (!(total > 0) || mode === 'live') return;
+    invalidateContinuation();
     pendingTarget = clamp(target); dragTarget = pendingTarget;
     if (force) flushSeek(true); else scheduleFlush();
     render();
   };
   const beginScrub = () => {
     if (scrubbing) return;
+    invalidateContinuation();
     scrubbing = true; dragTarget = Number(range.value); video.pause(); startAnimation(); render();
   };
   const finishScrub = () => {
@@ -378,6 +389,7 @@ export function attachMedia(video, apiOrigin, relativePath, onState, onCapture) 
     hint.hidden = true; render();
   };
   const togglePlay = () => {
+    invalidateContinuation();
     wantedPlay = !wantedPlay;
     if (wantedPlay) { if (video.ended && total > 0) requestSeek(0, true); else playSafely(); }
     else { video.pause(); settle(); }
@@ -385,14 +397,18 @@ export function attachMedia(video, apiOrigin, relativePath, onState, onCapture) 
   };
   const continueAtEnd = async () => {
     if (disposed || !wantedPlay || changing || scrubbing) return;
+    const revision = invalidateContinuation();
+    const isCurrent = () => !disposed && revision === playbackRevision && wantedPlay && !changing && !scrubbing;
     const at = position();
     try {
-      if (info?.isRecording) await refreshInfo();
-      if (disposed || !wantedPlay || scrubbing) return;
+      if (info?.isRecording) await refreshInfo(isCurrent);
+      if (!isCurrent()) return;
       if (mode === 'timeline' && total - at > 0.35) loadAt(at);
-      else if (info?.isRecording) continuation = setTimeout(continueAtEnd, 800);
+      else if (info?.isRecording) continuation = setTimeout(() => {
+        if (isCurrent()) { continuation = null; continueAtEnd(); }
+      }, 800);
       else { wantedPlay = false; render(); }
-    } catch (error) { if (!disposed && error.name !== 'AbortError') update('error', error.message); }
+    } catch (error) { if (isCurrent() && error.name !== 'AbortError') update('error', error.message); }
   };
   const buildControls = () => {
     controls = create('div', 'seek-controls'); controls.setAttribute('role', 'group');
@@ -424,10 +440,12 @@ export function attachMedia(video, apiOrigin, relativePath, onState, onCapture) 
     latest = create('button', 'ui-btn ui-btn-ghost ui-btn-xs button seek-latest', transport); latest.type = 'button'; latest.textContent = label('回到最新', 'Latest');
     listen(latest, 'click', async () => {
       if (latest.disabled) return;
+      const revision = invalidateContinuation();
+      const isCurrent = () => !disposed && revision === playbackRevision;
       latest.disabled = true; latest.setAttribute('aria-busy', 'true');
       try {
-        if (await refreshInfo() && !disposed) { wantedPlay = true; requestSeek(Math.max(0, total - 3), true); }
-      } catch (error) { if (!disposed) update('error', error.message); }
+        if (await refreshInfo(isCurrent) && isCurrent()) { wantedPlay = true; requestSeek(Math.max(0, total - 3), true); }
+      } catch (error) { if (isCurrent()) update('error', error.message); }
       finally { if (!disposed) { latest.disabled = false; latest.setAttribute('aria-busy', 'false'); } }
     });
     create('span', 'seek-spacer', transport);
@@ -536,9 +554,11 @@ export function attachMedia(video, apiOrigin, relativePath, onState, onCapture) 
       if (mode === 'timeline') {
         if (total > 0) loadAt(info.isRecording ? Math.max(0, total - 3) : 0, 'initial');
         poll = setInterval(async () => {
-          if (!disposed && (info?.isRecording || !(total > 0))) {
-            try { const before = total; const ready = await refreshInfo(); if (ready && before === 0) loadAt(info.isRecording ? Math.max(0, total - 3) : 0); }
-            catch (error) { if (!disposed && error.name !== 'AbortError') update('error', error.message); }
+          if (!disposed && !probing && (info?.isRecording || !(total > 0))) {
+            const revision = playbackRevision;
+            const isCurrent = () => !disposed && revision === playbackRevision;
+            try { const before = total; const ready = await refreshInfo(isCurrent); if (ready && before === 0) loadAt(info.isRecording ? Math.max(0, total - 3) : 0); }
+            catch (error) { if (isCurrent() && error.name !== 'AbortError') update('error', error.message); }
           }
         }, 1000);
       } else {
@@ -553,7 +573,7 @@ export function attachMedia(video, apiOrigin, relativePath, onState, onCapture) 
   })();
   return () => {
     if (disposed) return;
-    disposed = true; generation++; abort.abort(); clearInterval(poll); clearTimeout(continuation); clearTimeout(seekTimer); clearLoadTimeout(); cancelAnimationFrame(animation);
+    disposed = true; generation++; invalidateContinuation(); abort.abort(); clearInterval(poll); clearTimeout(seekTimer); clearLoadTimeout(); cancelAnimationFrame(animation);
     cancelFrameWatch(); removers.forEach(remove => remove()); release(); controls.remove(); freeze.remove();
     host?.classList.remove('enhanced-preview', 'is-scrubbing', 'is-seeking');
     video.pause(); video.removeAttribute('src'); video.load(); video.controls = true; activePlayers--;

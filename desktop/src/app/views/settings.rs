@@ -98,7 +98,6 @@ pub fn SettingsView() -> impl IntoView {
     let account_revision = RwSignal::new(0_u32);
     let reveal = RwSignal::new(false);
     let qr_open = RwSignal::new(false);
-    let appearance_busy = RwSignal::new(false);
     let window_busy = RwSignal::new(false);
     let directory_busy = RwSignal::new(false);
     let qr_account = RwSignal::new(None::<String>);
@@ -253,19 +252,7 @@ pub fn SettingsView() -> impl IntoView {
             let _ = directory_busy.try_set(false);
         });
     });
-    let choose_layout = Callback::new(move |grid: bool| {
-        if appearance_busy.get_untracked() || state.grid_view.get_untracked() == grid {
-            return;
-        }
-        appearance_busy.set(true);
-        state.grid_view.set(grid);
-        leptos::task::spawn_local(async move {
-            if let Err(error) = gateway::save_settings(json!({"is_grid_view":grid})).await {
-                state.fail(error);
-            }
-            let _ = appearance_busy.try_set(false);
-        });
-    });
+    let choose_layout = Callback::new(move |grid: bool| gateway::save_grid_view(state, grid));
     let choose_close_action = Callback::new(move |choice: String| {
         if window_busy.get_untracked() {
             return;
@@ -449,9 +436,9 @@ pub fn SettingsView() -> impl IntoView {
                                         on_click=Callback::new(move |_| choose_theme.run(mode))><span class="theme-preview" data-preview=mode><i /><i /><i /></span><span class="theme-option-label"><Icon name=icon size=17 />{label}<span class="theme-check"><Icon name="check" size=16 /></span></span></ActionButton>
                                 }).collect_view()}
                             </div>
-                            <div class="settings-row"><div><strong>{t("默认任务视图")}</strong><p>{t("在网格卡片和紧凑列表之间切换。")}</p></div><div class="view-switch">
-                                <IconButton label=t("默认网格视图") icon="grid" disabled=appearance_busy pressed=Signal::derive(move || Some(state.grid_view.get())) on_click=Callback::new(move |_| choose_layout.run(true)) />
-                                <IconButton label=t("默认列表视图") icon="list" disabled=appearance_busy pressed=Signal::derive(move || Some(!state.grid_view.get())) on_click=Callback::new(move |_| choose_layout.run(false)) />
+                            <div class="settings-row"><div><strong>{t("默认任务视图")}</strong><p>{t("在网格卡片和紧凑列表之间切换。")}</p></div><div class="view-switch" aria-busy=move || state.grid_view_saving.get().to_string()>
+                                <IconButton label=t("默认网格视图") icon="grid" disabled=Signal::derive(move || !state.status.get().ok) pressed=Signal::derive(move || Some(state.grid_view.get())) on_click=Callback::new(move |_| choose_layout.run(true)) />
+                                <IconButton label=t("默认列表视图") icon="list" disabled=Signal::derive(move || !state.status.get().ok) pressed=Signal::derive(move || Some(!state.grid_view.get())) on_click=Callback::new(move |_| choose_layout.run(false)) />
                             </div></div>
                         </SettingsGroup>
                     </Show>

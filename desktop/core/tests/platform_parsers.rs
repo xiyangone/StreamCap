@@ -422,6 +422,7 @@ fn qr_account_verification_handles_identity_shapes_without_matching_recommendati
         json!({"global":{"loginUser":{"id":42,"nickname":"Fixture"}}}),
         json!({"userStore":{"userInfo":{"principalId":"42","user_name":"Fixture"}}}),
         json!({"user":{"userInfoQuery":{"ownerInfo":{"originUserId":42,"name":"Fixture"}}}}),
+        json!({"user":{"isLoggedIn":true,"userInfoQuery":{"ownerInfo":{"userId":"42","name":"Fixture"}}}}),
     ] {
         let page = format!("<script>window.__INITIAL_STATE__ = {};</script>", state);
         assert_eq!(
@@ -435,6 +436,8 @@ fn qr_account_verification_handles_identity_shapes_without_matching_recommendati
         json!({"currentUser":{"userId":"42","isLogin":false}}),
         json!({"isLoggedIn":false,"currentUser":{"userId":"42"}}),
         json!({"userStore":{"isLogin":false,"userInfo":{"userId":"42"}}}),
+        json!({"user":{"isLoggedIn":false,"userInfoQuery":{"ownerInfo":{"userId":"42"}}}}),
+        json!({"user":{"loggedIn":"0","userInfoQuery":{"ownerInfo":{"userId":"42"}}}}),
     ] {
         let page = format!("window.__INITIAL_STATE__={};", state);
         let error = verify_login_page(&page, "42").unwrap_err();
@@ -450,18 +453,6 @@ fn qr_account_verification_handles_identity_shapes_without_matching_recommendati
     assert_eq!(
         verify_login_page(
             r#"<script>window.__BOOTSTRAP__={'isLoggedIn':true,'profile':{'userId':'42'}};</script>"#,
-            "42"
-        )
-        .unwrap(),
-        Some("42".into())
-    );
-    assert_eq!(
-        verify_login_page(r#"<html>{"userId":"42"}</html>"#, "42").unwrap(),
-        Some("42".into())
-    );
-    assert_eq!(
-        verify_login_page(
-            r#"window.__INITIAL_STATE__={"bootstrap":{"uid":"42"}};"#,
             "42"
         )
         .unwrap(),
@@ -485,6 +476,13 @@ fn qr_account_verification_handles_identity_shapes_without_matching_recommendati
         .unwrap(),
         Some("42".into())
     );
+    assert_eq!(
+        verify_login_page(
+            r#"<script>window.__BOOTSTRAP__={'currentUser':{'userId':'42','name':'Fixture \'quoted\''},'unused':undefined,'recommendations':[{'author':{'userId':'7'}}]};</script>"#,
+            "42"
+        ).unwrap(),
+        Some("Fixture 'quoted'".into())
+    );
     assert!(verify_login_page(
         r#"<script>window.__BOOTSTRAP__={'recommendations':[{'author':{'userId':'42'}}]};</script>"#,
         "42"
@@ -497,40 +495,86 @@ async fn qr_confirmed_but_unverified_never_exposes_or_saves_cookies() {
         routing::{get, post},
         Json, Router,
     };
-    let png="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aK9sAAAAASUVORK5CYII=";
-    let app=Router::new()
+    for state in [
+        json!({"room":{"author":{"userId":"fixture-user","name":"Fixture"}}}),
+        json!({"currentUser":null,"recommendations":[{"author":{"userId":"fixture-user"}}]}),
+        json!({"currentUser":{"userId":"another-user"},"recommendations":[{"author":{"userId":"fixture-user"}}]}),
+        json!({"user":{"isLoggedIn":false,"userInfoQuery":{"ownerInfo":{"userId":"fixture-user"}}}}),
+    ] {
+        let page = format!("<script>window.__INITIAL_STATE__={state};</script>");
+        let png="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aK9sAAAAASUVORK5CYII=";
+        let app=Router::new()
         .route("/rest/c/infra/ks/qr/start",post(move||async move{Json(json!({"result":1,"qrLoginToken":"fixture-token","qrLoginSignature":"fixture-sign","imageData":png}))}))
         .route("/rest/c/infra/ks/qr/scanResult",post(||async{Json(json!({"result":1}))}))
         .route("/rest/c/infra/ks/qr/acceptResult",post(||async{Json(json!({"result":1,"qrToken":"fixture-accepted"}))}))
         .route("/pass/kuaishou/login/qr/callback",post(||async{Json(json!({"result":1}))}))
         .route("/pass/kuaishou/login/passToken",post(||async{Json(json!({"result":1,"userId":"fixture-user","kuaishou.live.web_st":"fixture-session","kuaishou.live.web_ph":"fixture-proof"}))}))
-        .route("/",get(||async{r#"<script>window.__INITIAL_STATE__={"room":{"author":{"userId":"fixture-user","name":"Fixture"}}};</script>"#}));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}/", listener.local_addr().unwrap());
-    let server = tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    let manager = LoginManager::with_endpoints(
-        CancellationToken::new(),
-        LoginEndpoints::loopback(&base).unwrap(),
-    );
-    let mut snapshot = manager.start(None).await.unwrap();
-    for _ in 0..40 {
-        if snapshot.is_terminal() {
-            break;
+        .route("/",get(move || {let page = page.clone(); async move {page}}));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let manager = LoginManager::with_endpoints(
+            CancellationToken::new(),
+            LoginEndpoints::loopback(&base).unwrap(),
+        );
+        let mut snapshot = manager.start(None).await.unwrap();
+        for _ in 0..40 {
+            if snapshot.is_terminal() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            snapshot = manager.status(&snapshot.session_id).await.unwrap();
         }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        snapshot = manager.status(&snapshot.session_id).await.unwrap();
+        assert_eq!(snapshot.state, "error");
+        assert!(snapshot.message.contains("手机已确认"));
+        assert!(snapshot.cookies.is_none());
+        assert!(snapshot.username.is_none());
+        assert!(snapshot.image_base64.is_empty());
+        assert_eq!(snapshot.seconds_left, 0);
+        manager.shutdown().await;
+        assert_eq!(manager.active_tasks(), 0);
+        server.abort();
     }
-    assert_eq!(snapshot.state, "error");
-    assert!(snapshot.message.contains("手机已确认"));
-    assert!(snapshot.cookies.is_none());
-    assert!(snapshot.username.is_none());
-    assert!(snapshot.image_base64.is_empty());
-    assert_eq!(snapshot.seconds_left, 0);
-    manager.shutdown().await;
-    assert_eq!(manager.active_tasks(), 0);
-    server.abort();
+}
+
+#[test]
+fn qr_verification_decodes_unicode_surrogate_pairs_without_accepting_malformed_strings() {
+    use streamcap_core::platforms::kuaishou_login::verify_login_page;
+    let page =
+        r#"window.__BOOTSTRAP__={'currentUser':{'userId':'42','name':'\u68A6\uD83D\uDE00'}};"#;
+    assert_eq!(verify_login_page(page, "42").unwrap(), Some("梦😀".into()));
+    for name in [r"\uD83D", r"\uDE00", r"\uD83D\u0041", r"\uD83Dx"] {
+        let page =
+            format!("window.__BOOTSTRAP__={{'currentUser':{{'userId':'42','name':'{name}'}}}};");
+        assert!(verify_login_page(&page, "42").is_err(), "{page}");
+    }
+}
+
+#[test]
+fn qr_verification_rejects_recommendations_and_unowned_identity_text() {
+    use streamcap_core::platforms::kuaishou_login::verify_login_page;
+    for state in [
+        json!({"currentUser":null,"recommendations":[{"author":{"userId":"42"}}]}),
+        json!({"currentUser":{"userId":"7"},"recommendations":[{"author":{"userId":"42"}}]}),
+        json!({"isLoggedIn":true,"recommendations":[{"author":{"userId":"42"}}]}),
+        json!({"isLoggedIn":true,"metadata":{"userId":"42"}}),
+        json!({"currentUser":null,"isLoggedIn":true,"profile":{"userId":"42"}}),
+        json!({"currentUser":{"userId":"7"},"bootstrap":{"uid":"42"}}),
+        json!({"bootstrap":{"uid":"42"}}),
+    ] {
+        let page = format!("window.__INITIAL_STATE__={state};");
+        assert!(verify_login_page(&page, "42").is_err(), "{page}");
+    }
+    for page in [
+        r#"<html>{"userId":"42"}</html>"#,
+        r#"<script>window.__BOOTSTRAP__={'currentUser':null,'recommendations':[{'author':{'userId':'42'}}]};</script>"#,
+        r#"<script>window.__BOOTSTRAP__={'currentUser':{'userId':'7'},'recommendations':[{'author':{'userId':'42'}}]};</script>"#,
+        r#"<script>window.__INITIAL_STATE__={"currentUser":null};</script><p>42</p>"#,
+    ] {
+        assert!(verify_login_page(page, "42").is_err(), "{page}");
+    }
 }
 
 #[test]

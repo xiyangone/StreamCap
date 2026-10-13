@@ -11,6 +11,7 @@ use crate::{
 };
 use futures::StreamExt;
 use leptos::prelude::*;
+use std::collections::{HashMap, HashSet};
 
 fn kind(item: &StorageItem) -> &'static str {
     if item.is_dir {
@@ -78,6 +79,28 @@ fn stored_sort() -> (SortKey, bool) {
     sort_preference("")
 }
 fn sort_items(items: &mut [StorageItem], key: SortKey, descending: bool) {
+    if key == SortKey::Name {
+        if descending {
+            items.sort_by_cached_key(|item| {
+                (
+                    !item.is_dir,
+                    std::cmp::Reverse(item.name.to_lowercase()),
+                    item.name.clone(),
+                    item.path.clone(),
+                )
+            });
+        } else {
+            items.sort_by_cached_key(|item| {
+                (
+                    !item.is_dir,
+                    item.name.to_lowercase(),
+                    item.name.clone(),
+                    item.path.clone(),
+                )
+            });
+        }
+        return;
+    }
     items.sort_by(|a, b| {
         let dirs = b.is_dir.cmp(&a.is_dir);
         if dirs != std::cmp::Ordering::Equal {
@@ -107,11 +130,20 @@ fn sort_items(items: &mut [StorageItem], key: SortKey, descending: bool) {
     });
 }
 
+fn index_paths(items: &[StorageItem]) -> HashMap<String, usize> {
+    items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| (item.path.clone(), index))
+        .collect()
+}
+
 #[component]
 pub fn StorageView() -> impl IntoView {
     let state = gateway::app_state();
     let subfolder = RwSignal::new(String::new());
     let listing = RwSignal::new(StorageListing::default());
+    let listing_index = Memo::new(move |_| listing.with(|list| index_paths(&list.items)));
     let listed_folder = RwSignal::new(None::<String>);
     let reload = RwSignal::new(0_u32);
     let generation = RwSignal::new(0_u32);
@@ -149,6 +181,14 @@ pub fn StorageView() -> impl IntoView {
     let conversion_errors = RwSignal::new(std::collections::HashMap::<String, String>::new());
     let completed_jobs =
         Memo::new(move |_| state.media_jobs.with(|jobs| completed_output_keys(jobs)));
+    let pending_sources = Memo::new(move |_| {
+        state.media_jobs.with(|jobs| {
+            jobs.iter()
+                .filter(|job| job.pending())
+                .map(|job| job.source.clone())
+                .collect::<HashSet<_>>()
+        })
+    });
     Effect::new(move |_| {
         let folder = subfolder.get();
         let _ = reload.get();
@@ -206,8 +246,11 @@ pub fn StorageView() -> impl IntoView {
                         if generation.try_get_untracked() != Some(current) {
                             return;
                         }
+                        let index = listing_index.with_untracked(|paths| paths.get(&path).copied());
                         listing.update(|list| {
-                            if let Some(item) = list.items.iter_mut().find(|item| item.path == path)
+                            if let Some(item) = index
+                                .and_then(|index| list.items.get_mut(index))
+                                .filter(|item| item.path == path)
                             {
                                 match size {
                                     Ok(size) => {
@@ -231,20 +274,25 @@ pub fn StorageView() -> impl IntoView {
             let _ = loading.try_set(false);
         });
     });
-    let visible = move || {
-        let text = keyword.get().trim().to_lowercase();
-        let mode = filter.get();
-        let mut items = listing
-            .get()
-            .items
-            .into_iter()
-            .filter(|item| {
-                (mode == "all" || kind(item) == mode) && item.name.to_lowercase().contains(&text)
-            })
-            .collect::<Vec<_>>();
+    let sorted = Memo::new(move |_| {
+        let mut items = listing.with(|list| list.items.clone());
         sort_items(&mut items, sort.get(), descending.get());
         items
-    };
+    });
+    let visible = Memo::new(move |_| {
+        let text = keyword.get().trim().to_lowercase();
+        let mode = filter.get();
+        sorted.with(|items| {
+            items
+                .iter()
+                .filter(|item| {
+                    (mode == "all" || kind(item) == mode)
+                        && item.name.to_lowercase().contains(&text)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+    });
     let enter = Callback::new(move |item: StorageItem| {
         if loading.get_untracked() || busy.get_untracked() {
             return;
@@ -307,17 +355,20 @@ pub fn StorageView() -> impl IntoView {
             || loading.get_untracked()
             || !state.status.get_untracked().ok
             || conversion_submissions.with_untracked(|paths| paths.contains(&path))
-            || state
-                .media_jobs
-                .with_untracked(|jobs| jobs.iter().any(|job| job.source == path && job.pending()))
-            || listing.with_untracked(|list| list.items.iter().any(|item| item.path == output))
+            || pending_sources.with_untracked(|paths| paths.contains(&path))
+            || listing_index.with_untracked(|paths| paths.contains_key(&output))
         {
             return;
         }
+        let index = listing_index.with_untracked(|paths| paths.get(&path).copied());
         if !listing.with_untracked(|list| {
-            list.items.iter().any(|item| {
-                item.path == path && !item.is_dir && item.name.to_ascii_lowercase().ends_with(".ts")
-            })
+            index
+                .and_then(|index| list.items.get(index))
+                .is_some_and(|item| {
+                    item.path == path
+                        && !item.is_dir
+                        && item.name.to_ascii_lowercase().ends_with(".ts")
+                })
         }) {
             return;
         }
@@ -390,7 +441,7 @@ pub fn StorageView() -> impl IntoView {
                 <Show when=move || loading.get()><div class="loading-state"><span class="ui-loading ui-loading-spinner ui-loading-sm spinner" aria-hidden="true" />{t("正在读取文件…")}</div></Show>
                 <Show when=move || error.get().is_some()><div class="inline-error"><FormFeedback error=error title=t("操作未完成") /><ActionButton label=t("重试") class="small" disabled=loading on_click=Callback::new(move |_| reload.update(|n| *n = n.wrapping_add(1))) /></div></Show>
                 <Show when=move || error.get().is_none() && listed_folder.get().as_deref() == Some(subfolder.get().as_str())>
-                    <Show when=move || !visible().is_empty() fallback=move || view! {
+                    <Show when=move || visible.with(|items| !items.is_empty()) fallback=move || view! {
                         <Show when=move || !loading.get()>
                             <Show when=move || listing.with(|list| list.items.is_empty()) fallback=move || view! {
                                 <div class="empty-panel"><EmptyState icon="search" title=t("没有匹配的文件") description=t("当前目录中有文件，请调整文件类型或搜索条件。") />
@@ -404,16 +455,23 @@ pub fn StorageView() -> impl IntoView {
                             <th scope="col" class="file-size" aria-sort=move || if sort.get() == SortKey::Size { if descending.get() { "descending" } else { "ascending" } } else { "none" }>{t("大小")}</th>
                             <th scope="col" class="file-date" aria-sort=move || if sort.get() == SortKey::Modified { if descending.get() { "descending" } else { "ascending" } } else { "none" }>{t("修改时间")}</th>
                             <th scope="col" class="file-actions">{t("操作")}</th></tr></thead><tbody>
-                            <For each=visible key=|item| item.path.clone() children=move |initial| {
+                            <For each=move || visible.get() key=|item| item.path.clone() children=move |initial| {
                                 let icon = match kind(&initial) { "folder" => "folder", "audio" => "volume", "video" => "video", _ => "file" };
                                 let initial = StoredValue::new(initial);
-                                let item = Memo::new(move |_| initial.with_value(|initial| listing.with(|list| list.items.iter().find(|entry| entry.path == initial.path).cloned().unwrap_or_else(|| initial.clone()))));
+                                let item = Memo::new(move |_| initial.with_value(|initial| {
+                                    let index = listing_index.with(|paths| paths.get(&initial.path).copied());
+                                    listing.with(|list| index
+                                        .and_then(|index| list.items.get(index))
+                                        .filter(|entry| entry.path == initial.path)
+                                        .cloned().unwrap_or_else(|| initial.clone()))
+                                }));
                                 let exists = Memo::new(move |_| item.with(|item| {
+                                    if item.is_dir || !item.name.to_ascii_lowercase().ends_with(".ts") { return false; }
                                     let output = format!("{}.mp4", item.path.rsplit_once('.').map(|(base,_)|base).unwrap_or(&item.path));
-                                    listing.with(|list| list.items.iter().any(|entry| entry.path == output))
+                                    listing_index.with(|paths| paths.contains_key(&output))
                                 }));
                                 let submitted = Signal::derive(move || item.with(|item| conversion_submissions.with(|paths| paths.contains(&item.path))));
-                                let processing = Memo::new(move |_| item.with(|item| state.media_jobs.with(|jobs| jobs.iter().any(|job| job.source == item.path && job.pending()))));
+                                let processing = Memo::new(move |_| item.with(|item| pending_sources.with(|paths| paths.contains(&item.path))));
                                 let conversion_hint = Signal::derive(move || if exists.get() { t("同名 MP4 已存在") } else if processing.get() { t("处理中…") } else if !state.status.get().ok { t("本地服务未连接") } else { t("手动转换，保留源 TS") });
                                 let row_error = Signal::derive(move || item.with(|item| conversion_errors.with(|errors| errors.get(&item.path).cloned())));
                                 view! {
@@ -455,7 +513,7 @@ pub fn StorageView() -> impl IntoView {
                 </Show>
                 </div>
                 <footer class="file-manager-status" aria-label=t("目录摘要")>
-                    <span>{move || crate::tr_format!("显示 {} / {} 项", visible().len(), listing.with(|list| list.items.len()))}</span>
+                    <span>{move || crate::tr_format!("显示 {} / {} 项", visible.with(Vec::len), listing.with(|list| list.items.len()))}</span>
                     <span class="file-manager-total"><span>{t("当前目录大小")}</span><strong>{move || listing.with(|list| if list.total_size_known { human_size(list.total_size) } else if list.items.iter().any(|item| item.size_error.is_some()) { t("部分体积不可用").into() } else { t("体积计算中…").into() })}</strong></span>
                 </footer>
             </section>
@@ -506,6 +564,21 @@ mod tests {
         for value in ["", "other:desc", "size:broken", "name", "name:desc:extra"] {
             assert_eq!(sort_preference(value), (SortKey::Name, false));
         }
+    }
+    #[test]
+    fn path_index_tracks_reordered_refreshed_and_removed_files() {
+        let mut items = vec![
+            item("second.ts", false, 10, true, None),
+            item("first.mp4", false, 20, true, None),
+        ];
+        assert_eq!(index_paths(&items)["second.ts"], 0);
+        sort_items(&mut items, SortKey::Name, false);
+        assert_eq!(index_paths(&items)["second.ts"], 1);
+        items.remove(0);
+        items[0].size = 30;
+        let paths = index_paths(&items);
+        assert!(!paths.contains_key("first.mp4"));
+        assert_eq!(items[paths["second.ts"]].size, 30);
     }
     #[test]
     fn sorting_keeps_directories_first_and_unknown_values_last() {

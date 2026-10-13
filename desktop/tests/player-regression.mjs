@@ -72,7 +72,7 @@ if (nativeBackend) { const url=new URL(nativeBackend); assert.equal(url.hostname
 const result = { passed: false, cases: [], performance: [], output, segments: 0, maxActiveSegments: 0, errors: [],
   stylesheets: [...stylesheetAssets.values()].map(({ path, sha256 }) => ({ path, sha256 })) };
 const durationFor = path => path === 'short.ts' ? 0.8 : path === 'audio.wma' ? 4 : 18;
-let active = 0, growing = false;
+let active = 0, growing = false, nativeCopyByteLimit = 0;
 const children = new Set();
 const json = (res, value) => { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(value)); };
 const server = createServer(async (req, res) => {
@@ -90,12 +90,30 @@ const server = createServer(async (req, res) => {
     if (assets[url.pathname]) { const [file, mime] = assets[url.pathname]; res.setHeader('Content-Type',mime); res.end(await readFile(join(desktop,file))); return; }
     if (nativeBackend && ['/api/media/info','/api/media/transcode'].includes(url.pathname) && url.searchParams.get('path')==='native-copy.ts') {
       const abort=new AbortController();res.once('close',()=>abort.abort());
+      const byteLimit=url.pathname==='/api/media/transcode'?nativeCopyByteLimit:0;
       try {
         const response=await fetch(nativeBackend+url.pathname+url.search,{signal:abort.signal});
         if(res.destroyed){await response.body.cancel();return;}
         const headers={'Content-Type':response.headers.get('content-type')};
         for(const key of ['x-streamcap-offset','x-streamcap-preview-mode']){const value=response.headers.get(key);if(value!=null)headers[key]=value;}
-        res.writeHead(response.status,headers);const stream=Readable.fromWeb(response.body);stream.on('error',()=>res.destroy());stream.pipe(res);
+        res.writeHead(response.status,headers);const stream=Readable.fromWeb(response.body);stream.on('error',()=>res.destroy());
+        if (byteLimit) {
+          // Bound this fixture's delivered media, keeping the real backend stream
+          // open until the next seek cancels it. Fast machines must also cold-seek.
+          let delivered=0;
+          for await (const chunk of stream) {
+            const bytes=chunk.subarray(0,byteLimit-delivered);
+            delivered+=bytes.length;res.write(bytes);
+            if(delivered===byteLimit) {
+              await new Promise(resolve=>{
+                if(abort.signal.aborted)resolve();
+                else abort.signal.addEventListener('abort',resolve,{once:true});
+              });
+              break;
+            }
+          }
+          if(!res.destroyed)res.end();
+        } else stream.pipe(res);
       } catch(error) { if(!abort.signal.aborted)throw error; }
       return;
     }
@@ -270,6 +288,103 @@ try {
     await page.getByRole('button',{name:'回到最新',exact:true}).click();await at(15);
     await page.evaluate(()=>window.endPreview());growing=false;
   });
+  for (const action of ['buffered seek', 'segment seek', 'buffered seek with failed info', 'latest', 'drag', 'continue']) {
+    await step('delayed growing-file EOF respects '+action, async()=>{
+      const pattern = '**/api/media/info?path=eof.ts';
+      let held, capture, holding = false;
+      const intercepted = new Promise(resolve => { capture = resolve; });
+      const handler = route => {
+        if (holding && !held) { held = route; capture(); return; }
+        return route.continue();
+      };
+      await page.route(pattern, handler);
+      growing = true;
+      try {
+        await page.evaluate(()=>window.beginPreview('eof.ts'));
+        await page.waitForFunction(()=>{
+          const video=document.querySelector('video');
+          return video.readyState>=2 && Number(video.dataset.timelinePosition)>15.1
+            && !document.querySelector('.media-preview').classList.contains('is-seeking');
+        });
+        // The initial growing-file segment starts at 15s. Load a complete buffered
+        // timeline for local seeks, but retain that segment for the cold-seek case.
+        if (action !== 'segment seek' && action !== 'continue') {
+          await page.evaluate(()=>{
+            const range=document.querySelector('.seek-range');
+            range.value='0';range.dispatchEvent(new Event('input',{bubbles:true}));
+            range.dispatchEvent(new Event('change',{bubbles:true}));
+          });
+          await page.waitForFunction(()=>{
+            const video=document.querySelector('video');
+            return !document.querySelector('.media-preview').classList.contains('is-seeking')
+              && video.buffered.length && video.buffered.end(video.buffered.length-1)>17;
+          });
+          await page.evaluate(()=>{
+            const range=document.querySelector('.seek-range');
+            range.value='10';range.dispatchEvent(new Event('input',{bubbles:true}));
+            range.dispatchEvent(new Event('change',{bubbles:true}));
+          });
+          await at(10);
+        }
+        await page.waitForFunction(()=>!document.querySelector('.media-preview').classList.contains('is-seeking'));
+        holding = true;
+        const before = await page.locator('video').evaluate(video=>{
+          // Keep a real decoded frame while delivering a delayed EOF observation.
+          // An internal media pause deliberately leaves the user's play intent intact.
+          video.pause();
+          const value={position:Number(video.dataset.timelinePosition),loads:Number(video.dataset.segmentLoads)};
+          video.dispatchEvent(new Event('ended'));video.dispatchEvent(new Event('ended'));
+          return value;
+        });
+        let timeout;
+        await Promise.race([intercepted,new Promise((_,reject)=>{timeout=setTimeout(()=>reject(Error('EOF info request was not intercepted')),5000);})])
+          .finally(()=>clearTimeout(timeout));
+        if (action.includes('seek')) {
+          await page.evaluate(()=>{
+            const range=document.querySelector('.seek-range');
+            range.value='2';range.dispatchEvent(new Event('input',{bubbles:true}));
+            range.dispatchEvent(new Event('change',{bubbles:true}));
+          });
+          await at(2);
+          await page.waitForFunction(()=>!document.querySelector('.media-preview').classList.contains('is-seeking'));
+          await page.locator('video').evaluate(video=>video.pause());
+          assert.equal(await page.locator('video').getAttribute('data-seek-kind'),action==='segment seek'?'segment':'buffered');
+        } else if (action === 'latest') {
+          await page.getByRole('button',{name:'回到最新',exact:true}).click();
+        } else if (action === 'drag') {
+          await page.locator('.seek-range').dispatchEvent('pointerdown');
+        }
+        const response = page.waitForResponse(response=>response.url()===base+'/api/media/info?path=eof.ts');
+        holding = false;
+        await held.fulfill({status:action.endsWith('failed info')?503:200,contentType:'application/json',body:JSON.stringify({
+          format:'ts',nativeCompatible:true,compatibilityAvailable:true,durationSeconds:18,isRecording:true,seekable:true,
+        })});
+        held = null;
+        await response;
+        if (action === 'continue' || action === 'latest') {
+          await at(action==='latest'?15:before.position);
+          await page.waitForFunction(()=>!document.querySelector('video').paused && !document.querySelector('.media-preview').classList.contains('is-seeking'));
+        }
+        // Cover the old 800ms continuation timer as well as the promise completion.
+        await page.waitForTimeout(950);
+        const after = await page.locator('video').evaluate(video=>({
+          position:Number(video.dataset.timelinePosition),loads:Number(video.dataset.segmentLoads),
+          state:document.querySelector('.media-preview').dataset.playerState,scrubbing:video.dataset.scrubbing,
+        }));
+        assert.equal(after.loads,before.loads+Number(action==='segment seek'||action==='continue'),'only the current command may start a segment');
+        assert.notEqual(after.state,'error','a superseded info failure must not overwrite the newer playback state');
+        if (action.includes('seek')) assert.ok(Math.abs(after.position-2)<0.6,JSON.stringify(after));
+        if (action==='latest') assert.ok(after.position>=15&&after.position<17,JSON.stringify(after));
+        if (action==='drag') { assert.equal(after.scrubbing,'true');assert.ok(Math.abs(after.position-before.position)<0.2,JSON.stringify(after)); }
+      } finally {
+        holding = false;
+        if (held) await held.abort().catch(()=>{});
+        await page.evaluate(()=>window.endPreview());
+        await page.unroute(pattern,handler);
+        growing = false;
+      }
+    });
+  }
   for (const format of ['mp4','ts']) {
     await step(format+' continuous input presents fresh frames before motion stops', async()=>{
       await page.evaluate(path=>window.beginPreview(path),'sample.'+format);
@@ -332,6 +447,8 @@ try {
     await page.waitForTimeout(100);assert.equal(active,0);
   });
   if(nativeBackend) await step('Rust stream-copy preserves resolution, timestamps and real decoded frame on forward/backward seeks',async()=>{
+    nativeCopyByteLimit=128*1024;
+    try {
     await page.evaluate(()=>window.beginPreview('native-copy.ts'));
     await page.waitForFunction(()=>{const v=document.querySelector('video');return v.readyState>=2&&!v.seeking&&v.currentTime>.1;});
     await page.getByRole('button',{name:'暂停',exact:true}).click();
@@ -342,6 +459,10 @@ try {
     for(const [target,channel] of [[156.6,2],[3.6,0],[146.4,2],[1.2,0]]) {
       const slider=page.getByRole('slider',{name:'播放进度',exact:true}),box=await slider.boundingBox(),duration=Number(await page.locator('video').getAttribute('data-timeline-duration'));
       const loads=Number(await page.locator('video').getAttribute('data-segment-loads'));
+      const buffered=await page.locator('video').evaluate(v=>Array.from({length:v.buffered.length},(_,i)=>[
+        Number(v.dataset.seekOffset)+v.buffered.start(i),Number(v.dataset.seekOffset)+v.buffered.end(i),
+      ]));
+      assert.ok(!buffered.some(([start,end])=>target>=start&&target<=end),`cold seek target ${target} was already buffered: ${JSON.stringify(buffered)}`);
       const started=performance.now();await page.mouse.click(box.x+6+(box.width-12)*target/duration,box.y+box.height/2);await at(target);
       await page.waitForFunction(()=>!document.querySelector('.media-preview').classList.contains('is-seeking'));
       const milliseconds=Math.round(performance.now()-started),pixel=await frame();
@@ -349,11 +470,13 @@ try {
       assert.ok(pixel[channel]>190&&pixel[channel===0?2:0]<50,`wrong decoded frame at ${target}: ${pixel}`);
       assert.ok(milliseconds<1800,`seek must decode promptly, not just move the slider: ${milliseconds}ms`);
       const reloaded=Number(await page.locator('video').getAttribute('data-segment-loads'))>loads;
+      assert.ok(reloaded,`unbuffered target ${target} must request a backend segment`);
       if(reloaded)coldSeeks++;
       assert.equal(await page.locator('video').getAttribute('data-preview-mode'),'copy');
       result.cases.push({name:'native copied seek',target,milliseconds,pixel});
     }
     assert.ok(coldSeeks>=2,'cold forward and backward backend seeks are required');
+    } finally { nativeCopyByteLimit=0; }
     await page.evaluate(()=>window.beginPreview('native-copy.ts'));
     await page.waitForFunction(()=>document.querySelector('video').currentTime>.1);
     await page.getByRole('button',{name:'暂停',exact:true}).click();

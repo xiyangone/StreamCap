@@ -16,7 +16,15 @@ impl PlatformHttp {
         cookie: Option<&str>,
         timeout: Duration,
     ) -> Result<Self, String> {
-        let pooled = crate::network::platform_client(domain, proxy, cookie, timeout, true)?;
+        let pooled = crate::network::platform_client(
+            domain,
+            proxy,
+            cookie,
+            crate::network::CookiePolicy::Send,
+            None,
+            timeout,
+            true,
+        )?;
         Ok(Self {
             client: pooled.client,
             jar: pooled.jar,

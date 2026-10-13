@@ -741,6 +741,72 @@ async fn settings_only_broadcast_changed_inherited_tasks_and_skip_noop_updates()
 }
 
 #[tokio::test]
+async fn global_quality_requeues_idle_rechecks_but_preserves_active_runs_and_overrides() {
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = Workspace::from_repo_root(directory.path());
+    seed_defaults(&workspace);
+    let state = bootstrap(workspace).await.unwrap();
+    let mut records = Vec::new();
+    for id in ["rechecking", "active", "explicit", "paused"] {
+        let mut record = streamcap_core::Recording::new(
+            id.into(),
+            format!("http://127.0.0.1:1/{id}"),
+            id.into(),
+        );
+        record.quality = Some("OD".into());
+        record.check_state = "rechecking".into();
+        record.monitor_status = id != "paused";
+        record.is_recording = id == "active";
+        if id != "explicit" {
+            record.inherited_fields.push("quality".into());
+        }
+        records.push(record);
+    }
+    state.store.insert(records.clone()).await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = router(state.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    client
+        .put(format!("{base}/api/settings"))
+        .json(&json!({"userConfig":{"record_quality":"HD"}}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    for before in &records {
+        let current = state.store.get(&before.rec_id).await.unwrap();
+        assert_eq!(current.monitor_status, before.monitor_status);
+        if before.rec_id == "explicit" {
+            assert_eq!(current.quality, before.quality);
+            assert_eq!(current.check_state, before.check_state);
+        } else if before.is_recording {
+            assert_eq!(current.quality.as_deref(), Some("HD"));
+            assert_eq!(current.check_state, before.check_state);
+            assert!(current.is_recording);
+        } else {
+            assert_eq!(current.quality.as_deref(), Some("HD"));
+            assert_eq!(current.check_state, "idle");
+        }
+    }
+    let before_noop = state.store.all().await;
+    client
+        .put(format!("{base}/api/settings"))
+        .json(&json!({"userConfig":{"record_quality":"HD","theme_mode":"dark"}}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert_eq!(state.store.all().await, before_noop);
+    streamcap_core::api::shutdown(&state).await.unwrap();
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
 async fn cookies_write_read_and_clear() {
     let (base, _guard) = start_backend().await;
     let client = reqwest::Client::new();

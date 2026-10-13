@@ -675,6 +675,7 @@ pub struct AppState {
     pub settings_error: RwSignal<Option<String>>,
     settings_sync: StoredValue<SettingsSync>,
     appearance_writes: StoredValue<AppearanceWrites>,
+    grid_view_writes: StoredValue<GridViewWrites>,
     pub notice: RwSignal<Option<Notice>>,
     pub loading: RwSignal<bool>,
     pub error: RwSignal<Option<String>>,
@@ -682,6 +683,7 @@ pub struct AppState {
     pub events_revision: RwSignal<u32>,
     pub theme: RwSignal<String>,
     pub grid_view: RwSignal<bool>,
+    pub grid_view_saving: RwSignal<bool>,
     pub now: RwSignal<i64>,
 }
 impl AppState {
@@ -786,6 +788,25 @@ impl AppState {
                 .to_string()
         })
     }
+    fn publish_grid_view(self) {
+        let Some(grid) = self
+            .grid_view_writes
+            .try_update_value(|writes| writes.visible())
+        else {
+            return;
+        };
+        self.grid_view.set(grid);
+        if self.settings.with_untracked(|settings| {
+            !settings.is_empty()
+                && settings.get("is_grid_view").and_then(Value::as_bool) != Some(grid)
+        }) {
+            self.settings.update(|settings| {
+                settings.insert("is_grid_view".into(), Value::Bool(grid));
+            });
+            self.settings_version
+                .update(|version| *version = version.wrapping_add(1));
+        }
+    }
     fn apply_settings(self, payload: SettingsPayload) {
         let mut settings = payload.default_config;
         settings.extend(payload.user_config);
@@ -797,9 +818,13 @@ impl AppState {
         } else if let Some(theme) = settings.get("theme_mode").and_then(Value::as_str) {
             self.theme.set(normalize_theme(theme));
         }
-        if let Some(grid) = settings.get("is_grid_view").and_then(Value::as_bool) {
-            self.grid_view.set(grid);
-        }
+        let Some(grid) = self.grid_view_writes.try_update_value(|writes| {
+            writes.snapshot(settings.get("is_grid_view").and_then(Value::as_bool))
+        }) else {
+            return;
+        };
+        self.grid_view.set(grid);
+        settings.insert("is_grid_view".into(), Value::Bool(grid));
         if let Some(language) = settings
             .get("language")
             .and_then(Value::as_str)
@@ -853,6 +878,9 @@ struct SettingsSync {
     loaded: bool,
 }
 impl SettingsSync {
+    fn invalidate(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+    }
     fn begin(&mut self, force: bool) -> Option<u64> {
         if !force && (self.loaded || self.pending > 0) {
             return None;
@@ -868,6 +896,274 @@ impl SettingsSync {
         }
         self.loaded = success;
         true
+    }
+}
+#[derive(Default)]
+struct GridViewWrites {
+    confirmed: Option<bool>,
+    desired: Option<bool>,
+    pending: Option<bool>,
+    running: bool,
+}
+impl GridViewWrites {
+    /// Only a confirmed idle choice or an identical in-flight intent is a no-op.
+    fn push(&mut self, grid: bool) -> Option<bool> {
+        if self.running && self.desired == Some(grid)
+            || !self.running && self.desired.is_none() && self.confirmed == Some(grid)
+        {
+            return None;
+        }
+        self.desired = Some(grid);
+        self.pending = Some(grid);
+        Some(!std::mem::replace(&mut self.running, true))
+    }
+    fn next(&mut self) -> Option<bool> {
+        let next = self.pending.take();
+        if next.is_none() {
+            self.running = false;
+        }
+        next
+    }
+    fn saved(&mut self, grid: bool) {
+        self.confirmed = Some(grid);
+        if self.pending == Some(grid) {
+            self.pending = None;
+        }
+        if self.desired == Some(grid) && self.pending.is_none() {
+            self.desired = None;
+        }
+    }
+    /// An errored write may have committed. Only a fresh read can reconcile it.
+    fn reconcile(&mut self, attempted: bool, observed: Option<bool>) -> bool {
+        let Some(observed) = observed else {
+            return false;
+        };
+        self.confirmed = Some(observed);
+        if observed == attempted {
+            self.saved(observed);
+            true
+        } else {
+            if self.pending.is_none() {
+                self.desired = None;
+            }
+            false
+        }
+    }
+    fn snapshot(&mut self, observed: Option<bool>) -> bool {
+        if !self.running {
+            if let Some(observed) = observed {
+                self.confirmed = Some(observed);
+                if self.desired == Some(observed) {
+                    self.desired = None;
+                }
+            }
+        }
+        self.visible()
+    }
+    fn visible(&self) -> bool {
+        self.desired.or(self.confirmed).unwrap_or(true)
+    }
+}
+#[cfg(test)]
+mod grid_view_write_tests {
+    use super::*;
+
+    fn writes() -> GridViewWrites {
+        GridViewWrites {
+            confirmed: Some(true),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn failed_first_save_rolls_back_and_the_same_choice_can_retry() {
+        let mut writes = writes();
+        assert_eq!(writes.push(false), Some(true));
+        assert_eq!(writes.next(), Some(false));
+        assert!(!writes.visible());
+
+        assert!(!writes.reconcile(false, Some(true)));
+        assert!(writes.visible());
+        assert_eq!(writes.next(), None);
+        assert_eq!(writes.push(false), Some(true));
+        assert_eq!(writes.next(), Some(false));
+        writes.saved(false);
+        assert!(!writes.visible());
+        assert_eq!(writes.confirmed, Some(false));
+        assert_eq!(writes.next(), None);
+        assert_eq!(
+            writes.push(false),
+            None,
+            "only confirmed idle choices are skipped"
+        );
+    }
+
+    #[test]
+    fn unverified_failure_keeps_a_retryable_choice_without_claiming_success() {
+        let mut writes = writes();
+        assert_eq!(writes.push(false), Some(true));
+        assert_eq!(writes.next(), Some(false));
+        assert!(!writes.reconcile(false, None));
+        assert_eq!(writes.next(), None);
+        assert_eq!(writes.confirmed, Some(true));
+        assert_eq!(writes.desired, Some(false));
+        assert!(
+            !writes.snapshot(Some(true)),
+            "an unrelated read cannot erase the local intent"
+        );
+        assert_eq!(
+            writes.push(false),
+            Some(true),
+            "the selected option remains retryable"
+        );
+    }
+
+    #[test]
+    fn a_timed_out_write_is_acknowledged_only_when_readback_confirms_it() {
+        let mut writes = writes();
+        assert_eq!(writes.push(false), Some(true));
+        assert_eq!(writes.next(), Some(false));
+        assert!(writes.reconcile(false, Some(false)));
+        assert_eq!(writes.confirmed, Some(false));
+        assert_eq!(writes.desired, None);
+        assert_eq!(writes.next(), None);
+    }
+
+    #[test]
+    fn rapid_choices_share_one_worker_and_only_the_last_pending_choice_is_written() {
+        let mut writes = writes();
+        assert_eq!(writes.push(false), Some(true));
+        assert_eq!(writes.next(), Some(false));
+        assert_eq!(writes.push(true), Some(false));
+        assert_eq!(writes.push(false), Some(false));
+        assert_eq!(writes.push(true), Some(false));
+        assert_eq!(
+            writes.push(true),
+            None,
+            "identical pending intent is coalesced"
+        );
+        writes.saved(false);
+        assert!(
+            writes.visible(),
+            "the earlier acknowledgement cannot revert the last click"
+        );
+        assert_eq!(writes.next(), Some(true));
+        writes.saved(true);
+        assert_eq!(writes.next(), None);
+        assert_eq!(writes.confirmed, Some(true));
+        assert_eq!(writes.desired, None);
+    }
+
+    #[test]
+    fn returning_to_the_inflight_value_does_not_send_a_redundant_write() {
+        let mut writes = writes();
+        assert_eq!(writes.push(false), Some(true));
+        assert_eq!(writes.next(), Some(false));
+        assert_eq!(writes.push(true), Some(false));
+        assert_eq!(writes.push(false), Some(false));
+        writes.saved(false);
+        assert_eq!(writes.next(), None);
+        assert!(!writes.visible());
+    }
+
+    #[test]
+    fn a_failed_earlier_write_does_not_discard_a_newer_queued_choice() {
+        let mut writes = writes();
+        assert_eq!(writes.push(false), Some(true));
+        assert_eq!(writes.next(), Some(false));
+        assert_eq!(writes.push(true), Some(false));
+        assert!(!writes.reconcile(false, Some(true)));
+        assert!(writes.visible());
+        assert_eq!(writes.desired, Some(true));
+        assert_eq!(writes.next(), Some(true));
+        writes.saved(true);
+        assert_eq!(writes.next(), None);
+    }
+
+    #[test]
+    fn settings_reads_cannot_overwrite_pending_or_just_confirmed_grid_choices() {
+        let mut writes = writes();
+        let mut sync = SettingsSync::default();
+        let before_choice = sync.begin(false).unwrap();
+        assert_eq!(writes.push(false), Some(true));
+        sync.invalidate();
+        assert!(!sync.finish(before_choice, true));
+        assert_eq!(writes.next(), Some(false));
+
+        let while_saving = sync.begin(true).unwrap();
+        assert!(sync.finish(while_saving, true));
+        assert!(!writes.snapshot(Some(true)));
+        assert_eq!(writes.confirmed, Some(true));
+        assert_eq!(writes.desired, Some(false));
+
+        let before_acknowledgement = sync.begin(true).unwrap();
+        writes.saved(false);
+        sync.invalidate();
+        assert_eq!(writes.next(), None);
+        assert!(!sync.finish(before_acknowledgement, true));
+        let current = sync.begin(true).unwrap();
+        assert!(sync.finish(current, true));
+        assert!(!writes.snapshot(Some(false)));
+        assert_eq!(writes.confirmed, Some(false));
+    }
+
+    #[test]
+    fn a_new_choice_supersedes_an_older_verification_read() {
+        let mut writes = writes();
+        let mut sync = SettingsSync::default();
+        assert_eq!(writes.push(false), Some(true));
+        assert_eq!(writes.next(), Some(false));
+        let verification = sync.begin(true).unwrap();
+        assert_eq!(writes.push(true), Some(false));
+        sync.invalidate();
+        assert!(!sync.finish(verification, true));
+        assert!(writes.visible());
+        assert_eq!(writes.next(), Some(true));
+        writes.saved(true);
+        assert_eq!(writes.next(), None);
+    }
+
+    #[test]
+    fn application_owned_grid_writes_complete_after_either_entry_unmounts() {
+        let app = Owner::new();
+        let (writes, selected) = app.with(|| (StoredValue::new(writes()), RwSignal::new(true)));
+        let recordings_page = app.with(Owner::new);
+        recordings_page.with(|| {
+            assert_eq!(
+                writes.try_update_value(|writes| writes.push(false)),
+                Some(Some(true))
+            );
+            selected.set(false);
+        });
+        assert_eq!(
+            writes.try_update_value(GridViewWrites::next),
+            Some(Some(false))
+        );
+        recordings_page.cleanup();
+
+        let settings_page = app.with(Owner::new);
+        settings_page.with(|| {
+            assert_eq!(
+                writes.try_update_value(|writes| writes.push(true)),
+                Some(Some(false))
+            );
+            selected.set(true);
+        });
+        settings_page.cleanup();
+        writes.update_value(|writes| writes.saved(false));
+        assert_eq!(
+            writes.try_update_value(GridViewWrites::next),
+            Some(Some(true))
+        );
+        writes.update_value(|writes| writes.saved(true));
+        assert_eq!(writes.try_update_value(GridViewWrites::next), Some(None));
+        assert_eq!(
+            writes.with_value(GridViewWrites::visible),
+            selected.get_untracked()
+        );
+        assert_eq!(writes.with_value(|writes| writes.confirmed), Some(true));
+        app.cleanup();
+        assert!(writes.try_update_value(GridViewWrites::next).is_none());
     }
 }
 #[derive(Debug, Clone, PartialEq)]
@@ -1048,6 +1344,7 @@ pub fn provide_app_state() -> AppState {
         settings_error: RwSignal::new(None),
         settings_sync: StoredValue::new(SettingsSync::default()),
         appearance_writes: StoredValue::new(AppearanceWrites::default()),
+        grid_view_writes: StoredValue::new(GridViewWrites::default()),
         notice: RwSignal::new(None),
         loading: RwSignal::new(true),
         error: RwSignal::new(None),
@@ -1057,6 +1354,7 @@ pub fn provide_app_state() -> AppState {
             appearance["theme"].as_str().unwrap_or("light"),
         )),
         grid_view: RwSignal::new(true),
+        grid_view_saving: RwSignal::new(false),
         now: RwSignal::new((js_sys::Date::now() / 1000.0) as i64),
     };
     let clock = StoredValue::new_local(Some(gloo_timers::callback::Interval::new(
@@ -1105,6 +1403,48 @@ async fn call<T: DeserializeOwned>(
 ) -> Result<T, String> {
     call_controlled(method, path, body, None).await
 }
+struct ParentCancellation {
+    signal: web_sys::AbortSignal,
+    handler: Closure<dyn FnMut(web_sys::Event)>,
+}
+struct RequestCancellation {
+    controller: web_sys::AbortController,
+    parent: Option<ParentCancellation>,
+}
+impl RequestCancellation {
+    fn new(parent: Option<web_sys::AbortController>) -> Result<Self, String> {
+        let error = || crate::app::i18n::t("无法创建请求").to_string();
+        let controller = web_sys::AbortController::new().map_err(|_| error())?;
+        let parent = if let Some(parent) = parent {
+            let signal = parent.signal();
+            if signal.aborted() {
+                controller.abort();
+                None
+            } else {
+                let child = controller.clone();
+                let handler = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| child.abort());
+                signal
+                    .add_event_listener_with_callback("abort", handler.as_ref().unchecked_ref())
+                    .map_err(|_| error())?;
+                Some(ParentCancellation { signal, handler })
+            }
+        } else {
+            None
+        };
+        Ok(Self { controller, parent })
+    }
+}
+impl Drop for RequestCancellation {
+    fn drop(&mut self) {
+        if let Some(parent) = &self.parent {
+            let _ = parent.signal.remove_event_listener_with_callback(
+                "abort",
+                parent.handler.as_ref().unchecked_ref(),
+            );
+        }
+        self.controller.abort();
+    }
+}
 async fn call_controlled<T: DeserializeOwned>(
     method: &str,
     path: &str,
@@ -1116,18 +1456,15 @@ async fn call_controlled<T: DeserializeOwned>(
         return Err(crate::app::i18n::t("原生运行配置未就绪，请从桌面程序启动").into());
     }
     let url = format!("{base}{path}");
-    let abort = match controller {
-        Some(controller) => controller,
-        None => web_sys::AbortController::new()
-            .map_err(|_| crate::app::i18n::t("无法创建请求").to_string())?,
-    };
+    // A page can cancel all of its requests, but each timeout cancels only its own fetch.
+    let cancellation = RequestCancellation::new(controller)?;
     let builder = match method {
         "POST" => Request::post(&url),
         "PUT" => Request::put(&url),
         "DELETE" => Request::delete(&url),
         _ => Request::get(&url),
     }
-    .abort_signal(Some(&abort.signal()));
+    .abort_signal(Some(&cancellation.controller.signal()));
     let request = match body {
         Some(body) => builder.json(&body),
         None => builder.build(),
@@ -1142,7 +1479,8 @@ async fn call_controlled<T: DeserializeOwned>(
     } else {
         120_000
     };
-    let timer = gloo_timers::callback::Timeout::new(timeout_ms, move || abort.abort());
+    let timeout = cancellation.controller.clone();
+    let timer = gloo_timers::callback::Timeout::new(timeout_ms, move || timeout.abort());
     let response = request.send().await.map_err(|_| {
         crate::app::i18n::t("本地服务未响应；请刷新确认操作结果后再重试").to_string()
     })?;
@@ -1161,11 +1499,20 @@ async fn fetch_settings() -> Result<SettingsPayload, String> {
     call("GET", "/api/settings", None).await
 }
 pub async fn refresh_settings(state: AppState, force: bool) -> Result<(), String> {
+    if let Some(payload) = refresh_settings_snapshot(state, force).await? {
+        state.apply_settings(payload);
+    }
+    Ok(())
+}
+async fn refresh_settings_snapshot(
+    state: AppState,
+    force: bool,
+) -> Result<Option<SettingsPayload>, String> {
     let Some(Some(generation)) = state
         .settings_sync
         .try_update_value(|sync| sync.begin(force))
     else {
-        return Ok(());
+        return Ok(None);
     };
     state.settings_loading.set(true);
     let result = fetch_settings().await;
@@ -1174,14 +1521,13 @@ pub async fn refresh_settings(state: AppState, force: bool) -> Result<(), String
         .try_update_value(|sync| sync.finish(generation, result.is_ok()))
         != Some(true)
     {
-        return Ok(());
+        return Ok(None);
     }
     state.settings_loading.set(false);
     match result {
         Ok(payload) => {
             state.settings_error.set(None);
-            state.apply_settings(payload);
-            Ok(())
+            Ok(Some(payload))
         }
         Err(error) => {
             state.settings_error.set(Some(error.clone()));
@@ -1478,6 +1824,75 @@ fn encode(value: &str) -> String {
     js_sys::encode_uri_component(value)
         .as_string()
         .unwrap_or_default()
+}
+
+pub fn save_grid_view(state: AppState, grid: bool) {
+    let Some(Some(start)) = state
+        .grid_view_writes
+        .try_update_value(|writes| writes.push(grid))
+    else {
+        return;
+    };
+    state.settings_sync.update_value(SettingsSync::invalidate);
+    state.publish_grid_view();
+    state.grid_view_saving.set(true);
+    if !start {
+        return;
+    }
+    // The queue and signals belong to AppState, not either page's reactive owner.
+    leptos::task::spawn_local(async move {
+        while let Some(Some(grid)) = state
+            .grid_view_writes
+            .try_update_value(GridViewWrites::next)
+        {
+            let result = match save_settings(json!({"is_grid_view":grid})).await {
+                Ok(()) => {
+                    let _ = state
+                        .grid_view_writes
+                        .try_update_value(|writes| writes.saved(grid));
+                    Ok(())
+                }
+                Err(error) => match refresh_settings_snapshot(state, true).await {
+                    Ok(Some(payload)) => {
+                        let observed = payload
+                            .user_config
+                            .get("is_grid_view")
+                            .or_else(|| payload.default_config.get("is_grid_view"))
+                            .and_then(Value::as_bool);
+                        let verified = state
+                            .grid_view_writes
+                            .try_update_value(|writes| writes.reconcile(grid, observed))
+                            == Some(true);
+                        state.apply_settings(payload);
+                        if verified {
+                            Ok(())
+                        } else {
+                            Err(error)
+                        }
+                    }
+                    // Keep an unconfirmed choice retryable when verification also fails
+                    // or a newer settings generation supersedes this verification read.
+                    Ok(None) | Err(_) => Err(error),
+                },
+            };
+            let Some(complete) = state
+                .grid_view_writes
+                .try_update_value(|writes| writes.desired.is_none())
+            else {
+                return;
+            };
+            // Reads started while this request was pending cannot undo its acknowledgement.
+            state.settings_sync.update_value(SettingsSync::invalidate);
+            state.publish_grid_view();
+            match result {
+                Ok(()) if complete => state.notify(crate::app::i18n::t("偏好设置已保存")),
+                Err(error) => state.fail(error),
+                _ => {}
+            }
+        }
+        let _ = state.grid_view_saving.try_set(false);
+        let _ = refresh_settings(state, true).await;
+    });
 }
 
 pub fn save_appearance(state: AppState) {

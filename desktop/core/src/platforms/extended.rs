@@ -1,5 +1,6 @@
 //! Native ports of explicit streamget platform protocols. Missing business fields are errors, not "offline".
 use super::{catalog, http, quality_index, quality_name};
+use crate::network::{CookiePolicy, SessionClient};
 use crate::resolver::{ResolveRequest, StreamInfo};
 use reqwest::Url;
 use serde_json::{json, Value};
@@ -19,18 +20,8 @@ impl<'a> Context<'a> {
         request: &'a ResolveRequest,
         platform: &'static catalog::Platform,
     ) -> Result<Self, String> {
-        let domain = if platform.key == "flextv" {
-            "ttinglive.com"
-        } else {
-            platform.domains[0]
-        };
-        let transport = crate::network::platform_client(
-            domain,
-            request.proxy.as_deref(),
-            request.cookie.as_deref(),
-            Duration::from_secs(18),
-            false,
-        )?;
+        let url = http::validate_url(&request.url)?;
+        let transport = Self::transport(request, platform, &url)?;
         Ok(Self {
             request,
             #[cfg(test)]
@@ -38,9 +29,50 @@ impl<'a> Context<'a> {
             jar: transport.jar,
             platform,
             client: transport.client,
-            url: http::validate_url(&request.url)?,
+            url,
             initial_page: std::sync::Mutex::new(None),
         })
+    }
+    fn transport(
+        request: &ResolveRequest,
+        platform: &'static catalog::Platform,
+        url: &Url,
+    ) -> Result<SessionClient, String> {
+        let domain = Self::transport_domain(platform, url)?;
+        crate::network::platform_client(
+            domain,
+            request.proxy.as_deref(),
+            request.cookie.as_deref(),
+            if domain == "shp.ee" {
+                CookiePolicy::IdentityOnly
+            } else {
+                CookiePolicy::Send
+            },
+            request.account.as_ref(),
+            Duration::from_secs(18),
+            false,
+        )
+    }
+    fn transport_domain(
+        platform: &'static catalog::Platform,
+        url: &Url,
+    ) -> Result<&'static str, String> {
+        let host = url.host_str().ok_or("平台地址无效")?;
+        if !allowed_host(platform, host) {
+            return Err("平台请求指向未授权域名".into());
+        }
+        let domain = match platform.key {
+            "flextv" => "ttinglive.com",
+            "soop" => "sooplive.com",
+            "shopee" => platform
+                .domains
+                .iter()
+                .copied()
+                .find(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
+                .ok_or("Shopee 地区地址无效")?,
+            _ => platform.domains[0],
+        };
+        Ok(domain)
     }
     fn id(&self) -> Result<String, String> {
         self.url
@@ -62,13 +94,20 @@ impl<'a> Context<'a> {
         method: reqwest::Method,
         url: &str,
     ) -> Result<reqwest::RequestBuilder, String> {
+        self.request_with_client(&self.client, method, url)
+    }
+    fn request_with_client(
+        &self,
+        client: &reqwest::Client,
+        method: reqwest::Method,
+        url: &str,
+    ) -> Result<reqwest::RequestBuilder, String> {
         let parsed = http::validate_url(url)?;
         let host = parsed.host_str().ok_or("平台地址无效")?;
         if !allowed_host(self.platform, host) {
             return Err("平台请求指向未授权域名".into());
         }
-        let builder = self
-            .client
+        let builder = client
             .request(method, parsed.clone())
             .header("Referer", self.url.as_str());
 
@@ -78,23 +117,58 @@ impl<'a> Context<'a> {
         &self,
         request: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, String> {
+        self.send_with_jar(request, &self.jar).await
+    }
+    async fn send_with_jar(
+        &self,
+        request: reqwest::RequestBuilder,
+        _jar: &reqwest::cookie::Jar,
+    ) -> Result<reqwest::Response, String> {
         #[cfg(test)]
         if let Some(replies) = &self.test_responses {
-            return fixture_tests::respond(replies, &self.jar, request);
+            return fixture_tests::respond(replies, _jar, request);
         }
         request.send().await.map_err(http::transport_error)
     }
-    async fn fetch_page(&self, url: &str) -> Result<(Url, String), String> {
+    async fn fetch_page(&self, url: &str) -> Result<(Url, String, SessionClient), String> {
         let mut url = http::validate_url(url)?;
+        let mut transport = SessionClient {
+            client: self.client.clone(),
+            jar: self.jar.clone(),
+        };
+        let mut region = if self.platform.key == "shopee" {
+            Some(Self::transport_domain(self.platform, &self.url)?)
+                .filter(|domain| *domain != "shp.ee")
+        } else {
+            None
+        };
         {
             let mut cached = self.initial_page.lock().expect("initial page");
             if cached.as_ref().is_some_and(|(key, _)| key == &url) {
-                return Ok(cached.take().expect("cached page"));
+                let (url, page) = cached.take().expect("cached page");
+                return Ok((url, page, transport));
             }
         }
         for _ in 0..5 {
+            if self.platform.key == "shopee" {
+                let domain = Self::transport_domain(self.platform, &url)?;
+                if region.is_some_and(|bound| bound != domain) {
+                    return Err("Shopee 跳转跨越已绑定的地区，未发送登录信息".into());
+                }
+                if region.is_none() && domain != "shp.ee" {
+                    transport = Self::transport(self.request, self.platform, &url)?;
+                    region = Some(domain);
+                }
+            }
             let response = self
-                .send_request(self.request(reqwest::Method::GET, url.as_str())?)
+                .send_with_jar(
+                    self.request_with_client(
+                        &transport.client,
+                        reqwest::Method::GET,
+                        url.as_str(),
+                    )?,
+                    &transport.jar,
+                )
                 .await?;
             if response.status().is_redirection() {
                 let location = response
@@ -109,7 +183,7 @@ impl<'a> Context<'a> {
                 url = target;
                 continue;
             }
-            return Ok((url, http::body(response).await?));
+            return Ok((url, http::body(response).await?, transport));
         }
         Err("平台跳转次数超出限制".into())
     }
@@ -279,7 +353,9 @@ async fn prepare_short_link(c: &mut Context<'_>) -> Result<(), String> {
             .iter()
             .any(|d| h == *d || h.ends_with(&format!(".{d}")))
     }) {
-        let (url, page) = c.fetch_page(c.url.as_str()).await?;
+        let (url, page, transport) = c.fetch_page(c.url.as_str()).await?;
+        c.client = transport.client;
+        c.jar = transport.jar;
         c.url = url.clone();
         *c.initial_page.lock().expect("initial page") = Some((url, page));
     }

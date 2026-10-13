@@ -394,16 +394,26 @@ fn to_camel(snake: &str) -> String {
     out
 }
 
-/// 只更新继承项，显式覆盖的任务值不受全局修改影响。
-pub async fn apply_global_defaults(store: &Store, config: &crate::config::ConfigStore) {
+/// Apply inherited values and return (previous, current) pairs for lifecycle coordination.
+pub async fn apply_global_defaults(
+    store: &Store,
+    config: &crate::config::ConfigStore,
+) -> Vec<(Recording, Recording)> {
     let mut list = store.inner.write().await;
+    let mut changed = Vec::new();
     for rec in list.iter_mut() {
         let previous = rec.clone();
         apply_defaults(rec, config);
         if *rec != previous {
+            // An active recorder keeps its run identity; the new quality is for its next run.
+            if rec.quality != previous.quality && !rec.is_recording {
+                rec.invalidate_schedule();
+            }
             store.emit("update", serde_json::to_value(&*rec).unwrap_or(Value::Null));
+            changed.push((previous, rec.clone()));
         }
     }
+    changed
 }
 
 pub fn apply_defaults(rec: &mut Recording, config: &crate::config::ConfigStore) {

@@ -723,6 +723,11 @@ impl Engine {
         self.active.lock().await.keys().cloned().collect()
     }
 
+    /// Keep the exact recorder identity and its real output together during space checks.
+    pub(crate) async fn active_processes(&self) -> Vec<Arc<RecorderProcess>> {
+        self.active.lock().await.values().cloned().collect()
+    }
+
     pub async fn is_current(&self, process: &Arc<RecorderProcess>) -> bool {
         !process.stop_requested.load(Ordering::SeqCst)
             && self

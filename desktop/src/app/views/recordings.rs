@@ -94,7 +94,6 @@ pub fn RecordingsView() -> impl IntoView {
     });
     let batch_progress = RwSignal::new(None::<(usize, usize)>);
     let batch_status = RwSignal::new("");
-    let layout_busy = RwSignal::new(false);
     let add = RwSignal::new(false);
     let editing = RwSignal::new(None::<Recording>);
     let info = RwSignal::new(None::<Recording>);
@@ -303,23 +302,10 @@ pub fn RecordingsView() -> impl IntoView {
         });
     });
     let set_layout = Callback::new(move |grid: bool| {
-        if selection_locked.get_untracked()
-            || layout_busy.get_untracked()
-            || !state.status.get_untracked().ok
-            || state.grid_view.get_untracked() == grid
-        {
+        if selection_locked.get_untracked() || !state.status.get_untracked().ok {
             return;
         }
-        layout_busy.set(true);
-        state.grid_view.set(grid);
-        leptos::task::spawn_local(async move {
-            if let Err(error) =
-                gateway::save_settings(serde_json::json!({"is_grid_view":grid})).await
-            {
-                state.fail(crate::tr_format!("视图已切换，偏好保存失败：{error}"));
-            }
-            let _ = layout_busy.try_set(false);
-        });
+        gateway::save_grid_view(state, grid);
     });
     view! {
         <div class="page recordings-page">
@@ -346,12 +332,12 @@ pub fn RecordingsView() -> impl IntoView {
                     </div>
                     <label class="toolbar-field"><span>{t("平台")}</span><select class="ui-select ui-select-sm input platform-filter" aria-label=t("筛选平台") prop:value=move || platform.get() disabled=move || selection_locked.get() on:change=move |e| platform.set(event_target_value(&e))><option value="">{t("全部平台")}</option>{move || platforms.get().into_iter().map(|key| { let label = platform_label(&key); view! { <option value=key>{label}</option> } }).collect_view()}</select></label>
                     <label class="toolbar-field"><span>{t("排序")}</span><select class="ui-select ui-select-sm input sort-select" aria-label=t("任务排序") prop:value=move || sorting.get() disabled=move || selection_locked.get() on:change=move |e| sorting.set(event_target_value(&e))><option value="status">{t("状态优先")}</option><option value="name">{t("名称排序")}</option></select></label>
-                    <div class="view-switch" role="group" aria-label=t("视图模式")>
+                    <div class="view-switch" role="group" aria-label=t("视图模式") aria-busy=move || state.grid_view_saving.get().to_string()>
                         <IconButton label=t("网格视图") icon="grid" pressed=Signal::derive(move || Some(state.grid_view.get()))
-                            disabled=Signal::derive(move || selection_locked.get() || layout_busy.get() || !state.status.get().ok)
+                            disabled=Signal::derive(move || selection_locked.get() || !state.status.get().ok)
                             on_click=Callback::new(move |_| set_layout.run(true)) />
                         <IconButton label=t("列表视图") icon="list" pressed=Signal::derive(move || Some(!state.grid_view.get()))
-                            disabled=Signal::derive(move || selection_locked.get() || layout_busy.get() || !state.status.get().ok)
+                            disabled=Signal::derive(move || selection_locked.get() || !state.status.get().ok)
                             on_click=Callback::new(move |_| set_layout.run(false)) />
                     </div>
                 </div>

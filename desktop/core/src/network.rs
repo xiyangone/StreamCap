@@ -9,6 +9,11 @@ use std::{
 
 const CAPACITY: usize = 32;
 const TTL: Duration = Duration::from_secs(300);
+#[derive(Clone, Copy)]
+pub enum CookiePolicy {
+    Send,
+    IdentityOnly,
+}
 #[derive(Clone)]
 pub struct SessionClient {
     pub client: Client,
@@ -29,6 +34,8 @@ pub fn platform_client(
     domain: &'static str,
     proxy: Option<&str>,
     cookie: Option<&str>,
+    cookie_policy: CookiePolicy,
+    account: Option<&crate::config::PlatformAccount>,
     timeout: Duration,
     redirects: bool,
 ) -> Result<SessionClient, String> {
@@ -42,11 +49,24 @@ pub fn platform_client(
         domain.as_bytes(),
         proxy.as_bytes(),
         cookie.as_bytes(),
+        &[cookie_policy as u8],
         &timeout.as_nanos().to_le_bytes(),
         &[u8::from(redirects)],
     ] {
         hash.update((part.len() as u64).to_le_bytes());
         hash.update(part);
+    }
+    hash.update([u8::from(account.is_some())]);
+    if let Some(account) = account {
+        for part in [
+            &account.username,
+            &account.password,
+            &account.access_token,
+            &account.account_type,
+        ] {
+            hash.update((part.len() as u64).to_le_bytes());
+            hash.update(part.as_bytes());
+        }
     }
     let identity: [u8; 32] = hash.finalize().into();
     let mut cache = pool().lock().map_err(|_| "平台连接池不可用")?;
@@ -60,11 +80,13 @@ pub fn platform_client(
     }
     let jar = Arc::new(Jar::default());
     let origin = reqwest::Url::parse(&format!("https://{domain}/")).map_err(|_| "平台域名无效")?;
-    for pair in cookie.split(';').map(str::trim).filter(|s| s.contains('=')) {
-        jar.add_cookie_str(
-            &format!("{pair}; Domain=.{domain}; Path=/; Secure"),
-            &origin,
-        );
+    if matches!(cookie_policy, CookiePolicy::Send) {
+        for pair in cookie.split(';').map(str::trim).filter(|s| s.contains('=')) {
+            jar.add_cookie_str(
+                &format!("{pair}; Domain=.{domain}; Path=/; Secure"),
+                &origin,
+            );
+        }
     }
     let policy = if redirects {
         reqwest::redirect::Policy::custom(move |attempt| {
@@ -132,10 +154,13 @@ mod tests {
     use super::*;
     #[test]
     fn cache_reuses_identity_but_separates_credentials_and_policy() {
+        use reqwest::cookie::CookieStore;
         let a = platform_client(
             "fixture.example",
             None,
             Some("sid=one"),
+            CookiePolicy::Send,
+            None,
             Duration::from_secs(9),
             false,
         )
@@ -144,11 +169,28 @@ mod tests {
             "fixture.example",
             None,
             Some("sid=one"),
+            CookiePolicy::Send,
+            None,
             Duration::from_secs(9),
             false,
         )
         .unwrap();
         assert!(Arc::ptr_eq(&a.jar, &b.jar));
+        let withheld = platform_client(
+            "fixture.example",
+            None,
+            Some("sid=one"),
+            CookiePolicy::IdentityOnly,
+            None,
+            Duration::from_secs(9),
+            false,
+        )
+        .unwrap();
+        assert!(!Arc::ptr_eq(&a.jar, &withheld.jar));
+        assert!(withheld
+            .jar
+            .cookies(&reqwest::Url::parse("https://fixture.example/").unwrap())
+            .is_none());
         for (cookie, proxy, policy) in [
             ("sid=two", None, false),
             ("sid=one", Some("http://127.0.0.1:9"), false),
@@ -158,6 +200,8 @@ mod tests {
                 "fixture.example",
                 proxy,
                 Some(cookie),
+                CookiePolicy::Send,
+                None,
                 Duration::from_secs(9),
                 policy,
             )
@@ -168,6 +212,8 @@ mod tests {
             "fixture.example",
             None,
             Some("sid=a\nInjected: true"),
+            CookiePolicy::Send,
+            None,
             Duration::from_secs(9),
             false
         )

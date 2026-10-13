@@ -808,6 +808,7 @@ async fn update_settings(
     State(state): State<ApiState>,
     Json(payload): Json<SettingsPayload>,
 ) -> ApiResult {
+    let _lifecycle = state.store.lifecycle_guard().await;
     let changed = {
         let mut config = state.config.write().await;
         config
@@ -827,7 +828,9 @@ async fn update_settings(
             .any(|(_, setting)| key == setting)
     }) {
         let config = state.config.read().await;
-        crate::store::apply_global_defaults(&state.store, &config).await;
+        let affected = crate::store::apply_global_defaults(&state.store, &config).await;
+        drop(config);
+        state.scheduler.global_defaults_changed(&affected).await;
     }
     if changed.iter().any(|key| key == "loop_time_seconds") {
         state.scheduler.refresh_interval();

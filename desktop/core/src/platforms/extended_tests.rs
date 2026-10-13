@@ -5,6 +5,8 @@ pub(super) struct Reply {
     pub body: Vec<u8>,
     pub status: u16,
     pub cookie: Option<&'static str>,
+    pub location: Option<&'static str>,
+    pub expected_cookie: Option<&'static str>,
 }
 impl Reply {
     fn json(url: &'static str, body: Value) -> Self {
@@ -13,6 +15,8 @@ impl Reply {
             body: serde_json::to_vec(&body).unwrap(),
             status: 200,
             cookie: None,
+            location: None,
+            expected_cookie: None,
         }
     }
     fn text(url: &'static str, body: &str) -> Self {
@@ -21,6 +25,8 @@ impl Reply {
             body: body.as_bytes().to_vec(),
             status: 200,
             cookie: None,
+            location: None,
+            expected_cookie: None,
         }
     }
 }
@@ -43,7 +49,30 @@ pub(super) fn respond(
         reply.url,
         request.url()
     );
+    if let Some(expected) = reply.expected_cookie {
+        use reqwest::cookie::CookieStore;
+        let actual = jar.cookies(request.url());
+        let actual = actual
+            .as_ref()
+            .map(|header| header.to_str().unwrap())
+            .unwrap_or("");
+        if expected.is_empty() {
+            assert!(
+                actual.is_empty(),
+                "short links must not receive configured cookies"
+            );
+        } else {
+            assert!(
+                actual.split(';').any(|pair| pair.trim() == expected),
+                "missing expected fixture cookie for {}",
+                request.url()
+            );
+        }
+    }
     let mut response = axum::http::Response::builder().status(reply.status);
+    if let Some(location) = reply.location {
+        response = response.header("location", location);
+    }
     if let Some(cookie) = reply.cookie {
         jar.add_cookie_str(cookie, request.url());
         response = response.header("set-cookie", cookie);
@@ -109,6 +138,268 @@ fn separate_platform_accounts_never_share_their_transport_cookie_jar() {
     b.cookie = Some("sid=second".into());
     let other = Context::new(&b, catalog::by_key("bigo").unwrap()).unwrap();
     assert!(!std::sync::Arc::ptr_eq(&first.jar, &other.jar));
+}
+
+#[test]
+fn account_changes_do_not_reuse_authenticated_transport() {
+    use crate::config::PlatformAccount;
+    use reqwest::cookie::CookieStore;
+
+    for (key, url, origin) in [
+        (
+            "flextv",
+            "https://www.ttinglive.com/channels/fixture/live",
+            "https://www.ttinglive.com/",
+        ),
+        (
+            "soop",
+            "https://play.sooplive.com/fixture",
+            "https://live.sooplive.com/",
+        ),
+        (
+            "twitcasting",
+            "https://twitcasting.tv/fixture",
+            "https://twitcasting.tv/",
+        ),
+    ] {
+        let mut original = request(key, url);
+        original.cookie = Some("fixture_scope=account-isolation".into());
+        let account = PlatformAccount {
+            username: "first-user".into(),
+            password: "first-password".into(),
+            access_token: "first-token".into(),
+            account_type: "first-type".into(),
+        };
+        original.account = Some(account.clone());
+        let platform = catalog::by_key(key).unwrap();
+        let first = Context::new(&original, platform).unwrap();
+        let origin = Url::parse(origin).unwrap();
+        first
+            .jar
+            .add_cookie_str("session=first; Path=/; Secure", &origin);
+        let again = Context::new(&original, platform).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&first.jar, &again.jar));
+
+        for field in [
+            "username",
+            "password",
+            "access_token",
+            "account_type",
+            "empty",
+            "removed",
+        ] {
+            let mut changed = original.clone();
+            let mut replacement = account.clone();
+            match field {
+                "username" => replacement.username = "second-user".into(),
+                "password" => replacement.password = "second-password".into(),
+                "access_token" => replacement.access_token = "second-token".into(),
+                "account_type" => replacement.account_type = "second-type".into(),
+                _ => replacement = PlatformAccount::default(),
+            }
+            changed.account = (field != "removed").then_some(replacement);
+            let other = Context::new(&changed, platform).unwrap();
+            assert!(
+                !std::sync::Arc::ptr_eq(&first.jar, &other.jar),
+                "{key}: {field}"
+            );
+            assert!(
+                !other
+                    .jar
+                    .cookies(&origin)
+                    .is_some_and(|header| header.to_str().unwrap().contains("session=first")),
+                "{key}: {field}"
+            );
+        }
+    }
+}
+
+#[test]
+fn configured_cookies_follow_the_platform_region_without_crossing_domains() {
+    use reqwest::cookie::CookieStore;
+
+    for (key, room, endpoint, excluded) in [
+        (
+            "soop",
+            "https://play.sooplive.com/fixture",
+            "https://live.sooplive.com/afreeca/player_live_api.php",
+            "https://live.sooplive.co.kr/",
+        ),
+        (
+            "soop",
+            "https://play.sooplive.co.kr/fixture",
+            "https://live.sooplive.com/afreeca/player_live_api.php",
+            "https://live.sooplive.co.kr/",
+        ),
+        (
+            "shopee",
+            "https://live.shopee.sg/share?session=123",
+            "https://live.shopee.sg/api/v1/play_param/session",
+            "https://live.shopee.tw/",
+        ),
+        (
+            "shopee",
+            "https://live.shopee.tw/share?session=123",
+            "https://live.shopee.tw/api/v1/play_param/session",
+            "https://live.shopee.sg/",
+        ),
+    ] {
+        let mut request = request(key, room);
+        request.cookie = Some("fixture_region=authenticated".into());
+        let context = Context::new(&request, catalog::by_key(key).unwrap()).unwrap();
+        let cookies = context.jar.cookies(&Url::parse(endpoint).unwrap());
+        assert!(
+            cookies.is_some_and(|header| header
+                .to_str()
+                .unwrap()
+                .contains("fixture_region=authenticated")),
+            "{room}"
+        );
+        assert!(
+            context
+                .jar
+                .cookies(&Url::parse(excluded).unwrap())
+                .is_none(),
+            "{room}"
+        );
+        assert!(context
+            .jar
+            .cookies(&Url::parse("https://shp.ee/").unwrap())
+            .is_none());
+    }
+    let request = request(
+        "shopee",
+        "https://live.shopee.sg.evil.invalid/share?session=123",
+    );
+    assert!(Context::new(&request, catalog::by_key("shopee").unwrap()).is_err());
+}
+
+#[tokio::test]
+async fn shopee_short_links_seed_cookies_before_the_first_region_request() {
+    use reqwest::cookie::CookieStore;
+
+    let mut request = request("shopee", "https://shp.ee/fixture-short-link");
+    request.cookie = Some("fixture_short_link=authenticated".into());
+    let mut context = Context::new(&request, catalog::by_key("shopee").unwrap()).unwrap();
+    for url in [
+        "https://shp.ee/",
+        "https://live.shopee.sg/",
+        "https://live.shopee.tw/",
+    ] {
+        assert!(context.jar.cookies(&Url::parse(url).unwrap()).is_none());
+    }
+    let mut other = request.clone();
+    other.cookie = Some("fixture_short_link=other-account".into());
+    let other = Context::new(&other, catalog::by_key("shopee").unwrap()).unwrap();
+    assert!(!std::sync::Arc::ptr_eq(&context.jar, &other.jar));
+    context.test_responses = Some(Mutex::new(
+        vec![
+            Reply {
+                status: 302,
+                location: Some("https://live.shopee.sg/start"),
+                expected_cookie: Some(""),
+                ..Reply::text("https://shp.ee/", "")
+            },
+            Reply {
+                status: 302,
+                location: Some("/share?session=123"),
+                expected_cookie: Some("fixture_short_link=authenticated"),
+                cookie: Some("region_session=fresh; Path=/; Secure"),
+                ..Reply::text("https://live.shopee.sg/start", "")
+            },
+            Reply {
+                expected_cookie: Some("region_session=fresh"),
+                ..Reply::text("https://live.shopee.sg/share?session=123", "fixture page")
+            },
+            Reply {
+                expected_cookie: Some("region_session=fresh"),
+                ..Reply::json(
+                    "https://live.shopee.sg/api/v1/play_param/session",
+                    json!({"ok":true}),
+                )
+            },
+        ]
+        .into(),
+    ));
+    prepare_short_link(&mut context).await.unwrap();
+    assert_eq!(
+        context.url.as_str(),
+        "https://live.shopee.sg/share?session=123"
+    );
+    assert_eq!(
+        context.text(context.url.as_str()).await.unwrap(),
+        "fixture page"
+    );
+    assert_eq!(
+        context
+            .post(
+                "https://live.shopee.sg/api/v1/play_param/session",
+                json!({})
+            )
+            .await
+            .unwrap(),
+        json!({"ok":true})
+    );
+    assert!(context
+        .test_responses
+        .as_ref()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .is_empty());
+    assert!(context
+        .jar
+        .cookies(&Url::parse("https://live.shopee.sg/").unwrap())
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("fixture_short_link=authenticated"));
+    assert!(context
+        .jar
+        .cookies(&Url::parse("https://live.shopee.tw/").unwrap())
+        .is_none());
+    assert!(context
+        .jar
+        .cookies(&Url::parse("https://shp.ee/").unwrap())
+        .is_none());
+}
+
+#[tokio::test]
+async fn shopee_redirects_cannot_forward_cookies_to_another_region_or_untrusted_host() {
+    for target in [
+        "https://live.shopee.tw/share?session=123",
+        "https://live.shopee.sg.evil.invalid/share?session=123",
+        "http://live.shopee.sg/share?session=123",
+    ] {
+        let mut request = request("shopee", "https://shp.ee/fixture-boundary");
+        request.cookie = Some("fixture_boundary=authenticated".into());
+        let mut context = Context::new(&request, catalog::by_key("shopee").unwrap()).unwrap();
+        context.test_responses = Some(Mutex::new(
+            vec![
+                Reply {
+                    status: 302,
+                    location: Some("https://live.shopee.sg/start"),
+                    expected_cookie: Some(""),
+                    ..Reply::text("https://shp.ee/", "")
+                },
+                Reply {
+                    status: 302,
+                    location: Some(target),
+                    expected_cookie: Some("fixture_boundary=authenticated"),
+                    ..Reply::text("https://live.shopee.sg/start", "")
+                },
+            ]
+            .into(),
+        ));
+        assert!(prepare_short_link(&mut context).await.is_err(), "{target}");
+        assert!(context
+            .test_responses
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .is_empty());
+    }
 }
 
 struct SimpleCase {
@@ -738,7 +1029,7 @@ async fn migu_protocol_module_is_bounded_and_used_in_process() {
         super::super::migu_wasm::sign(&module, "https://media.example.test/live.m3u8").unwrap(),
         "abc"
     );
-    let info=fixture("migu","https://www.miguvideo.com/match/123",vec![Reply::json("basic-data/123/miguvideo",json!({"body":{"title":"Fixture","pId":"456"}})),Reply::json("v3/play/playurl",json!({"body":{"content":{"currentLive":1},"urlInfo":{"url":"https://media.example.test/live.m3u8?userid=fixture"}}})),Reply::json("settings/H5_DetailPage",json!({"body":{"paramValue":json!({"playerVersion":"fixture"}).to_string()}})),Reply{url:"mgprtcl.wasm",body:module,status:200,cookie:None}]).await.unwrap();
+    let info=fixture("migu","https://www.miguvideo.com/match/123",vec![Reply::json("basic-data/123/miguvideo",json!({"body":{"title":"Fixture","pId":"456"}})),Reply::json("v3/play/playurl",json!({"body":{"content":{"currentLive":1},"urlInfo":{"url":"https://media.example.test/live.m3u8?userid=fixture"}}})),Reply::json("settings/H5_DetailPage",json!({"body":{"paramValue":json!({"playerVersion":"fixture"}).to_string()}})),Reply{body:module,..Reply::text("mgprtcl.wasm", "")}]).await.unwrap();
     assert!(info.is_live);
     assert!(info.m3u8_url.contains("ddCalcu=abc"));
     let forbidden = wat::parse_str(

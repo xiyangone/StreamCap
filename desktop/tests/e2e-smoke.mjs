@@ -6,6 +6,7 @@ const h = await createHarness('interaction');
 const { page, state } = h;
 const steps = [];
 const loadResults = [];
+const storageLoadResults = [];
 const card = (id) => page.locator('article[data-rec-id="' + id + '"]');
 const dialog = (name) => page.getByRole('dialog', { name, exact: true });
 const requests = (method, path) => state.requests.filter((r) => r.method === method && r.path === path);
@@ -496,6 +497,84 @@ try {
     assert.equal(await page.locator('html').getAttribute('data-accent'), null);
     assert.deepEqual(await page.evaluate(() => JSON.parse(localStorage.getItem('streamcap.appearance'))), { theme: 'light' });
     assert.ok(requests('PUT', '/api/settings').slice(before).every(request => !Object.hasOwn(request.body.userConfig, 'theme_color')), '外观保存不再写入强调色');
+  });
+  await step('默认视图保存失败回滚，两个入口都能直接重试同一选项', async () => {
+    const original = state.userConfig.is_grid_view ?? state.defaultConfig.is_grid_view;
+    const gridWrites = () => requests('PUT', '/api/settings').filter(r => Object.hasOwn(r.body.userConfig, 'is_grid_view'));
+    for (const route of ['/settings', '/recordings']) {
+      await go(page, h.base, route);
+      if (route === '/settings') await page.getByRole('button', { name: '外观与窗口', exact: true }).click();
+      const name = value => route === '/settings'
+        ? (value ? '默认网格视图' : '默认列表视图') : (value ? '网格视图' : '列表视图');
+      const target = page.getByRole('button', { name: name(!original), exact: true });
+      const initial = page.getByRole('button', { name: name(original), exact: true });
+      h.failNext('PUT', '/api/settings', '模拟视图保存失败', 500);
+      await target.click();
+      await visible(page.getByText('模拟视图保存失败', { exact: false }).first());
+      await waitState(() => initial.getAttribute('aria-pressed'), value => value === 'true', '读回旧偏好并回滚');
+      await waitState(() => page.locator('.view-switch').getAttribute('aria-busy'), value => value === 'false', '失败后队列结束');
+      const count = gridWrites().length;
+      await target.click();
+      await waitState(() => state.userConfig.is_grid_view, value => value === !original, '再次点击必须发出保存');
+      await waitState(() => page.locator('.view-switch').getAttribute('aria-busy'), value => value === 'false', '重试完成');
+      assert.equal(gridWrites().length, count + 1);
+      await initial.click();
+      await waitState(() => state.userConfig.is_grid_view, value => value === original, '恢复原视图');
+      await waitState(() => page.locator('.view-switch').getAttribute('aria-busy'), value => value === 'false', '恢复完成');
+    }
+  });
+  await step('跨页视图选择串行合并，迟到设置快照不覆盖最后选择', async () => {
+    await go(page, h.base, '/recordings');
+    await page.getByRole('button', { name: '网格视图', exact: true }).click();
+    await waitState(() => state.userConfig.is_grid_view, value => value === true, '初始网格');
+    await waitState(() => page.locator('.view-switch').getAttribute('aria-busy'), value => value === 'false', '初始保存完成');
+    const held = h.holdNextSettingsRead();
+    try {
+      h.emit('settings', {});
+      await held.received;
+      const before = requests('PUT', '/api/settings').length;
+      h.delayNext('PUT', '/api/settings', 1200);
+      await page.getByRole('button', { name: '列表视图', exact: true }).click();
+      await waitState(() => requests('PUT', '/api/settings').length, count => count === before + 1, '首个视图请求在途');
+      await navigate('偏好设置');
+      await page.getByRole('button', { name: '外观与窗口', exact: true }).click();
+      await page.getByRole('button', { name: '默认网格视图', exact: true }).click();
+      await page.getByRole('button', { name: '默认列表视图', exact: true }).click();
+      await page.getByRole('button', { name: '默认网格视图', exact: true }).click();
+      assert.equal(requests('PUT', '/api/settings').length, before + 1, '跨页不能并行写入');
+      held.release();
+      await waitState(() => page.locator('.view-switch').getAttribute('aria-busy'), value => value === 'false', '合并队列结束');
+      assert.equal(state.userConfig.is_grid_view, true);
+      assert.equal(requests('PUT', '/api/settings').length, before + 2, '只写首个和最终选择');
+      assert.equal(await page.getByRole('button', { name: '默认网格视图', exact: true }).getAttribute('aria-pressed'), 'true');
+      await navigate('录制任务');
+      assert.equal(await page.getByRole('button', { name: '网格视图', exact: true }).getAttribute('aria-pressed'), 'true');
+    } finally { held.release(); }
+  });
+  await step('视图写入已提交但响应失败时读回确认，不伪报回滚或重复写入', async () => {
+    await go(page, h.base, '/settings');
+    await page.getByRole('button', { name: '外观与窗口', exact: true }).click();
+    const pattern = '**/api/settings';
+    let intercepted = false;
+    const handler = async route => {
+      if (!intercepted && route.request().method() === 'PUT'
+        && Object.hasOwn(route.request().postDataJSON().userConfig, 'is_grid_view')) {
+        intercepted = true;
+        const response = await fetchFixture(route);
+        assert.equal(response.status(), 200);
+        await route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ detail: '模拟已提交但确认响应丢失' }) });
+      } else await route.fallback();
+    };
+    await page.route(pattern, handler);
+    try {
+      const before = requests('PUT', '/api/settings').length;
+      await page.getByRole('button', { name: '默认列表视图', exact: true }).click();
+      await waitState(() => intercepted, Boolean, '确认丢失夹具已触发');
+      await waitState(() => page.locator('.view-switch').getAttribute('aria-busy'), value => value === 'false', '读回确认结束');
+      assert.equal(state.userConfig.is_grid_view, false);
+      assert.equal(await page.getByRole('button', { name: '默认列表视图', exact: true }).getAttribute('aria-pressed'), 'true');
+      assert.equal(requests('PUT', '/api/settings').length, before + 1, '读回而非重发修改');
+    } finally { await page.unroute(pattern, handler); }
   });
   await step('窗口一体化、原生按钮、关闭取消与托盘偏好',async()=>{
     const bounds=await page.locator('.app-shell').boundingBox();assert.equal(bounds.x,0);assert.equal(bounds.y,0);
@@ -1223,6 +1302,72 @@ try {
     await navigate('媒体库');
     await visible(page.locator('.file-name').filter({hasText:'海边日落.ts'}));
   });
+  await step('目录体积超时仅取消当前请求，切页仍取消整批且清除监听', async () => {
+    const originalFiles = structuredClone(state.files);
+    await navigate('录制任务');
+    state.files = [1, 2, 3, 4].map(n => ({ name: '超时回归' + n, path: '超时回归' + n, isDir: true, size: n * 1024, modified: 0 }));
+    await page.evaluate(() => {
+      const originalFetch = window.fetch, originalTimeout = window.setTimeout;
+      const audit = window.__sizeTimeoutAudit = { requests: [], timers: [] };
+      window.setTimeout = (callback, milliseconds, ...args) => {
+        const id = originalTimeout.call(window, callback, milliseconds, ...args);
+        if (milliseconds === 120000) audit.timers.push(() => callback(...args));
+        return id;
+      };
+      window.fetch = (input, init) => {
+        const url = new URL(input instanceof Request ? input.url : input, location.href);
+        if (url.pathname !== '/api/storage/size') return originalFetch.call(window, input, init);
+        const signal = init?.signal ?? input.signal;
+        const request = { path: url.searchParams.get('path'), signal, settled: false };
+        audit.requests.push(request);
+        return new Promise((resolve, reject) => {
+          const finish = (cancelled = false) => {
+            if (request.settled) return;
+            request.settled = true;
+            signal.removeEventListener('abort', cancel);
+            if (cancelled) reject(new DOMException('Synthetic request cancelled', 'AbortError'));
+            else resolve(new Response(JSON.stringify({ size: Number(request.path.slice(-1)) * 1024 }), { headers: { 'Content-Type': 'application/json' } }));
+          };
+          const cancel = () => finish(true);
+          request.complete = () => finish();
+          request.cancel = cancel;
+          signal.addEventListener('abort', cancel, { once: true });
+          if (signal.aborted) cancel();
+        });
+      };
+      audit.restore = () => {
+        for (const request of audit.requests) request.cancel();
+        window.fetch = originalFetch;
+        window.setTimeout = originalTimeout;
+        delete window.__sizeTimeoutAudit;
+      };
+    });
+    try {
+      await navigate('媒体库');
+      await page.waitForFunction(() => window.__sizeTimeoutAudit.requests.length === 2);
+      await page.evaluate(() => window.__sizeTimeoutAudit.timers[0]());
+      await page.waitForFunction(() => window.__sizeTimeoutAudit.requests.length >= 3);
+      assert.deepEqual(await page.evaluate(() => window.__sizeTimeoutAudit.requests.slice(0, 3).map(request => request.signal.aborted)), [true, false, false], '首项超时不能中止并发或后续请求');
+      await page.evaluate(() => window.__sizeTimeoutAudit.requests.slice(1).forEach(request => request.complete()));
+      await page.waitForFunction(() => window.__sizeTimeoutAudit.requests.length === 4);
+      await page.evaluate(() => window.__sizeTimeoutAudit.requests[3].complete());
+      await visible(page.locator('tr[data-path="超时回归1"] .file-size').getByText('体积不可用', { exact: true }));
+      for (const n of [2, 3, 4]) {
+        await waitState(() => page.locator(`tr[data-path="超时回归${n}"] .file-size`).innerText(), text => text === n.toFixed(1) + ' KB', '其他目录体积正常完成');
+      }
+      await page.getByRole('button', { name: '刷新文件', exact: true }).click();
+      await page.waitForFunction(() => window.__sizeTimeoutAudit.requests.length === 6);
+      await navigate('录制任务');
+      await page.waitForFunction(() => window.__sizeTimeoutAudit.requests.slice(4).every(request => request.signal.aborted && request.settled));
+      assert.equal(await page.evaluate(() => window.__sizeTimeoutAudit.requests.length), 6, '切页后不再执行排队目录');
+    } finally {
+      await navigate('录制任务');
+      await page.evaluate(() => window.__sizeTimeoutAudit.restore());
+      state.files = originalFiles;
+      await navigate('媒体库');
+      await visible(page.locator('.file-name').filter({ hasText: '海边日落.ts' }));
+    }
+  });
   await step('媒体库删除只修改模拟目录并要求确认', async () => {
     await page.getByRole('button', { name: '回收录制说明.txt', exact: true }).click();
     const modal = dialog('移至回收站'); await visible(modal);
@@ -1676,6 +1821,48 @@ try {
     assert.equal(checkRequests(),count);
     await navigate('录制任务');
   });
+  await step('媒体库千文件索引、搜索和刷新保留节点且不触发超一秒阻塞', async () => {
+    const original = state.files;
+    try {
+      for (const count of [100, 500, 1000]) {
+        state.files = Array.from({ length: count }, (_, index) => {
+          const name = `Library-${String(index).padStart(5, '0')}.mp4`;
+          return { name, path: name, isDir: false, size: 1234567, modified: 1789171200 };
+        });
+        const started = Date.now();
+        await go(page, h.base, '/storage');
+        await waitState(() => page.locator('.file-table tbody tr').count(), n => n === count, '全部文件可访问');
+        const mountMs = Date.now() - started;
+        const search = page.getByRole('textbox', { name: '搜索文件', exact: true });
+        await page.evaluate(() => {
+          window.__libraryLongTasks = [];
+          window.__libraryObserver = new PerformanceObserver(list => window.__libraryLongTasks.push(...list.getEntries().map(entry => entry.duration)));
+          window.__libraryObserver.observe({ type: 'longtask', buffered: false });
+        });
+        const searchStarted = Date.now();
+        await search.fill('Library-00000');
+        await waitState(() => page.locator('.file-table tbody tr').count(), n => n === 1, '索引后搜索');
+        const searchMs = Date.now() - searchStarted;
+        const clearStarted = Date.now();
+        await search.fill('');
+        await waitState(() => page.locator('.file-table tbody tr').count(), n => n === count, '清空后恢复');
+        const clearMs = Date.now() - clearStarted;
+        await page.evaluate(() => { window.__libraryFirstRow = document.querySelector('.file-table tbody tr'); });
+        state.files[0].size = 7340032;
+        await page.getByRole('button', { name: '刷新文件', exact: true }).click();
+        await waitState(() => page.locator('tr[data-path="Library-00000.mp4"] .file-size').textContent(), text => text.includes('7.0'), '索引行数据更新');
+        const measurement = await page.evaluate(() => {
+          window.__libraryObserver.disconnect();
+          return { stable: window.__libraryFirstRow === document.querySelector('.file-table tbody tr'),
+            longTaskMaxMs: Math.max(0, ...window.__libraryLongTasks), nodes: document.querySelectorAll('*').length };
+        });
+        assert.equal(measurement.stable, true, '刷新不能重建已有文件行');
+        assert.ok(measurement.longTaskMaxMs < 1000, `媒体库主线程长任务 ${measurement.longTaskMaxMs}ms`);
+        assert.ok(searchMs < 1000 && clearMs < 1000, `媒体库搜索/恢复 ${searchMs}/${clearMs}ms`);
+        storageLoadResults.push({ count, mountMs, searchMs, clearMs, ...measurement });
+      }
+    } finally { state.files = original; await go(page, h.base, '/recordings'); }
+  });
   await step('100、250、500 个任务中的五路秒级进度不重建卡片且在一秒内完成', async () => {
     const original = state.recordings;
     const template = seedRecordings()[0];
@@ -1720,7 +1907,7 @@ try {
   await h.shot('failure').catch(() => {});
   console.error(error.stack ?? error);
 } finally {
-  await h.report({ passed: !failure, steps, loadResults, failure: failure ? String(failure.stack ?? failure) : null });
+  await h.report({ passed: !failure, steps, loadResults, storageLoadResults, failure: failure ? String(failure.stack ?? failure) : null });
   await h.close();
 }
 console.log(JSON.stringify({ passed: !failure, checks: steps.length, artifacts: h.runDir }));

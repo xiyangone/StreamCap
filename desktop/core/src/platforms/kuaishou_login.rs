@@ -406,10 +406,11 @@ fn first_json_value(text: &str) -> Option<Value> {
         .next()?
         .ok()
 }
-fn js_string(text: &str) -> Option<String> {
-    let text = text.trim_start();
+fn js_string_token(text: &str) -> Option<(String, usize)> {
     if text.starts_with('"') {
-        return first_json_value(text)?.as_str().map(str::to_owned);
+        let mut values = serde_json::Deserializer::from_str(text).into_iter::<String>();
+        let value = values.next()?.ok()?;
+        return Some((value, values.byte_offset()));
     }
     let bytes = text.as_bytes();
     if bytes.first().copied()? != b'\'' {
@@ -419,7 +420,7 @@ fn js_string(text: &str) -> Option<String> {
     let mut index = 1;
     while index < bytes.len() {
         match bytes[index] {
-            b'\'' => return Some(result),
+            b'\'' => return Some((result, index + 1)),
             b'\\' => {
                 index += 1;
                 let escaped = *bytes.get(index)?;
@@ -433,8 +434,22 @@ fn js_string(text: &str) -> Option<String> {
                     b'u' => {
                         let hex = std::str::from_utf8(bytes.get(index + 1..index + 5)?).ok()?;
                         let code = u16::from_str_radix(hex, 16).ok()?;
-                        result.push(char::from_u32(code as u32)?);
                         index += 4;
+                        let code = if (0xD800..=0xDBFF).contains(&code) {
+                            if bytes.get(index + 1..index + 3)? != b"\\u" {
+                                return None;
+                            }
+                            let hex = std::str::from_utf8(bytes.get(index + 3..index + 7)?).ok()?;
+                            let low = u16::from_str_radix(hex, 16).ok()?;
+                            if !(0xDC00..=0xDFFF).contains(&low) {
+                                return None;
+                            }
+                            index += 6;
+                            0x10000 + ((u32::from(code) - 0xD800) << 10) + u32::from(low) - 0xDC00
+                        } else {
+                            u32::from(code)
+                        };
+                        result.push(char::from_u32(code)?);
                     }
                     _ => result.push(escaped as char),
                 }
@@ -449,32 +464,25 @@ fn js_string(text: &str) -> Option<String> {
     }
     None
 }
-/// The site's state serializer includes the JS value `undefined` in objects.
-/// Decode only JSON plus that value; never execute page code or alter string contents.
+/// Decode data literals only: JSON, single-quoted strings and the site's undefined value.
 fn state_json(text: &str) -> Option<Value> {
-    if let Some(value) = first_json_value(text) {
-        return Some(value);
-    }
     let text = text.trim_start();
     if text.len() > super::http::MAX_RESPONSE || !text.starts_with(['{', '[']) {
         return None;
     }
+    if let Some(value) = first_json_value(text) {
+        return Some(value);
+    }
     let mut output = String::with_capacity(text.len());
-    let (mut index, mut depth, mut quoted, mut escaped) = (0, 0_i32, false, false);
+    let (mut index, mut depth) = (0, 0_i32);
     let mut previous = None;
     while index < text.len() {
         let ch = text[index..].chars().next()?;
-        if quoted {
-            output.push(ch);
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                quoted = false;
-                previous = Some('"');
-            }
-            index += ch.len_utf8();
+        if matches!(ch, '"' | '\'') {
+            let (value, consumed) = js_string_token(&text[index..])?;
+            output.push_str(&serde_json::to_string(&value).ok()?);
+            previous = Some('"');
+            index += consumed;
             continue;
         }
         if matches!(previous, Some(':' | '[' | ','))
@@ -491,7 +499,6 @@ fn state_json(text: &str) -> Option<Value> {
         }
         output.push(ch);
         match ch {
-            '"' => quoted = true,
             '{' | '[' => depth += 1,
             '}' | ']' => {
                 depth -= 1;
@@ -515,20 +522,13 @@ fn assigned_json(text: &str) -> Option<Value> {
         .map(str::trim_start)
         .and_then(|tail| tail.strip_prefix('('));
     if let Some(tail) = parse_tail {
-        let encoded = js_string(tail)?;
-        return first_json_value(&encoded);
+        let (encoded, _) = js_string_token(tail.trim_start())?;
+        return state_json(&encoded);
     }
     state_json(text)
 }
-fn first_text_value(text: &str) -> Option<Value> {
-    first_json_value(text).or_else(|| js_string(text).map(Value::String))
-}
-pub(crate) fn initial_state(page: &str) -> Option<Value> {
-    for marker in [
-        "window.__INITIAL_STATE__",
-        "self.__INITIAL_STATE__",
-        "__INITIAL_STATE__",
-    ] {
+fn assigned_state(page: &str, markers: &[&str]) -> Option<Value> {
+    for marker in markers {
         let mut offset = 0;
         while let Some(relative) = page.get(offset..)?.find(marker) {
             let start = offset + relative + marker.len();
@@ -545,98 +545,136 @@ pub(crate) fn initial_state(page: &str) -> Option<Value> {
     }
     None
 }
+pub(crate) fn initial_state(page: &str) -> Option<Value> {
+    assigned_state(
+        page,
+        &[
+            "window.__INITIAL_STATE__",
+            "self.__INITIAL_STATE__",
+            "__INITIAL_STATE__",
+        ],
+    )
+}
 
-/// Verify exact account identity in login-owned state only, never arbitrary room recommendations.
-/// Phone confirmation, token exchange and website login verification are independent stages.
+/// Verify the expected account in structured login-owned state, excluding room collections.
 pub fn verify_login_page(page: &str, user_id: &str) -> Result<Option<String>, String> {
     const UNVERIFIED: &str =
         "手机已确认，但直播站未返回可验证的登录状态。登录信息未保存，请稍后重试。";
-    if user_id.is_empty() {
-        return Err(UNVERIFIED.into());
-    }
-    fn logged_out(value: &Value) -> bool {
+    const ACCOUNT_KEYS: &[&str] = &[
+        "currentUser",
+        "loginUser",
+        "loggedInUser",
+        "selfUser",
+        "currentAccount",
+        "currentUserInfo",
+        "loginUserInfo",
+    ];
+    fn login_flag(value: &Value, expected: bool) -> bool {
         ["isLogin", "isLoggedIn", "loggedIn"].iter().any(|key| {
             value.get(*key).is_some_and(|flag| {
-                flag == &Value::Bool(false)
-                    || flag == &Value::from(0)
-                    || matches!(flag.as_str(), Some("false" | "0"))
-            })
-        })
-    }
-    fn logged_in(value: &Value) -> bool {
-        ["isLogin", "isLoggedIn", "loggedIn"].iter().any(|key| {
-            value.get(*key).is_some_and(|flag| {
-                flag == &Value::Bool(true)
-                    || flag == &Value::from(1)
-                    || matches!(flag.as_str(), Some("true" | "1"))
+                if expected {
+                    flag == &Value::Bool(true)
+                        || flag == &Value::from(1)
+                        || matches!(flag.as_str(), Some("true" | "1"))
+                } else {
+                    flag == &Value::Bool(false)
+                        || flag == &Value::from(0)
+                        || matches!(flag.as_str(), Some("false" | "0"))
+                }
             })
         })
     }
     fn identity(value: &Value, user_id: &str) -> bool {
-        if logged_out(value) {
-            return false;
-        }
-        [
-            "userId",
-            "user_id",
-            "principalId",
-            "uid",
-            "originUserId",
-            "id",
-        ]
-        .iter()
-        .any(|key| {
-            super::text(&value[*key]) == user_id
-                || value[*key]
-                    .as_u64()
-                    .is_some_and(|id| id.to_string() == user_id)
-        })
+        !login_flag(value, false)
+            && [
+                "userId",
+                "user_id",
+                "principalId",
+                "uid",
+                "originUserId",
+                "id",
+            ]
+            .iter()
+            .any(|key| {
+                super::text(&value[*key]) == user_id
+                    || value[*key]
+                        .as_u64()
+                        .is_some_and(|id| id.to_string() == user_id)
+            })
     }
-    fn current_account<'a>(value: &'a Value, user_id: &str, depth: usize) -> Option<&'a Value> {
-        if depth > 20 || logged_out(value) {
-            return None;
+    fn collection(key: &str) -> bool {
+        matches!(
+            key,
+            "recommendations"
+                | "roomList"
+                | "rooms"
+                | "room"
+                | "roomInfo"
+                | "liveStream"
+                | "homeLiveStream"
+                | "cards"
+                | "author"
+        )
+    }
+    fn current_account<'a>(
+        value: &'a Value,
+        user_id: &str,
+        depth: usize,
+    ) -> Result<Option<&'a Value>, ()> {
+        if depth > 30 || login_flag(value, false) {
+            return Ok(None);
         }
-        let map = value.as_object()?;
-        for key in [
-            "currentUser",
-            "loginUser",
-            "loggedInUser",
-            "selfUser",
-            "currentAccount",
-            "currentUserInfo",
-            "loginUserInfo",
-        ] {
-            if let Some(account) = map.get(key) {
-                if identity(account, user_id) {
-                    return Some(account);
+        let Some(map) = value.as_object() else {
+            return Ok(None);
+        };
+        let mut found = None;
+        for (key, child) in map {
+            if collection(key) {
+                continue;
+            }
+            if ACCOUNT_KEYS.contains(&key.as_str()) {
+                if !identity(child, user_id) {
+                    return Err(());
                 }
+                found = Some(child);
+            } else if let Some(account) = current_account(child, user_id, depth + 1)? {
+                found = Some(account);
             }
         }
-        map.values()
-            .find_map(|child| current_account(child, user_id, depth + 1))
+        Ok(found)
     }
     fn logged_in_identity<'a>(
         value: &'a Value,
         user_id: &str,
         inherited_login: bool,
+        account_container: bool,
         depth: usize,
     ) -> Option<&'a Value> {
-        if depth > 30 || logged_out(value) {
+        if depth > 30 || login_flag(value, false) {
             return None;
         }
-        let in_login_context = inherited_login || logged_in(value);
-        if in_login_context && identity(value, user_id) {
+        let own_login = login_flag(value, true);
+        let in_login_context = inherited_login || own_login;
+        if in_login_context && (account_container || own_login) && identity(value, user_id) {
             return Some(value);
         }
-        match value {
-            Value::Object(map) => map
-                .values()
-                .find_map(|child| logged_in_identity(child, user_id, in_login_context, depth + 1)),
-            Value::Array(values) => values
-                .iter()
-                .find_map(|child| logged_in_identity(child, user_id, in_login_context, depth + 1)),
-            _ => None,
-        }
+        value
+            .as_object()?
+            .iter()
+            .filter(|(key, _)| !collection(key))
+            .find_map(|(key, child)| {
+                let account_container = matches!(
+                    key.as_str(),
+                    "profile" | "user" | "userInfo" | "account" | "accountInfo" | "ownerInfo"
+                );
+                logged_in_identity(
+                    child,
+                    user_id,
+                    in_login_context && account_container,
+                    account_container,
+                    depth + 1,
+                )
+            })
     }
     fn account_name(account: &Value, user_id: &str) -> String {
         ["name", "userName", "user_name", "nickname", "nickName"]
@@ -655,254 +693,51 @@ pub fn verify_login_page(page: &str, user_id: &str) -> Result<Option<String>, St
             .filter(|name: &String| !name.trim().is_empty())
             .unwrap_or_else(|| user_id.to_owned())
     }
-    fn same_id(value: &Value, user_id: &str) -> bool {
-        super::text(value) == user_id || value.as_u64().is_some_and(|id| id.to_string() == user_id)
-    }
-    fn text_identity_field(page: &str, key: &str, user_id: &str) -> bool {
-        for token in [format!("\"{key}\""), format!("'{key}'"), key.to_owned()] {
-            let mut offset = 0;
-            while let Some(relative) = page.get(offset..).and_then(|tail| tail.find(&token)) {
-                let start = offset + relative;
-                let end = start + token.len();
-                if token == key {
-                    let left = page
-                        .get(..start)
-                        .and_then(|prefix| prefix.chars().next_back());
-                    let right = page.get(end..).and_then(|suffix| suffix.chars().next());
-                    if left.is_some_and(|character| {
-                        character.is_ascii_alphanumeric() || character == '_'
-                    }) || right.is_some_and(|character| {
-                        character.is_ascii_alphanumeric() || character == '_'
-                    }) {
-                        offset = end;
-                        continue;
-                    }
-                }
-                let Some(tail) = page.get(end..).map(str::trim_start) else {
-                    break;
-                };
-                let Some(tail) = tail.strip_prefix(':').map(str::trim_start) else {
-                    offset = end;
-                    continue;
-                };
-                if let Some(value) = first_text_value(tail) {
-                    if same_id(&value, user_id) {
-                        return true;
-                    }
-                }
-                offset = end;
-            }
-        }
-        false
-    }
-    fn text_flag(page: &str, key: &str, expected: bool) -> bool {
-        for token in [format!("\"{key}\""), format!("'{key}'")] {
-            let mut offset = 0;
-            while let Some(relative) = page.get(offset..).and_then(|tail| tail.find(&token)) {
-                let start = offset + relative + token.len();
-                let Some(tail) = page.get(start..).map(str::trim_start) else {
-                    break;
-                };
-                let Some(tail) = tail.strip_prefix(':').map(str::trim_start) else {
-                    offset = start;
-                    continue;
-                };
-                if let Some(value) = first_text_value(tail) {
-                    let actual = value.as_bool().unwrap_or(false)
-                        || value.as_i64().is_some_and(|number| number == 1)
-                        || value.as_u64().is_some_and(|number| number == 1)
-                        || matches!(value.as_str(), Some("true" | "1"));
-                    if actual == expected {
-                        return true;
-                    }
-                }
-                offset = start;
-            }
-        }
-        false
-    }
-    fn text_login_context(page: &str) -> bool {
-        [
-            "currentUser",
-            "loginUser",
-            "loggedInUser",
-            "selfUser",
-            "currentAccount",
-            "currentUserInfo",
-            "loginUserInfo",
-        ]
-        .iter()
-        .any(|key| page.contains(&format!("\"{key}\"")) || page.contains(&format!("'{key}'")))
-            || text_flag(page, "isLogin", true)
-            || text_flag(page, "isLoggedIn", true)
-            || text_flag(page, "loggedIn", true)
-    }
-    fn exact_id_in_text(page: &str, user_id: &str) -> bool {
-        if user_id.is_empty() {
-            return false;
-        }
-        let is_identifier = |character: Option<char>| {
-            character.is_some_and(|character| {
-                character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
-            })
-        };
-        let mut offset = 0;
-        while let Some(relative) = page.get(offset..).and_then(|tail| tail.find(user_id)) {
-            let start = offset + relative;
-            let end = start + user_id.len();
-            let left = page
-                .get(..start)
-                .and_then(|prefix| prefix.chars().next_back());
-            let right = page.get(end..).and_then(|suffix| suffix.chars().next());
-            if !is_identifier(left) && !is_identifier(right) {
-                return true;
-            }
-            offset = end;
-        }
-        false
-    }
-    fn has_state_key(value: &Value, keys: &[&str], depth: usize) -> bool {
-        if depth > 30 {
-            return false;
-        }
-        match value {
-            Value::Object(map) => {
-                map.keys()
-                    .any(|key| keys.iter().any(|candidate| key == candidate))
-                    || map
-                        .values()
-                        .any(|child| has_state_key(child, keys, depth + 1))
-            }
-            Value::Array(values) => values
-                .iter()
-                .any(|child| has_state_key(child, keys, depth + 1)),
-            _ => false,
-        }
-    }
 
-    fn identity_outside_collection(
-        value: &Value,
-        user_id: &str,
-        in_collection: bool,
-        depth: usize,
-    ) -> bool {
-        if depth > 30 || logged_out(value) {
-            return false;
-        }
-        if !in_collection && identity(value, user_id) {
-            return true;
-        }
-        let is_collection = |key: &str| {
-            matches!(
-                key,
-                "recommendations"
-                    | "roomList"
-                    | "rooms"
-                    | "room"
-                    | "roomInfo"
-                    | "liveStream"
-                    | "cards"
-                    | "author"
+    if user_id.is_empty() {
+        return Err(UNVERIFIED.into());
+    }
+    let state = initial_state(page)
+        .or_else(|| {
+            assigned_state(
+                page,
+                &[
+                    "window.__BOOTSTRAP__",
+                    "self.__BOOTSTRAP__",
+                    "__BOOTSTRAP__",
+                ],
             )
-        };
-        match value {
-            Value::Object(map) => map.iter().any(|(key, child)| {
-                identity_outside_collection(
-                    child,
-                    user_id,
-                    in_collection || is_collection(key),
-                    depth + 1,
-                )
-            }),
-            Value::Array(values) => values
-                .iter()
-                .any(|child| identity_outside_collection(child, user_id, in_collection, depth + 1)),
-            _ => false,
+        })
+        .ok_or(UNVERIFIED)?;
+    if login_flag(&state, false) {
+        return Err(UNVERIFIED.into());
+    }
+    let current = current_account(&state, user_id, 0).map_err(|_| UNVERIFIED)?;
+    let mut account = current;
+    for pointer in [
+        "/userStore/userInfo",
+        "/userStore/user",
+        "/userInfoStore/userInfo",
+        "/loginStore/userInfo",
+        "/accountStore/userInfo",
+        "/user/userInfoQuery/ownerInfo",
+        "/user/userInfo",
+        "/userInfo",
+    ] {
+        if let Some(candidate) = state.pointer(pointer) {
+            let signed_out_ancestor = pointer.match_indices('/').any(|(index, _)| {
+                state
+                    .pointer(&pointer[..index])
+                    .is_some_and(|ancestor| login_flag(ancestor, false))
+            });
+            if signed_out_ancestor || !identity(candidate, user_id) {
+                return Err(UNVERIFIED.into());
+            }
+            account = Some(candidate);
         }
     }
-    let state = initial_state(page);
-    if let Some(state) = state.as_ref() {
-        if logged_out(state) {
-            return Err(UNVERIFIED.into());
-        }
-        let account = current_account(state, user_id, 0)
-            .or_else(|| {
-                [
-                    "/userStore/userInfo",
-                    "/userStore/user",
-                    "/userInfoStore/userInfo",
-                    "/loginStore/userInfo",
-                    "/accountStore/userInfo",
-                    "/user/userInfoQuery/ownerInfo",
-                    "/user/userInfo",
-                    "/userInfo",
-                ]
-                .iter()
-                .filter(|pointer| {
-                    pointer
-                        .rsplit_once('/')
-                        .and_then(|(parent, _)| state.pointer(parent))
-                        .is_none_or(|parent| !logged_out(parent))
-                })
-                .filter_map(|pointer| state.pointer(pointer))
-                .find(|account| identity(account, user_id))
-            })
-            .or_else(|| logged_in_identity(state, user_id, false, 0));
-        if let Some(account) = account {
-            return Ok(Some(account_name(account, user_id)));
-        }
-    }
-
-    // Some live-site deployments render the account state through a different
-    // bootstrap variable or a challenge wrapper. The pass-token exchange has
-    // already supplied the expected ID, so an exact ID token in the 200-page
-    // response is a useful fallback even when its field name is obfuscated or
-    // serialized by JavaScript. Room/recommendation-only payloads must not be
-    // accepted unless a login context is also present.
-    let recommendation_only = state.as_ref().is_some_and(|value| {
-        has_state_key(
-            value,
-            &[
-                "recommendations",
-                "roomList",
-                "rooms",
-                "room",
-                "roomInfo",
-                "liveStream",
-                "cards",
-                "author",
-            ],
-            0,
-        )
-    }) || [
-        "recommendations",
-        "roomList",
-        "rooms",
-        "room",
-        "roomInfo",
-        "liveStream",
-        "cards",
-        "author",
-    ]
-    .iter()
-    .any(|key| page.contains(&format!("\"{key}\"")) || page.contains(&format!("'{key}'")));
-    let login_context = state
-        .as_ref()
-        .is_some_and(|value| logged_in_identity(value, user_id, false, 0).is_some())
-        || text_login_context(page);
-    let state_identity = state
-        .as_ref()
-        .is_some_and(|value| identity_outside_collection(value, user_id, false, 0));
-    let text_identity = ["userId", "user_id", "principalId", "uid", "originUserId"]
-        .iter()
-        .any(|key| text_identity_field(page, key, user_id));
-    if !text_flag(page, "isLogin", false)
-        && !text_flag(page, "isLoggedIn", false)
-        && !text_flag(page, "loggedIn", false)
-        && (!recommendation_only || login_context || state_identity)
-        && (state_identity || text_identity || exact_id_in_text(page, user_id))
-    {
-        return Ok(Some(user_id.to_owned()));
-    }
-    Err(UNVERIFIED.into())
+    let account = account
+        .or_else(|| logged_in_identity(&state, user_id, false, false, 0))
+        .ok_or(UNVERIFIED)?;
+    Ok(Some(account_name(account, user_id)))
 }

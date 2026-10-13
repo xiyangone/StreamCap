@@ -1,8 +1,74 @@
 //! Filesystem preflights and file identities for recording and post-processing.
 use std::{
+    collections::HashMap,
     io,
     path::{Path, PathBuf},
 };
+
+/// Resolve the mounted volume, including mounted folders, instead of guessing a drive letter.
+fn volume_root(path: &Path) -> io::Result<PathBuf> {
+    let existing = path
+        .ancestors()
+        .find(|parent| parent.exists())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "保存目录所在磁盘不可用"))?
+        .canonicalize()?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let input: Vec<u16> = existing.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut output = vec![0_u16; 32768];
+        let ok = unsafe {
+            windows_sys::Win32::Storage::FileSystem::GetVolumePathNameW(
+                input.as_ptr(),
+                output.as_mut_ptr(),
+                output.len() as u32,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let length = output
+            .iter()
+            .position(|value| *value == 0)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "磁盘路径返回值无效"))?;
+        Ok(PathBuf::from(std::ffi::OsString::from_wide(
+            &output[..length],
+        )))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = existing;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "当前平台没有磁盘空间检测实现",
+        ))
+    }
+}
+
+/// One result per requested path. A failed volume never poisons another volume's result.
+pub(crate) fn check_recording_space(paths: &[PathBuf], minimum: u64) -> Vec<Result<(), String>> {
+    check_recording_space_with(paths, volume_root, |volume| {
+        require_space(volume, minimum, 0)
+    })
+}
+
+fn check_recording_space_with(
+    paths: &[PathBuf],
+    mut resolve: impl FnMut(&Path) -> io::Result<PathBuf>,
+    mut check: impl FnMut(&Path) -> io::Result<()>,
+) -> Vec<Result<(), String>> {
+    let mut volumes = HashMap::<PathBuf, Result<(), String>>::new();
+    paths
+        .iter()
+        .map(|path| {
+            let volume = resolve(path).map_err(|error| error.to_string())?;
+            volumes
+                .entry(volume.clone())
+                .or_insert_with(|| check(&volume).map_err(|error| error.to_string()))
+                .clone()
+        })
+        .collect()
+}
 
 pub fn available_bytes(path: &Path) -> io::Result<u64> {
     let existing = path
@@ -138,6 +204,61 @@ pub fn unique_output(root: &Path, relative: &Path) -> io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn space_checks_are_deduplicated_and_failures_stay_on_their_volume() {
+        let paths = ["new/b", "old/a/first.ts", "old/a/second.ts", "missing"].map(PathBuf::from);
+        let mut checks = Vec::new();
+        let results = check_recording_space_with(
+            &paths,
+            |path| match path.to_str().unwrap() {
+                "missing" => Err(io::Error::new(io::ErrorKind::NotFound, "unavailable")),
+                "new/b" => Ok(PathBuf::from("volume-b")),
+                _ => Ok(PathBuf::from("volume-a")),
+            },
+            |volume| {
+                checks.push(volume.to_path_buf());
+                if volume == Path::new("volume-a") {
+                    Err(io::Error::other("full"))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(
+            results,
+            [
+                Ok(()),
+                Err("full".into()),
+                Err("full".into()),
+                Err("unavailable".into())
+            ]
+        );
+        assert_eq!(
+            checks,
+            [PathBuf::from("volume-b"), PathBuf::from("volume-a")]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn volume_resolution_handles_unicode_files_and_future_outputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("直播目录");
+        std::fs::create_dir(&folder).unwrap();
+        let file = folder.join("片段.ts");
+        std::fs::write(&file, b"fixture").unwrap();
+        let root = volume_root(dir.path()).unwrap();
+        assert_eq!(volume_root(&file).unwrap(), root);
+        assert_eq!(
+            volume_root(&folder.join("future/part_%03d.ts")).unwrap(),
+            root
+        );
+        assert!(check_recording_space(&[file, folder], 0)
+            .iter()
+            .all(Result::is_ok));
+        assert!(volume_root(Path::new("")).is_err());
+    }
+
     #[test]
     fn space_preflight_rejects_unreasonable_requirement() {
         let dir = tempfile::tempdir().unwrap();
