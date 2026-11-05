@@ -404,6 +404,67 @@ try {
     assert.equal(record('fixture-5').quality, 'SD');
     await h.shot('07-settings-recording');
   });
+  await step('展开菜单不透字，明暗主题和窄窗口均有清晰反馈', async () => {
+    const originalTheme = state.userConfig.theme_mode;
+    const assertReadable = ({ background, color }) => {
+      const channels = value => value.match(/[\d.]+/g).map(Number);
+      const bg = channels(background), fg = channels(color);
+      assert.ok(bg.length === 3 || bg[3] === 1, '浮层必须完全不透明');
+      const luminance = rgb => rgb.slice(0, 3).map(value => {
+        const n = value / 255;
+        return n <= .04045 ? n / 12.92 : ((n + .055) / 1.055) ** 2.4;
+      }).reduce((sum, value, index) => sum + value * [.2126, .7152, .0722][index], 0);
+      const a = luminance(bg), b = luminance(fg);
+      assert.ok((Math.max(a, b) + .05) / (Math.min(a, b) + .05) >= 4.5, '菜单文字对比度至少为 4.5:1');
+    };
+    try {
+      for (const theme of ['light', 'dark']) {
+        state.userConfig.theme_mode = theme; h.emit('settings', {});
+        await waitTheme(page, theme);
+        for (const width of [1100, 800]) {
+          await page.setViewportSize({ width, height: 750 });
+          for (const name of ['默认清晰度', '默认录制格式']) {
+            const select = page.getByRole('combobox', { name, exact: true });
+            const original = await select.inputValue();
+            const closedBorder = await select.evaluate(el => getComputedStyle(el).borderColor);
+            await select.click();
+            const opened = await select.evaluate(el => {
+              const picker = getComputedStyle(el, '::picker(select)');
+              const selected = getComputedStyle(el.querySelector('option:checked'));
+              return { open: el.matches(':open'), border: getComputedStyle(el).borderColor,
+                picker: { background: picker.backgroundColor, color: picker.color },
+                selected: { background: selected.backgroundColor, color: selected.color } };
+            });
+            assert.equal(opened.open, true);
+            assert.notEqual(opened.border, closedBorder, '展开后触发按钮边界发生可见变化');
+            assertReadable(opened.picker); assertReadable(opened.selected);
+            if (name === '默认清晰度') await h.shot('dropdown-' + theme + '-' + width);
+            await select.press('ArrowDown');
+            await page.keyboard.press('Escape');
+            assert.equal(await select.evaluate(el => el.matches(':open')), false);
+            assert.equal(await select.inputValue(), original, '取消菜单不更改选择');
+            assert.equal(await select.evaluate(el => el === document.activeElement), true);
+          }
+        }
+        await navigate('录制任务');
+        const menu = await openCardMenu(card('fixture-5'));
+        assertReadable(await menu.locator('.card-menu-panel').evaluate(el => {
+          const s = getComputedStyle(el); return { background: s.backgroundColor, color: s.color };
+        }));
+        const trigger = await menu.locator('summary').evaluate(el => {
+          const s = getComputedStyle(el); return { background: s.backgroundColor, color: s.color };
+        });
+        assertReadable(trigger);
+        await h.shot('actions-menu-' + theme);
+        await closeCardMenu(menu);
+        await navigate('偏好设置');
+      }
+    } finally {
+      state.userConfig.theme_mode = originalTheme; h.emit('settings', {});
+      await waitTheme(page, originalTheme);
+      await page.setViewportSize({ width: 1280, height: 900 });
+    }
+  });
   await step('设置数值校验和失败反馈不伪报成功', async () => {
     await page.getByRole('button', { name: '网络与检测', exact: true }).click();
     const interval = page.getByRole('textbox', { name: /检测间隔/ });

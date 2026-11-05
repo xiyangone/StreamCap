@@ -30,7 +30,7 @@ aes = "0.9.3"
 cbc = { version = "0.2.1", features = ["alloc"] }
 rquickjs = "0.14.0"
 wasmi = { version = "2.0.0", default-features = false, features = ["stable", "std", "validate", "auto-dispatch"] }
-zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+zip = { version = "9.0.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 png = "0.18"
 
 [target.'cfg(windows)'.dependencies]

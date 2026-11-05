@@ -1055,7 +1055,11 @@ fn main() {
             b"[h264] reference picture missing during reorder\n".to_vec(),
             true,
         ),
-        ("overflow", vec![b'x'; 65537], true),
+        (
+            "overflow",
+            b"[h264] co located POCs unavailable\nCookie: private=value\n".repeat(2000),
+            true,
+        ),
     ] {
         std::fs::write(tools.path().join("diagnostics"), &diagnostics).unwrap();
         std::fs::write(tools.path().join("decoded"), b"pending").unwrap();
@@ -1115,6 +1119,14 @@ fn main() {
                     "decoder details must survive the stage error: {}",
                     job.message
                 );
+                assert_eq!(job.message.matches("原 TS 保留").count(), 1);
+            }
+            if name == "overflow" {
+                assert!(job.message.contains("co located POCs unavailable"));
+                assert!(job.message.contains("媒体工具退出码 0"));
+                assert!(job.message.contains("诊断已截断"));
+                assert!(!job.message.contains("private=value"));
+                assert!(job.message.chars().count() < 1000);
                 assert_eq!(job.message.matches("原 TS 保留").count(), 1);
             }
             assert!(

@@ -53,6 +53,61 @@ fn kuaishou_bitrate_selection() {
     );
     assert!(kuaishou::parse_page(&html, None).unwrap().is_live);
 }
+
+#[test]
+fn kuaishou_user_info_requires_success_target_identity_and_boolean_status() {
+    let valid =
+        json!({"data":{"result":1,"userInfo":{"id":"fixture","name":"Fixture","living":true}}});
+    for living in [false, true] {
+        let mut data = valid.clone();
+        data["data"]["userInfo"]["living"] = json!(living);
+        assert_eq!(
+            kuaishou::parse_user_info(&data, "fixture").unwrap(),
+            ("Fixture".into(), living)
+        );
+    }
+    for result in [json!(0), json!(2), json!(400002), json!("1"), Value::Null] {
+        let mut data = valid.clone();
+        data["data"]["result"] = result;
+        assert!(kuaishou::parse_user_info(&data, "fixture").is_err());
+    }
+    for identity in [json!("other"), json!(""), json!(42), Value::Null] {
+        let mut data = valid.clone();
+        data["data"]["userInfo"]["id"] = identity;
+        assert!(kuaishou::parse_user_info(&data, "fixture").is_err());
+    }
+    for living in [
+        json!(0),
+        json!(1),
+        json!("false"),
+        json!("true"),
+        Value::Null,
+    ] {
+        let mut data = valid.clone();
+        data["data"]["userInfo"]["living"] = living;
+        assert!(kuaishou::parse_user_info(&data, "fixture").is_err());
+    }
+    assert!(kuaishou::parse_user_info(&valid, "").is_err());
+    assert!(kuaishou::parse_user_info(&json!({}), "fixture").is_err());
+    // Display metadata is not evidence of status and is not required for it.
+    let no_name = json!({"data":{"result":1,"userInfo":{"id":"fixture","living":false}}});
+    assert_eq!(
+        kuaishou::parse_user_info(&no_name, "fixture").unwrap(),
+        (String::new(), false)
+    );
+}
+
+#[test]
+fn kuaishou_live_access_restriction_keeps_existing_access_contract() {
+    assert_eq!(
+        kuaishou::access_state(kuaishou::LIVE_ACCESS_UNAVAILABLE),
+        "unavailable"
+    );
+    assert!(!kuaishou::verification_required(
+        kuaishou::LIVE_ACCESS_UNAVAILABLE
+    ));
+}
+
 #[test]
 fn custom_urls_reject_credentials_and_unknown_pages() {
     let req = |url: &str| ResolveRequest {

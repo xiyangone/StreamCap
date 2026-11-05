@@ -1103,17 +1103,20 @@ async fn run_tool(
     let stdout = out.await.map_err(io::Error::other)??;
     let stderr = err.await.map_err(io::Error::other)??;
     let status = status?;
-    if stdout.len() > 1024 * 1024 || stderr.len() > 64 * 1024 {
-        return Err(io::Error::other("媒体工具响应超出限制"));
-    }
-    if !status.success() {
+    let output_limit = stdout.len() > 1024 * 1024 || stderr.len() > 64 * 1024;
+    if !status.success() || output_limit {
         let diagnostic = diagnostic_summary(&stderr);
         return Err(io::Error::other(format!(
-            "媒体工具退出码 {}{}",
+            "媒体工具退出码 {}{}{}",
             status
                 .code()
                 .map(|code| code.to_string())
                 .unwrap_or_else(|| "未知".into()),
+            if output_limit {
+                "；响应超出限制，以下诊断已截断"
+            } else {
+                ""
+            },
             if diagnostic.is_empty() {
                 String::new()
             } else {
