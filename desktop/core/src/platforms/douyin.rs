@@ -1,38 +1,71 @@
 //! Douyin room metadata and stream selection. Adapted from streamget (MIT).
 use super::{
-    douyin_sign, find_object,
+    douyin_sign,
     http::{validate_url, PlatformHttp, USER_AGENT},
-    json_after, quality_index, quality_name, text,
+    quality_index, quality_name, text,
 };
 use crate::resolver::{ResolveRequest, StreamInfo};
 use reqwest::Url;
 use serde_json::Value;
 use std::time::Duration;
 
-fn room_in(value: &Value) -> Option<&Value> {
-    find_object(
-        value,
-        &|v| {
-            v.get("status").is_some()
-                && (v.get("stream_url").is_some()
-                    || v.get("owner").is_some()
-                    || v.get("id_str").is_some())
-        },
-        0,
-    )
+struct RoomContext<'a> {
+    room: &'a Value,
+    user: Option<&'a Value>,
+    anchor: Option<&'a Value>,
+    web_stream: Option<&'a Value>,
+}
+
+/// Metadata may be beside the room in SSR state, but never in another room's subtree.
+fn room_context(value: &Value) -> Result<RoomContext<'_>, String> {
+    const MISSING: &str = "抖音未返回目标房间，不能确认是否开播";
+    if let Some(data) = value.get("data").filter(|data| data.get("data").is_some()) {
+        let room = data["data"]
+            .as_array()
+            .and_then(|rooms| rooms.first())
+            .filter(|room| room.is_object())
+            .ok_or(MISSING)?;
+        return Ok(RoomContext {
+            room,
+            user: data.get("user"),
+            anchor: None,
+            web_stream: None,
+        });
+    }
+    let context = if let Some(store) = value.get("roomStore") {
+        store.get("roomInfo").ok_or(MISSING)?
+    } else if let Some(info) = value.get("roomInfo") {
+        info
+    } else {
+        value
+    };
+    let room = if let Some(room) = context.get("room") {
+        room
+    } else if context.get("status").is_some() {
+        context
+    } else {
+        return Err(MISSING.into());
+    };
+    Ok(RoomContext {
+        room,
+        user: None,
+        anchor: context.get("anchor"),
+        web_stream: context.get("web_stream_url"),
+    })
 }
 pub fn parse_json(value: &Value, quality: Option<&str>) -> Result<StreamInfo, String> {
-    let room = value
-        .pointer("/data/data/0")
-        .or_else(|| room_in(value))
-        .ok_or("抖音未返回目标房间，不能确认是否开播")?;
+    let context = room_context(value)?;
+    let room = context.room;
     let status = room
         .get("status")
         .and_then(Value::as_i64)
         .ok_or("抖音房间状态缺失")?;
     let mut info = StreamInfo {
         platform: "抖音直播".into(),
-        anchor_name: text(&value["data"]["user"]["nickname"]),
+        anchor_name: context
+            .user
+            .map(|user| text(&user["nickname"]))
+            .unwrap_or_default(),
         title: text(&room["title"]),
         ..Default::default()
     };
@@ -43,12 +76,8 @@ pub fn parse_json(value: &Value, quality: Option<&str>) -> Result<StreamInfo, St
         info.anchor_name = text(&room["anchor_name"]);
     }
     if info.anchor_name.is_empty() {
-        if let Some(user) = find_object(
-            value,
-            &|v| v.get("nickname").is_some() && v.get("avatar_thumb").is_some(),
-            0,
-        ) {
-            info.anchor_name = text(&user["nickname"]);
+        if let Some(anchor) = context.anchor {
+            info.anchor_name = text(&anchor["nickname"]);
         }
     }
     if info.anchor_name.is_empty() {
@@ -63,14 +92,8 @@ pub fn parse_json(value: &Value, quality: Option<&str>) -> Result<StreamInfo, St
     let stream = room
         .get("stream_url")
         .filter(|v| v.is_object())
-        .or_else(|| {
-            find_object(
-                value,
-                &|v| v.get("web_stream_url").is_some_and(Value::is_object),
-                0,
-            )
-            .and_then(|v| v.get("web_stream_url"))
-        })
+        .or_else(|| room.get("web_stream_url").filter(|v| v.is_object()))
+        .or_else(|| context.web_stream.filter(|v| v.is_object()))
         .ok_or("抖音显示在播但缺少流信息")?;
     let mut flv = Vec::<(u64, String)>::new();
     let mut hls = Vec::<(u64, String)>::new();
@@ -154,48 +177,155 @@ fn select(mut urls: Vec<(u64, String)>, index: usize) -> String {
         .unwrap_or_default()
 }
 
+fn first_json(source: &str) -> Option<Value> {
+    serde_json::Deserializer::from_str(source.trim_start())
+        .into_iter::<Value>()
+        .next()?
+        .ok()
+}
+
+fn page_frame(source: &str) -> Option<(Option<Value>, usize)> {
+    let body = if source.starts_with(['{', '[']) {
+        source
+    } else {
+        let (id, body) = source.split_once(':')?;
+        if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        body
+    };
+    if let Some(text) = body.strip_prefix('T') {
+        let (length, text) = text.split_once(',')?;
+        let length = usize::from_str_radix(length, 16).ok()?;
+        let consumed = (source.len() - text.len()).checked_add(length)?;
+        source.get(consumed..)?;
+        return Some((None, consumed));
+    }
+    let mut values = serde_json::Deserializer::from_str(body).into_iter::<Value>();
+    let value = values.next()?.ok()?;
+    Some((
+        Some(value),
+        source.len() - body.len() + values.byte_offset(),
+    ))
+}
+
+/// The decoded page frame must own its room container. Component trees and route
+/// collections do not identify which nested room belongs to the requested page.
+fn parse_page_data(value: &Value, quality: Option<&str>) -> Option<Result<StreamInfo, String>> {
+    let direct_room = value.get("status").is_some()
+        && [
+            "owner",
+            "id_str",
+            "anchor_name",
+            "stream_url",
+            "web_stream_url",
+        ]
+        .iter()
+        .any(|key| value.get(*key).is_some());
+    if direct_room
+        || value.pointer("/data/data").is_some()
+        || ["roomStore", "roomInfo", "room"]
+            .iter()
+            .any(|key| value.get(*key).is_some())
+    {
+        Some(parse_json(value, quality))
+    } else {
+        None
+    }
+}
+
 pub fn parse_page(html: &str, quality: Option<&str>) -> Result<StreamInfo, String> {
-    if let Some(start) = html.find("id=\"RENDER_DATA\"") {
-        if let Some(body) = html[start..]
-            .split_once('>')
-            .and_then(|(_, s)| s.split_once("</script>").map(|(s, _)| s))
-        {
-            let decoded = percent_encoding::percent_decode_str(body).decode_utf8_lossy();
+    let scripts = regex::Regex::new(r"(?is)<script\b([^>]*)>(.*?)</script\s*>")
+        .expect("static script pattern");
+    let render_id = regex::Regex::new(r#"(?i)\bid\s*=\s*["']RENDER_DATA["']"#)
+        .expect("static render data pattern");
+    let mut error = None;
+    let mut parse = |value: &Value| match parse_page_data(value, quality) {
+        Some(Ok(info)) => Some(info),
+        Some(Err(reason)) => {
+            error = Some(reason);
+            None
+        }
+        None => None,
+    };
+    for script in scripts.captures_iter(html).take(500) {
+        if render_id.is_match(&script[1]) {
+            let decoded = percent_encoding::percent_decode_str(&script[2]).decode_utf8_lossy();
             if let Ok(data) = serde_json::from_str::<Value>(&decoded) {
-                if room_in(&data).is_some() {
-                    return parse_json(&data, quality);
+                if let Some(info) = parse(&data) {
+                    return Ok(info);
                 }
             }
         }
     }
-    for segment in ["self.__pace_f.push(", "self.__next_f.push("]
-        .into_iter()
-        .flat_map(|marker| html.split(marker).skip(1))
-        .take(500)
-    {
-        if let Some(Ok(Value::Array(parts))) = serde_json::Deserializer::from_str(segment)
-            .into_iter::<Value>()
-            .next()
-        {
-            for part in parts.iter().filter_map(Value::as_str) {
-                for marker in ["\"roomStore\":", "\"room\":"] {
-                    if let Some(value) = json_after(part, marker) {
-                        if let Ok(info) = parse_json(&value, quality) {
-                            return Ok(info);
+    for marker in ["self.__pace_f.push(", "self.__next_f.push("] {
+        let mut payload = String::new();
+        let mut chunks = 0;
+        'scripts: for script in scripts.captures_iter(html).take(500) {
+            for segment in script[2].split(marker).skip(1) {
+                if chunks == 500 {
+                    break 'scripts;
+                }
+                chunks += 1;
+                if let Some(Ok(Value::Array(parts))) = serde_json::Deserializer::from_str(segment)
+                    .into_iter::<Value>()
+                    .next()
+                {
+                    if parts.first().and_then(Value::as_u64) == Some(1) {
+                        if let Some(part) = parts.get(1).and_then(Value::as_str) {
+                            if payload.len() + part.len() > super::http::MAX_RESPONSE {
+                                return Err("抖音页面数据超过大小限制".into());
+                            }
+                            payload.push_str(part);
                         }
                     }
                 }
             }
         }
+        let mut remaining = payload.as_str();
+        for _ in 0..500 {
+            remaining = remaining.trim_start();
+            if remaining.is_empty() {
+                break;
+            }
+            if let Some((value, consumed)) = page_frame(remaining) {
+                if let Some(value) = value {
+                    if let Some(info) = parse(&value) {
+                        return Ok(info);
+                    }
+                }
+                remaining = &remaining[consumed..];
+            } else if remaining
+                .split_once(':')
+                .is_some_and(|(_, body)| body.starts_with('T'))
+            {
+                // A truncated length-prefixed text record cannot be scanned for new frames.
+                break;
+            } else if let Some((_, tail)) = remaining.split_once('\n') {
+                // Flight import records are not room state.
+                remaining = tail;
+            } else {
+                break;
+            }
+        }
     }
-    for marker in ["\"roomStore\":", "\"room\":"] {
-        if let Some(value) = json_after(html, marker) {
-            if let Ok(info) = parse_json(&value, quality) {
+    let assignment = regex::Regex::new(
+        r"^(?:(?:var|let|const)\s+)?(?:(?:window|self)\.)?[A-Za-z_$][A-Za-z0-9_$]*\s*=\s*",
+    )
+    .expect("static assignment pattern");
+    for script in scripts.captures_iter(html).take(500) {
+        let source = script[2].trim_start();
+        let source = assignment
+            .find(source)
+            .map(|matched| &source[matched.end()..])
+            .unwrap_or(source);
+        if let Some(value) = first_json(source) {
+            if let Some(info) = parse(&value) {
                 return Ok(info);
             }
         }
     }
-    Err("抖音页面没有可验证的房间数据（登录限制或页面结构变化）".into())
+    Err(error.unwrap_or_else(|| "抖音页面没有可验证的房间数据（登录限制或页面结构变化）".into()))
 }
 pub async fn resolve(request: &ResolveRequest) -> Result<StreamInfo, String> {
     let mut url = validate_url(&request.url)?;

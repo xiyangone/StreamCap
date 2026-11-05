@@ -202,6 +202,23 @@ pub fn preview_state() -> PreviewState {
 pub fn PreviewHost() -> impl IntoView {
     let preview = preview_state();
     let state = gateway::app_state();
+    let previous_root = StoredValue::new(None::<String>);
+    Effect::new(move |_| {
+        if state.settings_loading.get() {
+            return;
+        }
+        let root = state.settings.with(|settings| {
+            settings
+                .get("live_save_path")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        });
+        if previous_root.with_value(|previous| previous.as_ref().is_some_and(|old| old != &root)) {
+            preview.close();
+        }
+        previous_root.set_value(Some(root));
+    });
     let target = Signal::derive(move || match preview.target.get() {
         Some(PreviewTarget::Recording(id)) => state.recording(&id),
         _ => None,

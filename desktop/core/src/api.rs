@@ -809,6 +809,46 @@ async fn update_settings(
     Json(payload): Json<SettingsPayload>,
 ) -> ApiResult {
     let _lifecycle = state.store.lifecycle_guard().await;
+    crate::config::validate_settings(&payload.user_config)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let previous_root = {
+        let config = state.config.read().await;
+        payload.user_config.get("live_save_path").and_then(|value| {
+            let current = config.recordings_root();
+            let next = value
+                .as_str()
+                .filter(|path| !path.trim().is_empty())
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| config.workspace().default_recordings_dir());
+            let same = current == next
+                || current
+                    .canonicalize()
+                    .ok()
+                    .zip(next.canonicalize().ok())
+                    .is_some_and(|(current, next)| current == next);
+            (!same).then_some(current)
+        })
+    };
+    // Serialize the root switch with recorder-to-postprocessor reservations.
+    let _filesystem = if let Some(root) = previous_root {
+        let guard = state.engine.filesystem_guard().await;
+        let protected = match root.canonicalize() {
+            Ok(root) => state.engine.protects_path(&root).await,
+            Err(_) => false,
+        };
+        if protected
+            || !state.engine.active_ids().await.is_empty()
+            || state.scheduler.postprocess.pending() != 0
+        {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                "请先停止录制并等待媒体处理完成，再更改保存目录".into(),
+            ));
+        }
+        Some(guard)
+    } else {
+        None
+    };
     let changed = {
         let mut config = state.config.write().await;
         config
@@ -985,6 +1025,7 @@ async fn remux_media(
     State(state): State<ApiState>,
     Json(payload): Json<RemuxPayload>,
 ) -> ApiResult {
+    let _lifecycle = state.store.lifecycle_guard().await;
     let root = state.config.read().await.recordings_root();
     let job = state
         .scheduler
@@ -1312,11 +1353,8 @@ fn parse_range(header: &str, size: u64) -> Option<(u64, u64)> {
 async fn qr_start(State(state): State<ApiState>) -> ApiResult {
     let proxy = {
         let config = state.config.read().await;
-        if config.get_bool("enable_proxy", false) {
-            Some(config.get_str("proxy_address", ""))
-        } else {
-            None
-        }
+        crate::scheduler::recording_proxy(&config, Some("kuaishou"))
+            .map_err(ApiError::bad_request)?
     };
     match state.resolver.qr_start(proxy.as_deref()).await {
         Ok(snapshot) => Ok(Json(serde_json::to_value(snapshot).unwrap_or(Value::Null))),

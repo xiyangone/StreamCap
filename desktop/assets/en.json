@@ -836,5 +836,6 @@
   "平台验证受限": "Platform verification blocked",
   "平台验证受限，自动检测已暂停": "Platform verification blocked; automatic checks paused",
   "平台访问受限，自动检测已暂停": "Platform access restricted; automatic checks paused",
-  "访问受限，等待下次检测": "Access restricted; waiting for the next check"
+  "访问受限，等待下次检测": "Access restricted; waiting for the next check",
+  "请先停止录制并等待媒体处理完成，再更改保存目录": "Stop recording and wait for media processing to finish before changing the save folder"
 }

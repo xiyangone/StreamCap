@@ -16,7 +16,7 @@ pub fn Sidebar() -> impl IntoView {
     view! {
         <aside class="sidebar">
             <A attr:class="sidebar-brand" href="/home" attr:aria-label=t("StreamCap 总览")>
-                <span class="brand-mark" aria-hidden="true"><Icon name="record" size=22 /></span>
+                <span class="brand-mark" aria-hidden="true"><img src="/logo-mark.png" width="30" height="32" alt="" /></span>
                 <div><strong>"StreamCap"</strong><small>{t("本地录制")}</small></div>
             </A>
             <span class="nav-label">{t("工作空间")}</span>

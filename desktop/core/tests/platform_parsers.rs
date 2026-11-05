@@ -40,6 +40,174 @@ fn malformed_data_is_not_offline() {
     assert!(douyin::parse_page("captcha", None).is_err());
     assert!(kuaishou::parse_page("<script>window.__INITIAL_STATE__={\"r\":{\"liveStream\":null,\"author\":{},\"errorType\":{}}};</script>",None).is_err());
 }
+
+fn douyin_pages(state: &Value) -> Vec<String> {
+    let json = state.to_string();
+    let encoded = percent_encoding::utf8_percent_encode(&json, percent_encoding::NON_ALPHANUMERIC);
+    let mut pages = vec![
+        format!("<script id=\"RENDER_DATA\">{encoded}</script>"),
+        format!("<script>window.__INITIAL_STATE__ = {json};</script>"),
+        format!("<script type=\"application/json\">{json}</script>"),
+    ];
+    for marker in ["__next_f", "__pace_f"] {
+        pages.push(format!(
+            "<script>self.{marker}.push({})</script>",
+            json!([1, format!("0:{json}")])
+        ));
+    }
+    pages
+}
+
+#[test]
+fn douyin_never_fills_missing_target_data_from_recommendations() {
+    let unrelated = json!({
+        "status":2,
+        "owner":{"nickname":"Unrelated room"},
+        "stream_url":{"flv_pull_url":{"ORIGIN":"https://media.invalid/unrelated.flv"}}
+    });
+    let requested = json!({"status":2,"owner":{"nickname":"Requested room"}});
+    let unrelated_store = json!({"roomInfo":{
+        "room":unrelated,
+        "anchor":{"nickname":"Unrelated room","avatar_thumb":{}},
+        "web_stream_url":unrelated["stream_url"]
+    }});
+    for state in [
+        json!({"data":{"data":[]},"recommendations":[unrelated]}),
+        json!({"data":{"data":[requested]},"recommendations":[{"web_stream_url":unrelated["stream_url"]}]}),
+        json!({"data":{"data":null},"roomStore":unrelated_store}),
+        json!({"recommendations":[{"room":unrelated},{"roomStore":unrelated_store}]}),
+        json!({"roomStore":{"roomInfo":null},"room":unrelated}),
+        json!({"roomStore":{"roomInfo":{"room":requested}},"recommendations":[{"roomStore":unrelated_store}]}),
+        json!({"roomStore":{"roomInfo":{"room":{"status":2,"stream_url":unrelated["stream_url"]}}},"recommendations":[{"nickname":"Unrelated room","avatar_thumb":{}}]}),
+    ] {
+        assert!(douyin::parse_json(&state, None).is_err(), "{state}");
+        for page in douyin_pages(&state) {
+            assert!(douyin::parse_page(&page, None).is_err(), "{page}");
+        }
+    }
+}
+
+#[test]
+fn douyin_owned_room_shapes_keep_identity_quality_and_offline_state() {
+    let mut api = room();
+    api["data"]["user"]["nickname"] = json!("Requested room");
+    api["data"]["data"][0]["owner"]["nickname"] = json!("Requested room");
+    let direct = api["data"]["data"][0].clone();
+    let store = json!({"roomInfo":{
+        "room":{"id_str":"requested","status":2,"title":"Live"},
+        "anchor":{"nickname":"Requested room","avatar_thumb":{}},
+        "web_stream_url":direct["stream_url"]
+    }});
+    for state in [
+        api,
+        direct.clone(),
+        json!({"room":direct}),
+        store.clone(),
+        json!({"roomStore":store}),
+    ] {
+        let expected = douyin::parse_json(&state, Some("UHD")).unwrap();
+        assert_eq!(expected.anchor_name, "Requested room");
+        assert!(expected.is_live);
+        assert!(expected.record_url.ends_with("b.flv"));
+        for page in douyin_pages(&state) {
+            assert_eq!(douyin::parse_page(&page, Some("UHD")).unwrap(), expected);
+        }
+    }
+    let offline = json!({
+        "roomStore":{"roomInfo":{"room":{"status":4},"anchor":{"nickname":"Requested room"}}},
+        "recommendations":[{"room":direct}]
+    });
+    for page in douyin_pages(&offline) {
+        let info = douyin::parse_page(&page, None).unwrap();
+        assert_eq!(info.anchor_name, "Requested room");
+        assert!(!info.is_live);
+        assert!(info.record_url.is_empty());
+    }
+}
+
+#[test]
+fn douyin_page_placeholders_do_not_promote_unowned_room_containers() {
+    let store = json!({"roomInfo":{
+        "room":{"id_str":"requested","status":4},
+        "anchor":{"nickname":"Requested room"}
+    }});
+    let recommendation = json!({"status":2,"owner":{"nickname":"Unrelated room"},"stream_url":{"flv_pull_url":{"ORIGIN":"https://media.invalid/unrelated.flv"}}});
+    for state in [
+        json!({"recommendations":{"0":{"roomStore":store}}}),
+        json!(["$","Recommendation",null,{"roomStore":store}]),
+        json!({"0":{"room":recommendation}}),
+    ] {
+        for page in douyin_pages(&state) {
+            assert!(douyin::parse_page(&page, None).is_err());
+        }
+    }
+    let placeholder =
+        json!({"roomStore":{"roomInfo":null},"recommendations":[{"room":recommendation}]});
+    let html = format!(
+        "<script>self.__pace_f.push({})</script><script>self.__pace_f.push({})</script>",
+        json!([1, format!("0:{placeholder}")]),
+        json!([1, format!("1:{}", json!({"roomStore":store}))])
+    );
+    assert_eq!(
+        douyin::parse_page(&html, None).unwrap().anchor_name,
+        "Requested room"
+    );
+    for page in douyin_pages(&json!({"0":{"roomStore":store},"1":{"room":recommendation}})) {
+        assert!(douyin::parse_page(&page, None).is_err());
+    }
+}
+
+#[test]
+fn douyin_flight_chunks_reassemble_before_selecting_room_state() {
+    let requested = json!({"roomStore":{"roomInfo":{
+        "room":{"status":4},"anchor":{"nickname":"Requested room"}
+    }}});
+    let unrelated = json!({"room":{"status":2,"owner":{"nickname":"Unrelated room"},"stream_url":{"flv_pull_url":{"ORIGIN":"https://media.invalid/unrelated.flv"}}}});
+    let false_frame = format!("text before a newline\n0:{unrelated}\n");
+    for marker in ["__next_f", "__pace_f"] {
+        for (state, expected) in [
+            (requested.clone(), true),
+            (
+                json!({"data":{"data":[]},"recommendations":[unrelated]}),
+                false,
+            ),
+        ] {
+            let payload = format!("0:{state}\n");
+            let split = payload
+                .char_indices()
+                .nth(payload.chars().count() / 2)
+                .unwrap()
+                .0;
+            let html = format!(
+                "<script>self.{marker}.push({})</script><script>self.{marker}.push({})</script>",
+                json!([1, &payload[..split]]),
+                json!([1, &payload[split..]])
+            );
+            let result = douyin::parse_page(&html, None);
+            assert_eq!(result.is_ok(), expected);
+            if let Ok(info) = result {
+                assert_eq!(info.anchor_name, "Requested room");
+                assert!(!info.is_live);
+            }
+        }
+        let html = format!(
+            "<script>self.{marker}.push({})</script>",
+            json!([
+                1,
+                format!("a:T{:x},{false_frame}1:{requested}\n", false_frame.len())
+            ])
+        );
+        assert_eq!(
+            douyin::parse_page(&html, None).unwrap().anchor_name,
+            "Requested room"
+        );
+        let visible_text = format!(
+            "<p>self.{marker}.push({})</p>",
+            json!([1, format!("0:{unrelated}")])
+        );
+        assert!(douyin::parse_page(&visible_text, None).is_err());
+    }
+}
 #[test]
 fn kuaishou_bitrate_selection() {
     let room = json!({"author":{"name":"Fixture"},"isLiving":true,"liveStream":{"playUrls":{"h264":{"adaptationSet":{"representation":[{"bitrate":3000,"url":"https://media.invalid/h.flv"},{"bitrate":800,"url":"https://media.invalid/l.flv"}]}}}}});

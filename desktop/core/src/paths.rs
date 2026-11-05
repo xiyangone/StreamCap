@@ -84,8 +84,18 @@ impl Workspace {
     /// `USER_OWNED_FILES` 里的文件是运行期产物，永不覆盖。
     pub fn ensure_ready(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(self.config_dir())?;
-        std::fs::create_dir_all(self.default_recordings_dir())?;
-        self.seed_defaults()
+        self.seed_defaults()?;
+        let defaults = crate::config::read_json_object(&self.default_settings_path())?;
+        let user = crate::config::read_json_object(&self.user_settings_path())?;
+        let custom_directory = user
+            .get("live_save_path")
+            .or_else(|| defaults.get("live_save_path"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|path| !path.trim().is_empty());
+        if !custom_directory {
+            std::fs::create_dir_all(self.default_recordings_dir())?;
+        }
+        Ok(())
     }
 
     fn seed_defaults(&self) -> std::io::Result<()> {
@@ -293,4 +303,36 @@ fn media_probe_discovery_never_silently_uses_an_unrelated_binary() {
     });
     std::fs::write(&probe, b"fixture").unwrap();
     assert_eq!(adjacent_ffprobe(&ffmpeg), Some(probe));
+}
+
+#[cfg(test)]
+#[test]
+fn configured_recording_directory_does_not_require_the_unused_default_directory() {
+    for from_defaults in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = Workspace::from_repo_root(directory.path());
+        std::fs::create_dir_all(workspace.config_dir()).unwrap();
+        // A file at the fallback location makes creating it deterministically fail.
+        let unused = workspace.default_recordings_dir();
+        std::fs::write(&unused, b"keep unused fallback").unwrap();
+        let selected = directory.path().join("selected-recordings");
+        std::fs::create_dir(&selected).unwrap();
+        let settings_path = if from_defaults {
+            workspace.default_settings_path()
+        } else {
+            workspace.user_settings_path()
+        };
+        let settings = serde_json::to_vec(&serde_json::json!({"live_save_path":selected})).unwrap();
+        std::fs::write(&settings_path, &settings).unwrap();
+        workspace.ensure_ready().unwrap();
+        let config = crate::config::ConfigStore::load(workspace.clone()).unwrap();
+        assert_eq!(config.recordings_root(), selected);
+        assert_eq!(std::fs::read(&unused).unwrap(), b"keep unused fallback");
+        assert_eq!(std::fs::read(&settings_path).unwrap(), settings);
+
+        // Explicitly clearing the preference restores the fallback semantics.
+        std::fs::write(workspace.user_settings_path(), br#"{"live_save_path":""}"#).unwrap();
+        assert!(workspace.ensure_ready().is_err());
+        assert_eq!(std::fs::read(&unused).unwrap(), b"keep unused fallback");
+    }
 }

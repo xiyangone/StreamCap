@@ -1531,6 +1531,13 @@ impl Scheduler {
     }
 
     async fn stop_recording_locked(&self, rec_id: &str, invalidate: bool) -> bool {
+        let _filesystem = self.engine.filesystem_guard().await;
+        self.stop_recording_with_filesystem_locked(rec_id, invalidate)
+            .await
+    }
+
+    /// Caller owns the lifecycle and filesystem guards through the finish-plan handoff.
+    async fn stop_recording_with_filesystem_locked(&self, rec_id: &str, invalidate: bool) -> bool {
         self.recovery_requests
             .lock()
             .expect("recovery requests")
@@ -1538,7 +1545,6 @@ impl Scheduler {
         if let Some(token) = self.checks.lock().expect("active checks").get(rec_id) {
             token.cancel();
         }
-        let _filesystem = self.engine.filesystem_guard().await;
         let process = self.engine.process(rec_id).await;
         let stopped = self.engine.stop(rec_id, 15).await;
         let elapsed = process.as_ref().map(|p| p.recorded_seconds());
@@ -1585,8 +1591,14 @@ impl Scheduler {
 
     pub async fn stop_all_for_shutdown(&self) {
         let _starting = self.starting.lock().await;
-        for id in self.engine.active_ids().await {
-            self.stop_recording_locked(&id, true).await;
+        {
+            let _filesystem = self.engine.filesystem_guard().await;
+            let ids = self.engine.active_ids().await;
+            futures::future::join_all(
+                ids.iter()
+                    .map(|id| self.stop_recording_with_filesystem_locked(id, true)),
+            )
+            .await;
         }
         self.engine.stop_all(10).await;
     }

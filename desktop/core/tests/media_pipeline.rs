@@ -173,6 +173,54 @@ fn recordings(root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+async fn assert_recording_root_switch_is_blocked(state: &api::ApiState, base: &str, root: &Path) {
+    let settings_path = state.workspace.user_settings_path();
+    let before = std::fs::read(&settings_path).unwrap();
+    let client = reqwest::Client::new();
+    let response = client
+        .put(format!("{base}/api/settings"))
+        .json(&json!({"userConfig":{
+            "live_save_path":root.join("next-recordings"),
+            "record_quality":"SD"
+        }}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 409);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert!(body["detail"].as_str().unwrap().contains("媒体处理完成"));
+    assert_eq!(std::fs::read(&settings_path).unwrap(), before);
+    assert_eq!(
+        state.config.read().await.recordings_root(),
+        root.join("downloads")
+    );
+    let files = client
+        .get(format!("{base}/api/recordings/media/files"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        files.status(),
+        200,
+        "the current recording must remain previewable"
+    );
+    assert!(!files.json::<serde_json::Value>().await.unwrap()["files"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        client
+            .put(format!("{base}/api/settings"))
+            .json(&json!({"userConfig":{"live_save_path":root.join("downloads")}}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200,
+        "saving the same root remains allowed"
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires STREAMCAP_TEST_FFMPEG; synthetic incompatible MP4 codecs only"]
 async fn incompatible_mp4_codecs_use_decodable_compatibility_preview() {
@@ -338,6 +386,18 @@ fn main() {
             Some(local_ffmpeg.clone()),
             state.recording_enabled.clone(),
         ));
+        let server = Arc::new(
+            Server::start(
+                state.clone(),
+                ServerOptions {
+                    port: 0,
+                    monitoring: false,
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        let base = format!("http://{}", server.address());
         let stream = source(sample_ts(if manual { "20" } else { "2.2" }).await).await;
         add(&state, stream.url.clone(), false).await;
         state
@@ -363,6 +423,7 @@ fn main() {
             })
             .await
             .unwrap();
+            assert_recording_root_switch_is_blocked(&state, &base, root.path()).await;
             assert!(tokio::time::timeout(
                 Duration::from_secs(3),
                 state.scheduler.stop_recording("media")
@@ -382,6 +443,7 @@ fn main() {
             "manual={manual}: pending subtitles are not recording"
         );
         assert!(state.engine.active_ids().await.is_empty());
+        assert_recording_root_switch_is_blocked(&state, &base, root.path()).await;
         assert!(state.store.get("media").await.unwrap().speed.is_none());
         let guard =
             tokio::time::timeout(Duration::from_millis(500), state.engine.filesystem_guard())
@@ -405,8 +467,8 @@ fn main() {
         )
         .await
         .expect("unrelated operations must not wait for subtitles");
-        let closing = state.clone();
-        let shutdown = tokio::spawn(async move { api::shutdown(&closing).await });
+        let closing = server.clone();
+        let shutdown = tokio::spawn(async move { closing.shutdown().await });
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
             !shutdown.is_finished(),

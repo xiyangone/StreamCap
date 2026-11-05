@@ -2216,9 +2216,9 @@ async fn twitch(c: &Context<'_>, channel: &str) -> Result<StreamInfo, String> {
                 ("player_backend", "mediaplayer".into()),
             ],
         )?;
-        let manifest = c.text(&hls).await?;
+        let (manifest_url, manifest, _) = c.fetch_page(&hls).await?;
         hls = hls_variant(
-            &hls,
+            manifest_url.as_str(),
             &manifest,
             quality_index(c.request.quality.as_deref())?,
         )?;
@@ -2388,9 +2388,10 @@ async fn migu(c: &Context<'_>) -> Result<StreamInfo, String> {
     let address = format!("https://www.miguvideo.com/mgs/player/prd/{version}/dist/mgprtcl.wasm");
     let mut response = c
         .send_request(c.request(reqwest::Method::GET, &address)?)
-        .await?
-        .error_for_status()
-        .map_err(http::transport_error)?;
+        .await?;
+    if !response.status().is_success() {
+        return Err(format!("平台返回 HTTP {}", response.status().as_u16()));
+    }
     let mut module = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(http::transport_error)? {
         if module.len() + chunk.len() > 4 * 1024 * 1024 {

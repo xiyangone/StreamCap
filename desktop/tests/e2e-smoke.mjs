@@ -112,6 +112,41 @@ try {
     await navigate('录制任务');
     await waitState(() => page.locator('.recording-card').count(), (n) => n === 6, '任务页显示同一初始集合');
   });
+  await step('侧栏始终使用完整熊猫标识，明暗主题与紧凑侧栏保持比例', async () => {
+    const originalTheme = state.userConfig.theme_mode;
+    const originalViewport = page.viewportSize();
+    try {
+      for (const theme of ['light', 'dark']) {
+        state.userConfig.theme_mode = theme; h.emit('settings', {});
+        await waitTheme(page, theme);
+        for (const width of [1100, 800]) {
+          await page.setViewportSize({ width, height: 750 });
+          const brand = page.locator('.sidebar-brand .brand-mark');
+          const panda = brand.locator('img');
+          await visible(panda);
+          assert.equal(await brand.locator('svg').count(), 0);
+          assert.equal(await panda.getAttribute('src'), '/logo-mark.png');
+          await page.waitForFunction(() => {
+            const image = document.querySelector('.brand-mark img');
+            return image?.complete && image.naturalWidth > 0 && image.naturalHeight > 0;
+          });
+          const geometry = await panda.evaluate(image => ({
+            width: image.clientWidth, height: image.clientHeight,
+            fit: getComputedStyle(image).objectFit,
+            parent: getComputedStyle(image.parentElement).backgroundColor,
+          }));
+          assert.deepEqual(geometry, { width: 30, height: 32, fit: 'contain', parent: 'rgba(0, 0, 0, 0)' });
+          await h.shot('panda-' + theme + '-' + width);
+        }
+      }
+    } finally {
+      if (originalTheme === undefined) delete state.userConfig.theme_mode;
+      else state.userConfig.theme_mode = originalTheme;
+      h.emit('settings', {});
+      await waitTheme(page, originalTheme ?? 'light');
+      await page.setViewportSize(originalViewport);
+    }
+  });
   await step('快手访问异常不再显示人工检查入口', async () => {
     const target=state.recordings[1];
     const saved=structuredClone(target);
@@ -1425,6 +1460,41 @@ try {
       await navigate('录制任务');
       await page.evaluate(() => window.__sizeTimeoutAudit.restore());
       state.files = originalFiles;
+      await navigate('媒体库');
+      await visible(page.locator('.file-name').filter({ hasText: '海边日落.ts' }));
+    }
+  });
+  await step('保存目录切换被拒绝时保留预览，成功切换后释放旧目录播放器', async () => {
+    const originalRoot = state.userConfig.live_save_path;
+    const nextRoot = 'X:/Fixture/NextRecordings';
+    const blockedMessage = '请先停止录制并等待媒体处理完成，再更改保存目录';
+    try {
+      await navigate('媒体库');
+      await page.getByRole('button', { name: '返回媒体库根目录', exact: true }).click();
+      await page.locator('.file-name').filter({ hasText: '海边日落.ts' }).click();
+      const modal = dialog('媒体预览'); await visible(modal);
+      await page.waitForFunction(() => document.querySelector('video')?.videoWidth > 0);
+      await page.evaluate(() => { window.rootChangePreviewVideo = document.querySelector('video'); });
+      await modal.getByRole('button', { name: '最小化预览', exact: true }).click();
+      await navigate('偏好设置');
+      const path = page.getByRole('textbox', { name: /录制保存位置/ });
+      await path.fill(nextRoot);
+      assert.equal(await page.locator('video').evaluate(video => video === window.rootChangePreviewVideo), true);
+      h.failNext('PUT', '/api/settings', blockedMessage, 409);
+      await page.locator('.settings-savebar').getByRole('button', { name: '保存修改', exact: true }).click();
+      await visible(page.locator('.form-feedback').getByText(blockedMessage, { exact: true }));
+      assert.equal(state.userConfig.live_save_path, originalRoot);
+      assert.equal(await path.inputValue(), nextRoot, '拒绝保存时保留用户草稿');
+      await visible(modal);
+      assert.equal(await page.locator('video').evaluate(video => video === window.rootChangePreviewVideo), true);
+      await page.locator('.settings-savebar').getByRole('button', { name: '保存修改', exact: true }).click();
+      await waitState(() => state.userConfig.live_save_path, value => value === nextRoot, '空闲时切换目录');
+      await hidden(modal);
+      await page.waitForFunction(async () => (await import('/media-player.js')).activePlayerCount() === 0);
+      assert.equal(await page.evaluate(() => window.rootChangePreviewVideo.isConnected), false);
+      await hidden(page.locator('.settings-savebar'));
+    } finally {
+      state.userConfig.live_save_path = originalRoot; h.emit('settings', {});
       await navigate('媒体库');
       await visible(page.locator('.file-name').filter({ hasText: '海边日落.ts' }));
     }

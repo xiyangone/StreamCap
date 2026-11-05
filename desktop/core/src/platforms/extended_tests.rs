@@ -928,6 +928,45 @@ fn twitch_replies(on: bool) -> Vec<Reply> {
     }
     replies
 }
+
+#[tokio::test]
+async fn twitch_redirected_playlists_use_the_final_url_for_variants_and_media() {
+    const DESTINATION: &str = "https://edge.hls.ttvnw.net/relocated/master.m3u8?session=fixture";
+    let master = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=2000,RESOLUTION=1920x1080\n1080/index.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=1000,RESOLUTION=1280x720\n720/index.m3u8?token=fixture\n";
+    for (quality, manifest, expected) in [
+        (
+            "OD",
+            master,
+            "https://edge.hls.ttvnw.net/relocated/1080/index.m3u8",
+        ),
+        (
+            "UHD",
+            master,
+            "https://edge.hls.ttvnw.net/relocated/720/index.m3u8?token=fixture",
+        ),
+        (
+            "OD",
+            "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nsegment.ts\n",
+            DESTINATION,
+        ),
+    ] {
+        let mut replies = twitch_replies(true);
+        replies.pop();
+        replies.push(Reply {
+            status: 302,
+            location: Some(DESTINATION),
+            ..Reply::text("usher.ttvnw.net", "")
+        });
+        replies.push(Reply::text(DESTINATION, manifest));
+        let mut req = request("twitch", "https://www.twitch.tv/fixture");
+        req.quality = Some(quality.into());
+        let info = fixture_request(req, replies).await.unwrap();
+        assert!(info.is_live);
+        assert_eq!(info.anchor_name, "Fixture");
+        assert_eq!(info.record_url, expected);
+    }
+}
+
 #[tokio::test]
 async fn twitch_faceit_and_popkon_identity_auth_contracts() {
     for on in [true, false] {
@@ -1041,4 +1080,30 @@ async fn migu_protocol_module_is_bounded_and_used_in_process() {
             .unwrap_err()
             .contains("不允许")
     );
+}
+
+#[tokio::test]
+async fn migu_module_http_errors_preserve_platform_cooldown_signals() {
+    for status in [403, 429, 503] {
+        let result = fixture(
+            "migu",
+            "https://www.miguvideo.com/match/123",
+            vec![
+                Reply::json("basic-data/123/miguvideo", json!({"body":{"title":"Fixture","pId":"456"}})),
+                Reply::json("v3/play/playurl", json!({"body":{"content":{"currentLive":1},"urlInfo":{"url":"https://media.example.test/live.m3u8"}}})),
+                Reply::json("settings/H5_DetailPage", json!({"body":{"paramValue":json!({"playerVersion":"fixture"}).to_string()}})),
+                Reply { status, ..Reply::text("mgprtcl.wasm", "not a protocol module") },
+            ],
+        ).await;
+        assert_eq!(
+            result.as_ref().unwrap_err(),
+            &format!("平台返回 HTTP {status}")
+        );
+        let pacer = crate::pacing::Pacer::default();
+        pacer.result("migu", &result);
+        assert_eq!(
+            pacer.status("migu", 1).reason == "cooldown",
+            matches!(status, 403 | 429)
+        );
+    }
 }

@@ -1,5 +1,9 @@
 use futures::StreamExt;
-use std::{path::PathBuf, sync::atomic::Ordering, time::Duration};
+use std::{
+    path::PathBuf,
+    sync::{atomic::Ordering, Arc},
+    time::Duration,
+};
 use streamcap_core::{
     api,
     engine::RecordOptions,
@@ -748,4 +752,110 @@ async fn ffmpeg_old_process_handle_cannot_reap_a_replacement_recording() {
     );
     engine.stop_all(5).await;
     assert!(engine.active_ids().await.is_empty());
+}
+
+#[tokio::test]
+#[ignore = "requires rustc; two owned synthetic recorders ignore graceful exit requests"]
+async fn ffmpeg_unresponsive_recorders_share_one_shutdown_grace_period() {
+    let tools = tempfile::tempdir().unwrap();
+    let source = tools.path().join("unresponsive.rs");
+    let executable = tools.path().join(if cfg!(windows) {
+        "recorder.exe"
+    } else {
+        "recorder"
+    });
+    std::fs::write(&source, r#"
+use std::io::{Read, Write};
+fn main() {
+    let output = std::env::args().last().unwrap();
+    std::fs::write(&output, b"owned synthetic recorder").unwrap();
+    println!("frame=1\nout_time_us=1000000\nprogress=continue");
+    std::io::stdout().flush().unwrap();
+    let mut byte = [0];
+    std::io::stdin().read_exact(&mut byte).unwrap();
+    assert_eq!(byte[0], b'q');
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+    std::fs::write(format!("{output}.stop-requested"), now.to_string()).unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(60));
+}
+"#).unwrap();
+    let compiled = fixture_command(std::path::Path::new("rustc"))
+        .args(["--crate-name", "unresponsive_recorder"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&executable)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let mut state = api::bootstrap(Workspace::from_repo_root(directory.path()))
+        .await
+        .unwrap();
+    state.scheduler = Arc::new(streamcap_core::Scheduler::new(
+        state.store.clone(),
+        state.engine.clone(),
+        state.config.clone(),
+        state.resolver.clone(),
+        Some(executable),
+        state.recording_enabled.clone(),
+    ));
+    let mut outputs = Vec::new();
+    for index in 0..2 {
+        let id = format!("unresponsive-{index}");
+        let url = format!("https://media.invalid/{index}.ts");
+        let record = streamcap_core::Recording::new(id.clone(), url.clone(), id.clone());
+        state.store.insert(vec![record]).await.unwrap();
+        state
+            .scheduler
+            .start_recording(
+                id.clone(),
+                &streamcap_core::resolver::StreamInfo {
+                    is_live: true,
+                    record_url: url,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        outputs.push(state.engine.process(&id).await.unwrap().output_path.clone());
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while outputs.iter().any(|path| !path.exists()) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let started = std::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(50), api::shutdown(&state))
+        .await
+        .unwrap()
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert!(state.engine.active_ids().await.is_empty());
+    let mut requested = Vec::new();
+    for output in &outputs {
+        assert_eq!(std::fs::read(output).unwrap(), b"owned synthetic recorder");
+        assert!(!state.engine.protects_path(output).await);
+        let marker = format!("{}.stop-requested", output.to_string_lossy());
+        requested.push(
+            std::fs::read_to_string(marker)
+                .unwrap()
+                .parse::<u128>()
+                .unwrap(),
+        );
+    }
+    assert!(
+        requested[0].abs_diff(requested[1]) < 5000,
+        "stop requests were serialized: {requested:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(24),
+        "shutdown accumulated per-recorder grace periods: {elapsed:?}"
+    );
 }

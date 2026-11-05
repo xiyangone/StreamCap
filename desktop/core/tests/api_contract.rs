@@ -1000,6 +1000,90 @@ async fn qr_routes_use_in_process_sessions_and_expose_errors() {
     );
 }
 
+#[tokio::test]
+async fn qr_routes_apply_the_same_platform_proxy_selection_and_validation_as_recording() {
+    let (base, _directory) = start_backend().await;
+    let client = reqwest::Client::new();
+    for (enabled, platforms, address, expected_status) in [
+        (true, "kuaishou", "", 400),
+        (true, "", "", 400),
+        (true, "kuaishou", "invalid proxy address", 400),
+        (true, "twitch", "invalid proxy address", 200),
+        (false, "kuaishou", "invalid proxy address", 200),
+    ] {
+        client
+            .put(format!("{base}/api/settings"))
+            .json(&json!({"userConfig":{
+                "enable_proxy":enabled,
+                "default_platform_with_proxy":platforms,
+                "proxy_address":address
+            }}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let response = client
+            .post(format!("{base}/api/qr/kuaishou/start"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            expected_status,
+            "enabled={enabled}, platforms={platforms}"
+        );
+        let body: Value = response.json().await.unwrap();
+        if expected_status == 400 {
+            assert!(body["detail"].as_str().unwrap().contains("代理"));
+            assert!(body.get("sessionId").is_none());
+        } else {
+            // Only the test's loopback login endpoint is reached; no real login occurs.
+            assert_eq!(body["state"], "error");
+            assert!(body["sessionId"].is_string());
+        }
+    }
+}
+
+#[tokio::test]
+async fn idle_recording_root_changes_are_atomic_and_do_not_create_historical_directories() {
+    let (base, directory) = start_backend().await;
+    let client = reqwest::Client::new();
+    let selected = directory.path().join("selected-recordings");
+    let response = client
+        .put(format!("{base}/api/settings"))
+        .json(&json!({"userConfig":{"live_save_path":selected}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(!selected.exists());
+    let settings: Value = get_json(&format!("{base}/api/settings")).await;
+    assert_eq!(settings["userConfig"]["live_save_path"], json!(selected));
+    let stored = std::fs::read(directory.path().join("config/user_settings.json")).unwrap();
+    let invalid = client
+        .put(format!("{base}/api/settings"))
+        .json(&json!({"userConfig":{"live_save_path":42,"record_quality":"SD"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), 400);
+    assert_eq!(
+        std::fs::read(directory.path().join("config/user_settings.json")).unwrap(),
+        stored
+    );
+    assert_eq!(
+        client
+            .put(format!("{base}/api/settings"))
+            .json(&json!({"userConfig":{"live_save_path":""}}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+}
+
 /// 构造一个未使用的 ApiState 类型引用，确保公开导出稳定（编译期契约）。
 #[allow(dead_code)]
 fn _assert_public_types(state: &ApiState) {
