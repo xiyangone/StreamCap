@@ -52,7 +52,7 @@ try {
     if (-not (Test-Path -LiteralPath $archivePath)) {
         if ($Offline) { throw 'Pinned FFmpeg archive is missing; run prepare-ffmpeg.ps1 once with network access.' }
         $download = Join-Path $cache ('download-' + [Guid]::NewGuid().ToString('N') + '.zip')
-        Invoke-WebRequest -Uri $archiveUri.AbsoluteUri -OutFile $download -TimeoutSec 600
+        Invoke-WebRequest -Uri $archiveUri.AbsoluteUri -OutFile $download -TimeoutSec 600 -MaximumRetryCount 3 -RetryIntervalSec 5
         if ((Get-FileHash -LiteralPath $download -Algorithm SHA256).Hash.ToLowerInvariant() -ne $manifest.archiveSha256) {
             throw 'FFmpeg archive checksum mismatch; the rejected download has been retained for inspection.'
         }
