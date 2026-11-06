@@ -82,14 +82,8 @@ jobs:
           desktop/tests/artifacts/**/*.png
         retention-days: 14
         if-no-files-found: warn
-    - name: Preserve prepared build cache
-      if: ${{ !cancelled() && steps.toolchain.outcome == 'success' && steps.dependencies.outcome == 'success' }}
-      uses: actions/cache/save@v6.1.0
-      with:
-        path: ${{ env.STREAMCAP_CACHE_PATHS }}
-        key: ${{ steps.cache.outputs.cache-primary-key }}
     - name: Upload verified executable
-      if: github.event_name == 'workflow_dispatch'
+      if: github.event_name == 'workflow_dispatch' && steps.verify.outcome == 'success'
       uses: actions/upload-artifact@v7.0.1
       with:
         name: StreamCap-windows-x64-withFF
@@ -97,3 +91,9 @@ jobs:
           ${{ steps.verify.outputs.release-directory }}/StreamCap.exe
           ${{ steps.verify.outputs.release-directory }}/StreamCap.exe.sha256
         if-no-files-found: error
+    - name: Preserve prepared build cache
+      if: ${{ !cancelled() && steps.toolchain.outcome == 'success' && steps.dependencies.outcome == 'success' }}
+      uses: actions/cache/save@v6.1.0
+      with:
+        path: ${{ env.STREAMCAP_CACHE_PATHS }}
+        key: ${{ steps.cache.outputs.cache-primary-key }}

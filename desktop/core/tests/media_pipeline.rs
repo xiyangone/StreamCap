@@ -17,6 +17,22 @@ use streamcap_core::{
 fn ffmpeg() -> PathBuf {
     PathBuf::from(std::env::var("STREAMCAP_TEST_FFMPEG").expect("explicit local FFmpeg path"))
 }
+fn prepare_bundled_tools(workspace: &Workspace) {
+    workspace.ensure_ready().unwrap();
+    let bundled = streamcap_core::tools::bundled_directory(workspace);
+    let payload = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../build/ffmpeg-bundle")
+        .join(format!(
+            "{}.bundle.zip",
+            bundled.file_name().unwrap().to_str().unwrap()
+        ));
+    streamcap_core::tools::ensure_bundled_tools(workspace, &std::fs::read(payload).unwrap())
+        .unwrap();
+    assert_eq!(
+        streamcap_core::paths::find_ffmpeg(workspace),
+        Some(bundled.join("ffmpeg.exe"))
+    );
+}
 fn command(path: &Path) -> tokio::process::Command {
     let mut command = tokio::process::Command::new(path);
     command.kill_on_drop(true);
@@ -624,21 +640,8 @@ async fn media_failed_input_preserves_original_and_removes_only_own_temporary_fi
 async fn media_recording_preview_follows_growth_then_stop_converts_to_mp4() {
     let directory = tempfile::tempdir().unwrap();
     let workspace = Workspace::from_repo_root(directory.path());
-    workspace.ensure_ready().unwrap();
-    let bundled = streamcap_core::tools::bundled_directory(&workspace);
-    let payload = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../build/ffmpeg-bundle")
-        .join(format!(
-            "{}.bundle.zip",
-            bundled.file_name().unwrap().to_str().unwrap()
-        ));
-    streamcap_core::tools::ensure_bundled_tools(&workspace, &std::fs::read(payload).unwrap())
-        .unwrap();
+    prepare_bundled_tools(&workspace);
     let state = state(directory.path(), true).await;
-    assert_eq!(
-        streamcap_core::paths::find_ffmpeg(&workspace),
-        Some(bundled.join("ffmpeg.exe"))
-    );
     let source = source(sample_ts("12").await).await;
     add(&state, source.url.clone(), false).await;
     let server = Server::start(
@@ -2002,9 +2005,10 @@ async fn media_preview_buffers_ahead_and_keeps_source_unchanged() {
 }
 
 #[tokio::test]
-#[ignore = "requires FFmpeg and project Playwright; real Rust copy-preview decoded in browser, isolated media only"]
+#[ignore = "requires prepared bundled tools, FFmpeg and project Playwright; real Rust copy-preview decoded in browser"]
 async fn media_browser_copy_preview_has_correct_frames_and_bounded_seek_latency() {
     let temp = tempfile::tempdir().unwrap();
+    prepare_bundled_tools(&Workspace::from_repo_root(temp.path()));
     let state = state(temp.path(), false).await;
     let root = temp.path().join("downloads");
     let file = root.join("native-copy.ts");
