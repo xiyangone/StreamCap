@@ -75,7 +75,16 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             for window_config in &window_configs{
                 let mut window=tauri::WebviewWindowBuilder::from_config(app,window_config)?.theme(Some(window_theme(&theme)));
                 window=window.initialization_script(lifecycle::runtime_script(address));
-                if smoke{window=window.initialization_script(lifecycle::smoke_transport_script(address));}
+                if smoke{
+                    // Keep wry 0.57 defaults and opt into CDP through the API for this isolated profile.
+                    #[cfg(windows)]
+                    {window=window.additional_browser_args(concat!(
+                        "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection ",
+                        "--autoplay-policy=no-user-gesture-required ",
+                        "--remote-debugging-port=0 --remote-debugging-address=127.0.0.1"
+                    ));}
+                    window=window.initialization_script(lifecycle::smoke_transport_script(address));
+                }
                 window.build()?;
             }
             lifecycle::start_native_events(app.handle(),native_events);

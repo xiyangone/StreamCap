@@ -30,10 +30,10 @@ $mediaDirectory=Join-Path $profile 'downloads';[IO.Directory]::CreateDirectory($
 & $testFfmpeg -v error -nostdin -n -f lavfi -i 'testsrc2=size=160x120:rate=10' -f lavfi -i 'sine=frequency=440:sample_rate=48000' -t 60 -c:v libx264 -preset ultrafast -tune zerolatency -g 10 -pix_fmt yuv420p -c:a aac -f mpegts (Join-Path $run 'native-preview.ts')
 if($LASTEXITCODE -ne 0){throw 'Synthetic native preview fixture failed'}
 $stdout = Join-Path $run 'app.stdout.log'; $stderr = Join-Path $run 'app.stderr.log'
-$debugListener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0)
-$debugListener.Start(); $debugPort = $debugListener.LocalEndpoint.Port; $debugListener.Stop()
+$debugPort = 0
+$debugPortFile = Join-Path $profile 'webview/EBWebView/DevToolsActivePort'
 $arguments = @('--data-dir',$profile,'--api-port','0','--smoke-seconds','120')
-$environment = @{TEMP=$temp;TMP=$temp;WEBVIEW2_USER_DATA_FOLDER=(Join-Path $profile 'webview');PATH='';WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS="--remote-debugging-port=$debugPort --remote-debugging-address=127.0.0.1"}
+$environment = @{TEMP=$temp;TMP=$temp;PATH=''}
 # ProcessStartInfo preserves an actually empty child PATH on Windows.
 $startInfo = [Diagnostics.ProcessStartInfo]::new()
 $startInfo.FileName=$Executable;$startInfo.WorkingDirectory=$working
@@ -83,10 +83,16 @@ try {
     $debugOwner = $null
     for ($i=0;$i -lt 40;$i++) {
         Update-OwnedProcesses
-        $debugOwner=Get-NetTCPConnection -State Listen -LocalPort $debugPort -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (Test-Path -LiteralPath $debugPortFile) {
+            $portText=Get-Content -LiteralPath $debugPortFile -TotalCount 1 -ErrorAction SilentlyContinue
+            $publishedPort=0
+            if ([int]::TryParse([string]$portText,[ref]$publishedPort) -and $publishedPort -gt 0 -and $publishedPort -le 65535) {$debugPort=$publishedPort}
+        }
+        if ($debugPort -gt 0) {$debugOwner=Get-NetTCPConnection -State Listen -LocalPort $debugPort -ErrorAction SilentlyContinue | Select-Object -First 1}
         if ($debugOwner -and $owned.ContainsKey([int]$debugOwner.OwningProcess)) {break}
         Start-Sleep -Milliseconds 100
     }
+    if ($debugPort -eq 0) {throw 'The isolated WebView2 profile did not publish a valid debug port'}
     if (-not $debugOwner -or -not $owned.ContainsKey([int]$debugOwner.OwningProcess)) {throw 'Debug listener is not owned by this isolated application; refusing to attach'}
     $debugIdentity=Get-OwnedWebViewListener $rootIdentity $debugPort
     $probe = @'
@@ -348,6 +354,12 @@ try {
     $result=[ordered]@{passed=$true;executable=$Executable;sourceExecutable=$sourceExecutable;sha256=$candidateHash.ToLowerInvariant();startupDirectory=$working;emptyPath=$true;bundledToolStatus=$toolStatus;resolver='native';debugListenerOwnership=$debugIdentity;exitMode=$ExitMode;ownedChildNames=@($owned.Values.Name|Sort-Object -Unique);ownedProcessIdentities=@($owned.Values|Select-Object ProcessId,ParentProcessId,Name,CreationDate);ownedProcessesRemaining=$remaining.Count;apiListenerClosed=$true;webviewListenerClosed=$true;shutdown=$shutdown;ui=$ui;profile=$profile}
     $result | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $run 'result.json') -Encoding utf8
     $result | ConvertTo-Json -Depth 8
+} catch {
+    $failureMessage=$_.Exception.Message
+    $connections=if($debugPort -gt 0){@(Get-NetTCPConnection -LocalPort $debugPort -ErrorAction SilentlyContinue | Select-Object LocalAddress,LocalPort,State,OwningProcess)}else{@()}
+    [ordered]@{passed=$false;error=$failureMessage;executable=$Executable;root=$rootIdentity;debugPort=$debugPort;debugPortFilePresent=(Test-Path -LiteralPath $debugPortFile);connections=$connections;ownedProcesses=@($owned.Values|Select-Object ProcessId,ParentProcessId,Name,CreationDate)} |
+        ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $run 'result.json') -Encoding utf8
+    throw
 } finally {
     if ($null -ne $probeProcess -and -not $probeProcess.HasExited) {$probeProcess.Kill($true);$probeProcess.WaitForExit(10000)|Out-Null}
     if (-not $process.HasExited) {$process.Kill($true);$process.WaitForExit(10000)|Out-Null}
