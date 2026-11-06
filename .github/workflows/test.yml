@@ -28,7 +28,8 @@ jobs:
           desktop/src-tauri/target
           desktop/build/npm-cache
           desktop/build/playwright
-        key: native-${{ runner.os }}-rust195-${{ hashFiles('desktop/**/Cargo.lock', 'desktop/package-lock.json') }}
+          desktop/build/ffmpeg-bundle
+        key: native-${{ runner.os }}-rust195-${{ hashFiles('desktop/**/Cargo.lock', 'desktop/package-lock.json', 'desktop/ffmpeg-bundle.json') }}
         restore-keys: native-${{ runner.os }}-rust195-
     - name: Install Rust toolchain and project tools
       shell: pwsh
@@ -56,14 +57,7 @@ jobs:
           cargo fetch --manifest-path $manifest --locked
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
         }
-    - name: Prepare FFmpeg test tools
-      shell: pwsh
-      run: |
-        if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
-          choco install ffmpeg -y --no-progress
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-        }
-    - name: Full native verification and noFF build
+    - name: Full native verification and bundled FFmpeg build
       id: verify
       shell: pwsh
       working-directory: desktop
@@ -86,7 +80,7 @@ jobs:
       if: github.event_name == 'workflow_dispatch'
       uses: actions/upload-artifact@v7.0.1
       with:
-        name: StreamCap-windows-x64-noFF
+        name: StreamCap-windows-x64-withFF
         path: |
           ${{ steps.verify.outputs.release-directory }}/StreamCap.exe
           ${{ steps.verify.outputs.release-directory }}/StreamCap.exe.sha256

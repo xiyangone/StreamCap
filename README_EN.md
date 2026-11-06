@@ -1,6 +1,6 @@
 # StreamCap Native Desktop
 
-StreamCap uses **Rust, Tauri 2 and Leptos/WASM**. The supported release target is **Windows x64 noFF**, delivered as one directly runnable executable. No Python/Flet/Node backend is installed or launched.
+StreamCap uses **Rust, Tauri 2 and Leptos/WASM**. The supported release target is **one Windows x64 executable with FFmpeg and ffprobe included**. No Python/Flet/Node backend is installed or launched.
 
 ## Supported features
 
@@ -12,15 +12,17 @@ StreamCap uses **Rust, Tauri 2 and Leptos/WASM**. The supported release target i
 - Task cards show source reading, remuxing, track verification and full decoding, prioritizing the active segment. The overview and media library use full-width layouts without right-hand information panels. The library focuses on files and offers manual conversion that always keeps the source TS.
 - Desktop notifications, DingTalk, WeCom, Feishu, Bark, ntfy, ServerChan, Telegram and SMTP, plus bounded post-recording executable jobs.
 - Scheduled/countdown shutdown with a cancellable 60-second warning; recording and processing finish before shutdown, without forcing other applications closed.
-- Integrated window controls, close/tray preferences, native folder selection, Chinese/English UI, shortcuts, last-page restoration, explicit release checks and verified FFmpeg installation.
+- Integrated window controls, close/tray preferences, native folder selection, Chinese/English UI, shortcuts, last-page restoration, explicit release checks and bundled recording-tool status.
 
 Only the native Rust pipeline is maintained. Python/Flet, Docker Web and former macOS entrypoints are retired. New or resumed monitors receive an initial check, then retain independent configured intervals and platform pacing. Refreshing the interface never triggers platform checks.
 
 ## Runtime
 
-Windows 10/11 x64, the system Microsoft Edge WebView2 Runtime, and the Microsoft Visual C++ v14 x64 runtime (VCRUNTIME140.dll / VCRUNTIME140_1.dll) are required. noFF does not bundle FFmpeg: recording uses FFmpeg from the user-data directory or PATH. MP4 remuxing also requires ffprobe alongside FFmpeg for output validation. Native FLV downloading needs no recording subprocess but requires FLV format with segmentation disabled. The explicit Gyan installer verifies SHA-256 and installs only FFmpeg/ffprobe into application data, without modifying PATH or replacing an existing installation. Node and Rust are development tools only.
+Windows 10/11 x64, the system Microsoft Edge WebView2 Runtime, and the Microsoft Visual C++ v14 x64 runtime (VCRUNTIME140.dll / VCRUNTIME140_1.dll) are required. The EXE includes the pinned Gyan FFmpeg 8.1.2 build and matching ffprobe for recording, remuxing, subtitles and compatibility previews. No separate tool installation or PATH configuration is needed. Native FLV downloading needs no recording subprocess but requires FLV format with segmentation disabled. Node and Rust are development tools only.
 
-User data defaults to %APPDATA%\StreamCap. Builds never overwrite tasks, cookies, account metadata, settings or downloaded recordings.
+Startup verifies and extracts the tools, license and source notice to `runtime/ffmpeg/<archive SHA-256>/` inside the user-data directory. First launch needs space for extraction; subsequent launches verify and reuse the cache. Tools are never downloaded at runtime. An invalid existing cache produces an error rather than overwriting files or selecting another installation.
+
+User data defaults to %APPDATA%\StreamCap. Builds never overwrite tasks, cookies, account metadata, settings or downloaded recordings. The default recording directory is `downloads` beside the EXE; custom relative paths are also based on the EXE directory. An absolute `--data-dir` makes that profile the base for default and relative recording paths. The launch working directory has no effect. Saved absolute paths remain unchanged; select a new location in Preferences after moving existing recordings.
 
 ## Media lifecycle and automation
 
@@ -57,8 +59,12 @@ npm run tauri:dev
 
 The frontend helper verifies the project-local wasm-bindgen CLI against Cargo.lock. A missing or mismatched tool is an error, not an interpreter fallback.
 
-Before UI verification, set $env:PLAYWRIGHT_BROWSERS_PATH = Join-Path (Get-Location) 'build/playwright' and run npx playwright install chromium. Run npm run verify for the complete native verification/build pipeline, or pwsh -NoProfile -File scripts/build-release.ps1 to build only. Output is a fresh desktop/src-tauri/target/native-noFF-* directory containing StreamCap.exe and its SHA256 file, not an installer.
+During builds, `scripts/prepare-ffmpeg.ps1` reads `ffmpeg-bundle.json`, downloads the fixed Gyan archive and verifies its SHA-256 plus all four embedded files. Prepared tools and the compressed payload stay under `build/ffmpeg-bundle`. Downloads happen on the build machine only; a complete cache can be rechecked with `pwsh -NoProfile -File scripts/prepare-ffmpeg.ps1 -Offline`.
 
-Verification requires online dependency audits for all three Cargo.lock files and npm; audit failures block the build. Reports retain vulnerability findings and maintenance warnings separately. One Native validation CI workflow handles pushes, PRs and manual runs; only a successful manual run uploads the verified EXE.
+Before UI verification, set $env:PLAYWRIGHT_BROWSERS_PATH = Join-Path (Get-Location) 'build/playwright' and run npx playwright install chromium. Run npm run verify for the complete native verification/build pipeline, or pwsh -NoProfile -File scripts/build-release.ps1 to build only. Output is a fresh desktop/src-tauri/target/native-withFF-* directory containing StreamCap.exe and its SHA256 file, not an installer.
+
+Verification requires online dependency audits for all three Cargo.lock files and npm; audit failures block the build. Reports retain vulnerability findings and maintenance warnings separately. One Native validation CI workflow handles pushes, PRs and manual runs; only a successful manual run uploads the verified EXE as `StreamCap-windows-x64-withFF`.
+
+Bundled FFmpeg and ffprobe retain their GPL v3 license. The license, upstream source location and build configuration are extracted with the tools; pinned origins and file hashes are recorded in [the bundle manifest](desktop/ffmpeg-bundle.json).
 
 See [packaging and verification](docs/packaging_en.md), [LICENSE](LICENSE) and [third-party notices](desktop/THIRD_PARTY_NOTICES.md).

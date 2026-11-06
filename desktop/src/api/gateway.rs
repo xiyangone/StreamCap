@@ -1470,9 +1470,7 @@ async fn call_controlled<T: DeserializeOwned>(
         None => builder.build(),
     }
     .map_err(|_| crate::app::i18n::t("无法构造请求").to_string())?;
-    let timeout_ms = if path == "/api/tools/install" {
-        600_000
-    } else if path.starts_with("/api/storage/size?") {
+    let timeout_ms = if path.starts_with("/api/storage/size?") {
         120_000
     } else if method == "GET" {
         12_000
@@ -2186,11 +2184,6 @@ pub fn subscribe_events(state: AppState) -> Option<EventConnection> {
 
 pub async fn tool_status() -> Result<Value, String> {
     call("GET", "/api/tools/status", None).await
-}
-pub async fn install_tools() -> Result<(), String> {
-    call::<Value>("POST", "/api/tools/install", Some(json!({})))
-        .await
-        .map(|_| ())
 }
 pub async fn check_update() -> Result<UpdateCheck, String> {
     call("GET", "/api/tools/update", None).await

@@ -1822,12 +1822,30 @@ try {
       assert.deepEqual(routeErrors, []);
     } finally { recoveryGate.resolve(); await page.unroute(pattern, handler); }
   });
-  await step('安装与关机都有准确确认文案，取消不产生副作用',async()=>{
+  await step('内置工具状态、失败重试与关机取消不产生额外副作用',async()=>{
     await navigate('偏好设置');
-    const before=requests('POST','/api/tools/install').length;
-    await page.getByRole('button',{name:'安装 FFmpeg',exact:true}).click();const install=dialog('安装录制工具');await visible(install);
-    await visible(install.getByRole('button',{name:'确认安装',exact:true}));assert.equal(await install.getByRole('button',{name:'确认删除',exact:true}).count(),0);
-    await install.getByRole('button',{name:'取消',exact:true}).click();assert.equal(requests('POST','/api/tools/install').length,before);
+    await visible(page.getByText('FFmpeg 与 ffprobe 已就绪',{exact:true}));
+    await visible(page.getByText('FFmpeg '+state.tools.version+' · ffprobe',{exact:true}));
+    assert.equal(await page.getByRole('button',{name:'安装 FFmpeg',exact:true}).count(),0);
+    const recheck=page.getByRole('button',{name:'重新检查',exact:true});
+    h.delayNext('GET','/api/tools/status');
+    await recheck.click();
+    await visible(page.getByRole('status').filter({hasText:'正在检查录制工具…'}));
+    assert.equal(await recheck.isDisabled(),true);
+    assert.equal(await page.getByText('FFmpeg 与 ffprobe 已就绪',{exact:true}).count(),0,'检查中不展示旧就绪状态');
+    await visible(page.getByText('FFmpeg 与 ffprobe 已就绪',{exact:true}));
+    state.tools.ffprobeReady=false;
+    await recheck.click();
+    await visible(page.getByText('录制工具不可用，请重新启动应用',{exact:true}));
+    state.tools.ffprobeReady=true;
+    h.failNext('GET','/api/tools/status','模拟工具状态读取失败');
+    await recheck.click();
+    await visible(page.getByRole('alert').filter({hasText:'模拟工具状态读取失败'}));
+    assert.equal(await page.getByText('FFmpeg 与 ffprobe 已就绪',{exact:true}).count(),0,'读取失败不保留旧就绪状态');
+    await recheck.click();
+    await visible(page.getByText('FFmpeg 与 ffprobe 已就绪',{exact:true}));
+    await hidden(page.getByRole('alert').filter({hasText:'模拟工具状态读取失败'}));
+    assert.equal(requests('POST','/api/tools/install').length,0,'工具状态检查不会下载或安装');
     await page.getByRole('button',{name:'选择文件夹',exact:true}).click();await visible(page.locator('.settings-savebar'));assert.ok(state.native.calls.some(call=>call.command==='desktop_window_action'&&call.args.action==='pick-directory'));await page.getByRole('button',{name:'放弃修改',exact:true}).click();
     await page.getByRole('button',{name:'自动化与通知',exact:true}).click();await page.getByRole('spinbutton',{name:'关机倒计时（小时）',exact:true}).fill('2');await page.getByRole('button',{name:'启动倒计时',exact:true}).click();const timer=dialog('启动关机倒计时');await visible(timer);await timer.getByRole('button',{name:'启动倒计时',exact:true}).click();await waitState(()=>state.quickShutdown,value=>value===2,'只设置模拟倒计时');
     await h.triggerShutdown(60);await visible(page.locator('.shutdown-banner'));await page.getByRole('button',{name:'取消关机',exact:true}).click();await hidden(page.locator('.shutdown-banner'));assert.equal(state.native.systemShutdown,false);assert.equal(state.quickShutdown,null);

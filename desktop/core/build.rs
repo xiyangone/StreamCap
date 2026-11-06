@@ -21,6 +21,8 @@ pub const BUILD_INPUTS: &[&str] = &[
     "src-tauri/.cargo",
     "scripts/build-frontend.ps1",
     "scripts/build-release.ps1",
+    "scripts/prepare-ffmpeg.ps1",
+    "ffmpeg-bundle.json",
     "src-tauri/src",
     "src-tauri/build.rs",
     "src-tauri/Cargo.toml",

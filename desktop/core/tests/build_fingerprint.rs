@@ -20,6 +20,8 @@ fn styles_locks_and_all_declared_release_inputs_change_the_fingerprint() {
         "Trunk.toml",
         "src-tauri/build.rs",
         "scripts/build-release.ps1",
+        "scripts/prepare-ffmpeg.ps1",
+        "ffmpeg-bundle.json",
     ] {
         assert!(
             build_script::BUILD_INPUTS.contains(&required),

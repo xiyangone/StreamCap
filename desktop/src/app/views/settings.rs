@@ -799,75 +799,46 @@ fn ToolSettings() -> impl IntoView {
     let state = gateway::app_state();
     let result = RwSignal::new(Value::Null);
     let error = RwSignal::new(None::<String>);
-    let busy = RwSignal::new(false);
-    let confirm = RwSignal::new(false);
+    let busy = RwSignal::new(true);
     let reload = RwSignal::new(0_u32);
     Effect::new(move |_| {
         let _ = reload.get();
+        busy.set(true);
+        error.set(None);
+        result.set(Value::Null);
         leptos::task::spawn_local(async move {
             match gateway::tool_status().await {
                 Ok(value) => {
                     let _ = result.try_set(value);
-                    let _ = error.try_set(None);
                 }
                 Err(message) => {
                     let _ = error.try_set(Some(message));
-                }
-            }
-        });
-    });
-    let timer = StoredValue::new_local(Some(gloo_timers::callback::Interval::new(
-        1500,
-        move || {
-            if result
-                .try_get_untracked()
-                .is_some_and(|r| r["installation"]["state"] == "downloading")
-            {
-                let _ = reload.try_update(|v| *v = v.wrapping_add(1));
-            }
-        },
-    )));
-    on_cleanup(move || {
-        timer.update_value(|v| {
-            v.take();
-        })
-    });
-    let install = Callback::new(move |_| {
-        if busy.get_untracked()
-            || !state.status.get_untracked().ok
-            || result.get_untracked()["installation"]["state"] == "downloading"
-        {
-            return;
-        }
-        error.set(None);
-        busy.set(true);
-        leptos::task::spawn_local(async move {
-            match gateway::install_tools().await {
-                Ok(()) => {
-                    let _ = confirm.try_set(false);
-                    state.notify(t("开始下载并校验 FFmpeg"));
-                    let _ = reload.try_update(|v| *v = v.wrapping_add(1));
-                }
-                Err(message) => {
-                    let _ = error.try_set(Some(message.clone()));
-                    state.fail(message);
                 }
             }
             let _ = busy.try_set(false);
         });
     });
     view! {
-        <SettingsGroup title=t("录制工具") subtitle=t("noFF 不捆绑 FFmpeg。安装仅写入应用数据目录，不修改 PATH。") icon="settings">
-            <p role="status">{move||if result.get()["ffmpegReady"]==true&&result.get()["ffprobeReady"]==true{t("FFmpeg 与 ffprobe 已就绪")}else{t("需要 FFmpeg 与 ffprobe")}}</p>
-            <p role="status">{move||result.get()["installation"]["message"].as_str().unwrap_or("").to_string()}</p>
+        <SettingsGroup title=t("录制工具") subtitle=t("已内置 FFmpeg 与 ffprobe，无需另行下载。") icon="settings">
+            <p role="status">{move || {
+                if busy.get() {
+                    t("正在检查录制工具…")
+                } else if error.get().is_some() {
+                    t("无法读取录制工具状态")
+                } else if result.get()["ffmpegReady"] == true && result.get()["ffprobeReady"] == true {
+                    t("FFmpeg 与 ffprobe 已就绪")
+                } else {
+                    t("录制工具不可用，请重新启动应用")
+                }
+            }}</p>
+            <Show when=move || result.get()["bundled"] == true && result.get()["version"].is_string()>
+                <p>{move || format!("FFmpeg {} · ffprobe", result.get()["version"].as_str().unwrap_or_default())}</p>
+            </Show>
             <FormFeedback error=error title=t("操作未完成") />
-            <ActionButton label=t("安装 FFmpeg") icon="download" busy=busy busy_label=t("正在安装…")
-                disabled=Signal::derive(move || !state.status.get().ok || result.get()["installation"]["state"]=="downloading")
-                on_click=Callback::new(move |_|confirm.set(true)) />
+            <ActionButton label=t("重新检查") icon="refresh" busy=busy busy_label=t("正在检查录制工具…")
+                disabled=Signal::derive(move || !state.status.get().ok)
+                on_click=Callback::new(move |_| reload.update(|value| *value = value.wrapping_add(1))) />
         </SettingsGroup>
-        <ConfirmDialog open=confirm title=t("安装录制工具") description=t("将从 Gyan 下载并验证 FFmpeg，保存到应用数据目录；不会覆盖已有工具。")
-            busy=busy disabled=Signal::derive(move || !state.status.get().ok || result.get()["installation"]["state"]=="downloading")
-            on_confirm=install icon="download" destructive=false confirm_text=t("确认安装") busy_text=t("正在安装…") />
     }
 }
 

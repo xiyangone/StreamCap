@@ -1084,6 +1084,68 @@ async fn idle_recording_root_changes_are_atomic_and_do_not_create_historical_dir
     );
 }
 
+#[tokio::test]
+async fn relative_recording_preferences_resolve_against_the_explicit_profile_after_reload() {
+    let (base, directory) = start_backend().await;
+    let selected = "中文 录制/captures";
+    let response = reqwest::Client::new()
+        .put(format!("{base}/api/settings"))
+        .json(&json!({"userConfig":{"live_save_path":selected}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let workspace = Workspace {
+        resource_dir: directory.path().join("移动后的 程序目录"),
+        user_data_dir: directory.path().to_path_buf(),
+    };
+    let config = streamcap_core::ConfigStore::load(workspace).unwrap();
+    assert_eq!(config.recordings_root(), directory.path().join(selected));
+    assert!(
+        !config.recordings_root().exists(),
+        "保存偏好不应提前创建历史录制目录"
+    );
+    let settings = get_json(&format!("{base}/api/settings")).await;
+    assert_eq!(settings["userConfig"]["live_save_path"], selected);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn drive_relative_recording_paths_are_rejected_without_partial_settings_writes() {
+    let (base, directory) = start_backend().await;
+    let path = directory.path().join("config/user_settings.json");
+    let original = std::fs::read(&path).unwrap();
+    for invalid in ["C:captures", "\\captures", "bad\0path"] {
+        let response = reqwest::Client::new()
+            .put(format!("{base}/api/settings"))
+            .json(&json!({"userConfig":{"live_save_path":invalid,"record_quality":"SD"}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400, "{invalid:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+}
+
+#[tokio::test]
+async fn tool_status_reports_the_bundle_without_an_online_installer() {
+    let (base, directory) = start_backend().await;
+    let status = get_json(&format!("{base}/api/tools/status")).await;
+    assert_eq!(status["bundled"], true);
+    assert_eq!(status["version"], streamcap_core::tools::bundle_version());
+    assert_eq!(status["ffmpegReady"], false);
+    assert_eq!(status["ffprobeReady"], false);
+    assert!(status.get("installation").is_none());
+    let removed = reqwest::Client::new()
+        .post(format!("{base}/api/tools/install"))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), 404);
+    assert!(!directory.path().join("runtime").exists());
+}
+
 /// 构造一个未使用的 ApiState 类型引用，确保公开导出稳定（编译期契约）。
 #[allow(dead_code)]
 fn _assert_public_types(state: &ApiState) {

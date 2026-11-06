@@ -11,7 +11,7 @@ if(-not $run.StartsWith($allowedArtifacts,[StringComparison]::OrdinalIgnoreCase)
 if(Test-Path -LiteralPath $run){throw 'Use a fresh evidence directory'}
 $tmp=Join-Path $run 'tmp'
 [IO.Directory]::CreateDirectory($tmp)|Out-Null
-$publish=if($OutputDirectory){[IO.Path]::GetFullPath($OutputDirectory)}else{Join-Path $desktop ('src-tauri/target/native-noFF-'+$stamp)}
+$publish=if($OutputDirectory){[IO.Path]::GetFullPath($OutputDirectory)}else{Join-Path $desktop ('src-tauri/target/native-withFF-'+$stamp)}
 $steps=[Collections.Generic.List[object]]::new()
 $names=@('TEMP','TMP','STREAMCAP_TEST_ARTIFACTS','npm_config_cache','NO_COLOR','STREAMCAP_TEST_FFMPEG','STREAMCAP_TEST_PWSH','PLAYWRIGHT_BROWSERS_PATH','STREAMCAP_TEST_SOURCE_CSS','STREAMCAP_TEST_BACKEND','NODE_OPTIONS','NODE_COMPILE_CACHE','NODE_DISABLE_COMPILE_CACHE')
 $saved=@{};foreach($name in $names){$saved[$name]=[Environment]::GetEnvironmentVariable($name,'Process')}
@@ -80,7 +80,8 @@ try {
     Step 'browser-prerequisite' {& node --input-type=module -e 'import { chromium } from "playwright"; const browser = await chromium.launch({headless:true}); await browser.close();'}
     Step 'ffmpeg-prerequisite' {
         $env:STREAMCAP_TEST_PWSH=(Get-Command pwsh -ErrorAction Stop).Source
-        if(-not $env:STREAMCAP_TEST_FFMPEG){$env:STREAMCAP_TEST_FFMPEG=(Get-Command ffmpeg -ErrorAction Stop).Source}
+        $preparedTools=& (Join-Path $PSScriptRoot 'prepare-ffmpeg.ps1')
+        $env:STREAMCAP_TEST_FFMPEG=Join-Path $preparedTools 'ffmpeg.exe'
         if(-not(Test-Path -LiteralPath $env:STREAMCAP_TEST_FFMPEG)){throw 'FFmpeg validation tool missing'}
         if(-not(Test-Path -LiteralPath (Join-Path (Split-Path -Parent $env:STREAMCAP_TEST_FFMPEG) 'ffprobe.exe'))){throw 'Adjacent ffprobe is required for recording validation'}
     }
@@ -111,4 +112,4 @@ finally {
     Pop-Location;foreach($name in $names){[Environment]::SetEnvironmentVariable($name,$saved[$name],'Process')}
     Write-Host "Verification report: $run/verification.json"
 }
-if($passed){Write-Output "Verified noFF executable: $exe"}
+if($passed){Write-Output "Verified executable with bundled FFmpeg/ffprobe: $exe"}

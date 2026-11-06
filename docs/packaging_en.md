@@ -1,28 +1,32 @@
-# Native noFF packaging and verification
+# Native packaging with bundled FFmpeg
 
-The only current release target is a Windows x64 StreamCap.exe. It embeds frontend assets and shipped defaults, not Python, Node, FFmpeg or user data. WebView2 and the Microsoft Visual C++ v14 x64 runtime are system prerequisites; normal recording uses an existing FFmpeg installation, except native FLV downloading.
+The only current release target is a Windows x64 StreamCap.exe. It embeds frontend assets, shipped defaults and a compressed FFmpeg/ffprobe payload, not Python, Node or user data. WebView2 and the Microsoft Visual C++ v14 x64 runtime are system prerequisites. Recording tools are verified and extracted at startup without runtime downloads or PATH configuration.
 
 From desktop, run npm run verify for the complete verification/build pipeline, or pwsh -NoProfile -File scripts/build-release.ps1 for a build only. The release script, npm build and the Tauri build hook share build-frontend.ps1, so they cannot silently package stale frontend assets.
 
 Dependencies must first be fetched with cargo fetch --locked for the frontend, core and src-tauri manifests. Builds use locked/offline mode. Required tools are Rust 1.95.0 with wasm32-unknown-unknown/MSVC/Windows SDK, Node.js 24, bundled mpegts.js 1.8.2, Trunk 0.21.14 and wasm-bindgen-cli 0.2.129. Install Trunk and wasm-bindgen into desktop/target/tools; the helper verifies the CLI version against the frontend Cargo.lock.
 
-Output is a new desktop/src-tauri/target/native-noFF-* directory containing StreamCap.exe and StreamCap.exe.sha256. Existing release files are never overwritten; no installer is produced.
+Output is a new desktop/src-tauri/target/native-withFF-* directory containing StreamCap.exe and StreamCap.exe.sha256. Existing release files are never overwritten; no installer is produced.
+
+`ffmpeg-bundle.json` pins Gyan FFmpeg 8.1.2, its archive URL/hash, and the names, sizes and hashes of FFmpeg, ffprobe, LICENSE and README.txt. `prepare-ffmpeg.ps1` downloads only on the build machine, verifies all files and creates `build/ffmpeg-bundle/<SHA-256>.bundle.zip` plus a relative `embedded.rs` include. A complete cache supports `-Offline`; corrupt cached files stop the build. The same preparation entry is used by frontend, release and verification scripts.
+
+Startup uses `%APPDATA%\StreamCap\runtime\ffmpeg\<SHA-256>`, or the explicitly selected profile. It verifies existing files, serializes concurrent extraction and publishes only a complete verified directory. It does not overwrite user-managed tools, enable partial output or search PATH. Cache errors identify the exact directory to handle before restarting; the entire profile must not be cleared. GPL v3 LICENSE and the upstream source/build README are embedded alongside both tools.
 
 ## Verification boundaries
 
-Rust format, dependency audits, Clippy and test gates are followed by WASM release compilation, UI/layout regression and actual native close/tray/shutdown smoke. A failed gate returns nonzero. Native smoke only launches build outputs under src-tauri/target with a fresh profile and random loopback ports. No production profile, real QR login or live platform request is used.
+Rust format, dependency audits, Clippy and test gates are followed by WASM release compilation, UI/layout regression and actual native close/tray/shutdown smoke. A failed gate returns nonzero. Native smoke copies a candidate into a fresh path containing Chinese characters and spaces under src-tauri/target, then launches it with a different working directory, an empty PATH, a fresh Unicode profile and random loopback ports. It checks branding, styles, extracted hashes, the recording process path and relative recording paths. No production profile, real QR login or live platform request is used.
 
 Install cargo-audit 0.22.2 into desktop/target/tools. Verification updates desktop/target/advisory-db online and audits all three lockfiles against the same revision; npm audit also requires network access. JSON reports retain the database commit, vulnerabilities and maintenance warnings. Vulnerabilities block the gate; maintenance warnings remain visible without advisory ignore rules. Playwright defaults to desktop/build/playwright unless PLAYWRIGHT_BROWSERS_PATH is explicitly set; use the same path when installing Chromium. A preliminary isolated headless launch checks browser availability.
 
 Test evidence is stored under desktop/tests/artifacts. Preserve logs, result JSON and final visual evidence. Recycle Bin checks use new temporary fixture files, including a locked-file test proving that a failed recycle does not fall back to permanent deletion.
 
-Media gates generate synthetic H.264/AAC TS locally. They exercise growing preview, manual/natural/segmented completion, shutdown, cancellation, output conflicts and source protection. ffprobe and decode checks validate MP4 outputs. Native smoke must actually decode live TS and converted MP4, then release players, readers and processes. FFmpeg and adjacent ffprobe are validation/runtime prerequisites but remain outside the noFF executable.
+Media gates generate synthetic H.264/AAC TS locally. They exercise growing preview, manual/natural/segmented completion, shutdown, cancellation, output conflicts and source protection. ffprobe and decode checks validate MP4 outputs. Native smoke must actually decode live TS and converted MP4 with tools extracted from the candidate EXE, then release players, readers and processes. The API preview regression also extracts the prepared payload before use and checks that an equivalent relative recording path is allowed while recording, whereas an actual root change is rejected.
 
 ## Data protection
 
-The normal user-data location is %APPDATA%\StreamCap. Downloads follow user settings. --data-dir selects an explicit profile and --api-port selects a local API port; frontend transport is initialized from the bound native address.
+The normal user-data location is %APPDATA%\StreamCap. Default recordings go to downloads beside the EXE; relative recording preferences use the same base. An absolute --data-dir selects a profile that instead becomes the base for default and relative recordings. Saving settings, guarding a root change and reading media use the same resolution rules. Absolute preferences and historical file paths are not migrated automatically; drive-relative forms such as C:captures are rejected. --api-port selects a local API port only in isolated smoke mode; frontend transport is initialized from the bound native address.
 
-Only config/default_settings.json is embedded as a recording default. Language and version data come from the native UI; legacy metadata is no longer seeded, and existing user copies are left untouched. Never package an entire user config/profile/download/backup directory. Keep the existing task and credential JSON contracts. Do not clear system WebView2 data or remove existing FFmpeg.
+The only embedded recording configuration is config/default_settings.json. Language and version data come from the native UI; legacy metadata is no longer seeded, and existing user copies are left untouched. Never package an entire user config/profile/download/backup directory. Keep the existing task and credential JSON contracts. Do not clear system WebView2 data or remove existing FFmpeg.
 
 Custom command ACL is generated by build.rs with handwritten permissions in src-tauri/permissions/desktop.toml. The native verification gate requires the former Python/Flet/Docker entrypoints to be absent. Git commits, pushes and deployment overwrites are not performed by the build scripts.
 
@@ -36,7 +40,7 @@ The retired-entry gate also rejects old fonts, macOS icons, screenshots and stat
 
 The Windows process-tree gate starts only a synthetic sleeping pwsh fixture and proves its owned descendants terminate with the Job Object. Settings regressions cover out-of-order reads, serialized appearance writes and unsaved drafts. Load regression updates five recordings among 100, 250 and 500 tasks, enforcing a one-second batch budget without replacing card nodes.
 
-.github/workflows/test.yml is the single CI entry for pushes, PRs and workflow_dispatch. All triggers run the same verification and upload evidence; only successful manual runs upload the verified noFF EXE.
+.github/workflows/test.yml is the single CI entry for pushes, PRs and workflow_dispatch. The bundle manifest participates in cache keys and cached payloads are rechecked. All triggers run the same verification and upload evidence; only successful manual runs upload StreamCap-windows-x64-withFF. Bundled licensing and source details are recorded in the extracted LICENSE/README.txt and desktop/THIRD_PARTY_NOTICES.md.
 
 Time-seek validation uses a synthetic red/blue TS larger than 600 MiB, seeks forward and backward, and decodes the first returned frame. Native smoke drags the growing-recording timeline, returns to latest, and verifies recording remains active; changing only the displayed time is not a pass.
 

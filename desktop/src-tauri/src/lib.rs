@@ -9,10 +9,12 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{Manager, RunEvent, WindowEvent};
 mod lifecycle;
 mod logging;
+include!("../../build/ffmpeg-bundle/embedded.rs");
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     if let Err(error) = run_app() {
+        log::error!("StreamCap 启动失败: {error}");
         eprintln!("StreamCap 启动失败: {error}");
         std::process::exit(1);
     }
@@ -24,10 +26,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("程序目录不可用")?
         .to_path_buf();
     let workspace = if let Some(data) = options.data_dir.clone() {
-        Workspace {
-            resource_dir: exe_dir.clone(),
-            user_data_dir: data,
-        }
+        Workspace::from_repo_root(data)
     } else {
         Workspace::for_installed(&exe_dir)?
     };
@@ -38,6 +37,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .target(env_logger::Target::Pipe(Box::new(log)))
         .try_init();
+    streamcap_core::tools::ensure_bundled_tools(&workspace, FFMPEG_BUNDLE)?;
     let state = tauri::async_runtime::block_on(streamcap_core::api::bootstrap(workspace.clone()))?;
     let theme = tauri::async_runtime::block_on(async {
         state.config.read().await.get_str("theme_mode", "light")

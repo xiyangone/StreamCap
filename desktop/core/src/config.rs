@@ -75,6 +75,9 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 pub fn validate_settings(patch: &Map<String, Value>) -> io::Result<()> {
     let invalid = |message: &str| io::Error::new(io::ErrorKind::InvalidInput, message);
+    if let Some(value) = patch.get("live_save_path") {
+        validate_recordings_path(value)?;
+    }
     for key in UNSUPPORTED_FLAGS {
         if patch.get(*key).is_some_and(|v| v != &Value::Bool(false)) {
             return Err(invalid("浏览器刷新不再触发检测，请使用手动检测或监控间隔"));
@@ -192,6 +195,12 @@ impl ConfigStore {
         disable_unimplemented(&mut default_config);
         normalize_theme_settings(&mut default_config);
         let mut persisted_user_config = read_json_object(&workspace.user_settings_path())?;
+        if let Some(path) = persisted_user_config
+            .get("live_save_path")
+            .or_else(|| default_config.get("live_save_path"))
+        {
+            validate_recordings_path(path)?;
+        }
 
         // 与 Python `init_user_config` 一致：首次运行（文件缺失或为空）时把默认设置复制为
         // 用户设置。否则设置页会读到空配置并渲染成空白表单。
@@ -346,13 +355,36 @@ impl ConfigStore {
             .collect())
     }
 
-    /// 录制输出根目录：live_save_path 优先，否则用默认目录。
+    /// 自定义相对路径与默认目录使用同一固定基准。
     pub fn recordings_root(&self) -> std::path::PathBuf {
         match self.get("live_save_path") {
-            Some(Value::String(s)) if !s.trim().is_empty() => std::path::PathBuf::from(s),
+            Some(Value::String(s)) => self.workspace.resolve_recordings_path(s),
             _ => self.workspace.default_recordings_dir(),
         }
     }
+}
+
+fn validate_recordings_path(value: &Value) -> io::Result<()> {
+    if value.is_null() {
+        return Ok(());
+    }
+    let path = value
+        .as_str()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "保存目录必须是文本"))?;
+    let parsed = Path::new(path);
+    if path.contains('\0')
+        || (!parsed.is_absolute()
+            && (parsed.has_root()
+                || parsed
+                    .components()
+                    .any(|part| matches!(part, std::path::Component::Prefix(_)))))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "保存目录须为完整绝对路径或普通相对路径，不支持依赖当前盘符的路径",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "version": "8.1.2",
+  "archiveUrl": "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-8.1.2-essentials_build.zip",
+  "archiveSha256": "db580001caa24ac104c8cb856cd113a87b0a443f7bdf47d8c12b1d740584a2ec",
+  "sourceUrl": "https://github.com/FFmpeg/FFmpeg/commit/38b88335f9",
+  "license": "GPL-3.0-or-later",
+  "files": [
+    {
+      "name": "ffmpeg.exe",
+      "archivePath": "ffmpeg-8.1.2-essentials_build/bin/ffmpeg.exe",
+      "size": 101897728,
+      "sha256": "1326dde4c84ff1f96fe6b8916c5bed29e163e9b5dccf995f6f3db069d143ec5e"
+    },
+    {
+      "name": "ffprobe.exe",
+      "archivePath": "ffmpeg-8.1.2-essentials_build/bin/ffprobe.exe",
+      "size": 101692928,
+      "sha256": "b49ccc7c6547b141ad5a2f6ec69cc04323d7133d7704d70b331b904c63eecb07"
+    },
+    {
+      "name": "LICENSE",
+      "archivePath": "ffmpeg-8.1.2-essentials_build/LICENSE",
+      "size": 35147,
+      "sha256": "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903"
+    },
+    {
+      "name": "README.txt",
+      "archivePath": "ffmpeg-8.1.2-essentials_build/README.txt",
+      "size": 41440,
+      "sha256": "9172433fb251059a58d2ff11ba8c6132e04819136ed96e809563911ff0d13816"
+    }
+  ]
+}

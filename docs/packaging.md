@@ -1,8 +1,8 @@
-# 原生 noFF 打包与验收
+# 内置 FFmpeg 的原生单 EXE 打包与验收
 
 ## 唯一发布路径
 
-当前只交付 Windows x64 的 StreamCap.exe。它内嵌前端和默认配置，不内嵌 Python、Node、FFmpeg、用户设置、账号或录制文件。运行依赖系统 WebView2 和 Microsoft Visual C++ v14 x64 运行库；常规录制需要独立的 FFmpeg，原生 FLV 直下除外。
+当前只交付 Windows x64 的 StreamCap.exe。它内嵌前端、默认配置和 FFmpeg/ffprobe 压缩载荷，不内嵌 Python、Node、用户设置、账号或录制文件。运行依赖系统 WebView2 和 Microsoft Visual C++ v14 x64 运行库；录制工具首次启动时校验释放，运行时无需下载或配置 PATH。
 
 所有命令从 desktop 目录执行。工具安装步骤见仓库 README。首次构建先用 cargo fetch --locked 为前端、core 和 src-tauri 三个 manifest 准备依赖；正式构建使用锁文件和离线模式。
 
@@ -18,21 +18,25 @@ pwsh -NoProfile -File .\scripts\build-release.ps1
 
 仅构建时，脚本先调用同一个 build-frontend.ps1，再构建 Rust shell。直接运行 npm run tauri:build 也会通过 Tauri 的 beforeBuildCommand 重建前端。三个入口不依赖旧 dist。
 
-输出目录为 desktop/src-tauri/target/native-noFF-时间戳/。已有 StreamCap.exe 不会被覆盖。交付文件是 StreamCap.exe 与 StreamCap.exe.sha256，不是安装器。
+输出目录为 desktop/src-tauri/target/native-withFF-时间戳/。已有 StreamCap.exe 不会被覆盖。交付文件是 StreamCap.exe 与 StreamCap.exe.sha256，不是安装器。
 
 ## 工具和依赖
 
 - Rust 1.95.0、wasm32-unknown-unknown、MSVC C++ 工具与 Windows SDK。
 - Node.js 24/npm 用于 Tauri API、锁定版本的 mpegts.js 本地资源和 Playwright；不会随 EXE 启动 Node。
-- FFmpeg 与同目录 ffprobe 用于生成隔离媒体夹具和校验转封装；noFF 成品不捆绑这两个工具。
+- FFmpeg 8.1.2 与同目录 ffprobe 来自固定 Gyan Windows essentials 包，同时用于隔离媒体夹具和发布 EXE。`ffmpeg-bundle.json` 固定来源、压缩包 SHA-256、两个工具及 LICENSE/README.txt 的大小与 SHA-256。
 - Trunk 0.21.14、wasm-bindgen-cli 0.2.129 安装在 desktop/target/tools。升级 wasm-bindgen 库时必须同步项目本地 CLI，构建时会检查版本。
 - cargo-audit 0.22.2 同样安装在 desktop/target/tools。首次审计联网更新 desktop/target/advisory-db，三份锁文件使用同一数据库版本；npm audit 也需要网络。审计 JSON 和数据库提交号保留在验收目录，已知漏洞阻断验收，维护状态警告单独保留，不自动忽略漏洞。
 - Playwright 浏览器默认使用 desktop/build/playwright，可通过进程级 PLAYWRIGHT_BROWSERS_PATH 明确指定。安装浏览器时使用相同路径；验收会先启动并关闭一次无页面的隔离 Chromium，缺少浏览器会明确失败。
 - Tauri 命令权限自动文件由 build.rs 生成，不手动维护；手写权限在 src-tauri/permissions/desktop.toml。
 
+`prepare-ffmpeg.ps1` 只在构建机下载固定包，逐项验证后生成 `build/ffmpeg-bundle/<SHA-256>.bundle.zip` 和相对引用它的 `embedded.rs`。缓存完整时支持 `-Offline`，校验失败直接阻断构建，保留证据；更换源码目录不需要修改生成文件里的绝对路径。前端构建、发布脚本及完整验收共用这一准备入口。
+
+桌面启动先从 EXE 释放到 `%APPDATA%\StreamCap\runtime\ffmpeg\<SHA-256>`，显式 `--data-dir` 时使用对应 profile。校验已有缓存后复用；并发启动按版本加锁，只在全部文件通过校验后发布缓存目录。失败不启用半成品，不覆盖旧缓存或用户自管工具，不搜索 PATH。缓存损坏时按错误中给出的精确目录处理后重启，不清空整个用户目录。
+
 ## 验收隔离
 
-native-smoke.ps1 只接受项目 src-tauri/target 内的构建产物，使用新建的数据目录、随机 API/CDP 端口和自己的 WebView2 profile，不启动已部署的程序。源码测试使用模拟平台，本流程不重新扫码或访问真实直播间。
+native-smoke.ps1 只接受项目 src-tauri/target 内的构建产物，将其复制到该目录内新的中文、空格安装路径，以不同工作目录、空 PATH、新建中文数据目录和随机 API/CDP 端口启动。验收核对图标、样式、释放文件哈希、实际 FFmpeg 进程路径及相对录像目录，不启动已部署的程序。源码测试使用模拟平台，本流程不重新扫码或访问真实直播间。
 
 媒体门禁生成合成 H.264/AAC TS，检查增量预览、手动停止、自然结束、分段和退出后的转换；ffprobe 与解码校验必须通过。原生窗口必须实际播放录中的 TS 和生成的 MP4，关闭后播放器/连接/子进程不得残留。取消、损坏输入、同名输出及文件保护均有回归，不以“播放器容器显示正常”替代实际播放。
 
@@ -40,9 +44,9 @@ native-smoke.ps1 只接受项目 src-tauri/target 内的构建产物，使用新
 
 ## 用户数据保护
 
-默认用户目录为 %APPDATA%\StreamCap，下载路径由用户配置决定。--data-dir 可以显式指定独立数据目录；--api-port 可以指定本地端口，前端地址由原生启动配置注入。
+默认用户目录为 %APPDATA%\StreamCap。默认录像目录为 EXE 同目录的 downloads，自定义相对录像路径也以 EXE 目录为基准；绝对 --data-dir 显式指定独立数据目录时，默认和相对录像目录均基于该 profile。保存偏好、切换目录前的录制保护和运行期读取使用同一解析规则。绝对录像路径及历史记录不自动迁移；盘符相对路径（如 C:captures）被拒绝。--api-port 仅在隔离验收模式指定本地端口，前端地址由原生启动配置注入。
 
-不得整目录打包根 config、用户 profile、下载目录或旧备份。编译仅内嵌 config/default_settings.json；语言与版本使用原生界面数据，不再播种旧版语言/版本元数据。已有用户目录中的这些文件仍保留，任务与 Cookie 的持久化契约不变。不要清空系统 WebView2 数据，也不要因发布 noFF 而移除用户已有 FFmpeg。
+不得整目录打包根 config、用户 profile、下载目录或旧备份。配置文件仅内嵌 config/default_settings.json；语言与版本使用原生界面数据，不再播种旧版语言/版本元数据。已有用户目录中的这些文件仍保留，任务与 Cookie 的持久化契约不变。不要清空系统 WebView2 数据，也不要移除用户已有 FFmpeg。
 
 向现有安装位置替换 EXE、提交 Git 或推送不属于构建脚本行为。
 
@@ -52,14 +56,14 @@ native-smoke.ps1 只接受项目 src-tauri/target 内的构建产物，使用新
 - 全录制格式分别验证普通与分段文件；同时覆盖 TS 清理、失败保留、锁定源文件、队列重启恢复、时间字幕、FLV 原生直下及兼容/直播源预览。
 - UI 测试运行真正的发布 WASM，模拟账号/工具/关机端点，验证账号读写期间的草稿与凭据保护、更新链接、截图、删源后切换播放器、语言切换、快捷键和页面恢复。真实通知、关机及用户脚本不在自动验收中执行。
 - Windows 脚本进程树门禁仅启动合成的 pwsh 睡眠进程，校验关闭 Job Object 后父子进程均退出，不执行用户脚本。
-- 原生关闭/托盘 smoke 使用新数据目录。noFF 只保留一条 Rust 后端路径，不启动 Python 或 Node。
+- 原生关闭/托盘 smoke 使用新数据目录；录制、转封装和预览使用从 EXE 释放的同一版本工具，只保留一条 Rust 后端路径，不启动 Python 或 Node。
 - 设置竞态回归覆盖乱序读取、串行外观保存和未保存草稿；列表负载回归在 100、250、500 个任务中更新五路进度，校验单轮一秒预算和卡片身份不变。
 - 录后脚本回归覆盖同名再次录制、转换失败、关闭转换和分段部分成功；脚本只接收当前录制对应的文件。
 - 退役入口检查同时禁止旧字体、旧 macOS 图标、旧截图和静态语言/版本文件重新进入仓库；保留品牌 SVG 母版及现用运行资源、许可证。
 
 需要指定候选输出目录时，运行 `scripts/verify-native.ps1 -OutputDirectory <绝对目录>`。目录必须位于 desktop/src-tauri/target 内，且不能覆盖已有候选 EXE。
 
-CI 统一使用 .github/workflows/test.yml，支持 push、PR 和 workflow_dispatch。各入口执行同一验收脚本并上传证据；只有手动运行且验收成功时上传 noFF EXE，不额外保留第二条构建工作流。
+CI 统一使用 .github/workflows/test.yml，支持 push、PR 和 workflow_dispatch。各入口执行同一验收脚本并上传证据；工具清单参与缓存键，构建缓存命中后仍校验载荷。只有手动运行且验收成功时上传 StreamCap-windows-x64-withFF，不额外保留第二条构建工作流。随包 GPL v3 许可证和上游源码/构建说明见释放目录内的 LICENSE、README.txt 及项目 THIRD_PARTY_NOTICES.md。
 
 按时间预览门禁使用超过 600 MiB 的合成红/蓝 TS，直接跳到后段再跳回前段，并解码首帧核对画面。原生窗口用鼠标拖动录中进度条、返回最新位置，并确认录制未停止；只更新界面数字不能视为通过。
 

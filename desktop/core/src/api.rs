@@ -36,7 +36,6 @@ pub struct ApiState {
     pub recording_enabled: Arc<AtomicBool>,
     pub storage: crate::storage::Storage,
     pub preview: crate::preview::Preview,
-    pub tools: crate::tools::Tools,
 }
 
 pub fn router(state: ApiState) -> Router {
@@ -71,7 +70,6 @@ pub fn router(state: ApiState) -> Router {
             post(save_screenshot).layer(axum::extract::DefaultBodyLimit::max(12 * 1024 * 1024)),
         )
         .route("/api/tools/status", get(tools_status))
-        .route("/api/tools/install", post(install_tools))
         .route("/api/tools/update", get(check_update))
         .route("/api/accounts", get(account_summaries).put(save_account))
         .route("/api/automation/shutdown", post(schedule_shutdown))
@@ -818,7 +816,7 @@ async fn update_settings(
             let next = value
                 .as_str()
                 .filter(|path| !path.trim().is_empty())
-                .map(std::path::PathBuf::from)
+                .map(|path| config.workspace().resolve_recordings_path(path))
                 .unwrap_or_else(|| config.workspace().default_recordings_dir());
             let same = current == next
                 || current
@@ -1068,12 +1066,8 @@ async fn tools_status(State(state): State<ApiState>) -> Json<Value> {
     let config = state.config.read().await;
     let path = crate::paths::find_ffmpeg(config.workspace());
     Json(
-        json!({"installation":state.tools.status(),"ffmpegReady":path.is_some(),"ffprobeReady":path.as_ref().is_some_and(|p|crate::paths::adjacent_ffprobe(p).is_some())}),
+        json!({"bundled":true,"version":crate::tools::bundle_version(),"ffmpegReady":path.is_some(),"ffprobeReady":path.as_ref().is_some_and(|p|crate::paths::adjacent_ffprobe(p).is_some())}),
     )
-}
-async fn install_tools(State(state): State<ApiState>) -> ApiResult {
-    state.tools.install().map_err(ApiError::bad_request)?;
-    Ok(Json(json!({"ok":true})))
 }
 async fn check_update() -> Result<Json<crate::tools::UpdateCheck>, ApiError> {
     let release = crate::tools::check_update()
@@ -1471,7 +1465,6 @@ pub async fn bootstrap_with_resolver(
         recording_enabled.clone(),
     ));
 
-    let tools = crate::tools::Tools::new(workspace.clone());
     let preview = crate::preview::Preview::new(engine.clone(), resolver.cancellation());
     Ok(ApiState {
         store,
@@ -1480,7 +1473,6 @@ pub async fn bootstrap_with_resolver(
         scheduler,
         storage: crate::storage::Storage::new(resolver.cancellation()),
         preview,
-        tools,
         resolver,
         workspace,
         recording_enabled,
@@ -1500,7 +1492,6 @@ pub async fn shutdown(state: &ApiState) -> std::io::Result<()> {
     );
     state.scheduler.finish_background().await;
     state.preview.shutdown().await;
-    state.tools.shutdown().await;
     state.storage.shutdown().await;
     for rec in state.store.all().await {
         state

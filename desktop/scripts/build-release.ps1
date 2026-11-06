@@ -1,10 +1,10 @@
-# Native noFF build: one directly runnable StreamCap.exe; never packages Python or user data.
+# One directly runnable EXE with verified FFmpeg/ffprobe and bundled UI assets.
 param([string]$OutputDirectory)
 $ErrorActionPreference = 'Stop'
 $desktop = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $env:NO_COLOR = 'true'
 if (-not $OutputDirectory) {
-    $OutputDirectory = Join-Path $desktop ('src-tauri\target\native-noFF-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    $OutputDirectory = Join-Path $desktop ('src-tauri\target\native-withFF-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
 }
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
 $allowed = [IO.Path]::GetFullPath((Join-Path $desktop 'src-tauri\target')) + [IO.Path]::DirectorySeparatorChar
@@ -20,6 +20,6 @@ try {
     [IO.File]::Copy((Join-Path $desktop 'src-tauri\target\release\streamcap-tauri.exe'),$exe,$false)
     $hash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
     [IO.File]::WriteAllText("$exe.sha256", "$hash  StreamCap.exe" + [Environment]::NewLine,[Text.UTF8Encoding]::new($false))
-    Write-Host "Native noFF executable: $exe"
+    Write-Host "Native executable with bundled FFmpeg/ffprobe: $exe"
     Write-Output $exe
 } finally { Pop-Location }

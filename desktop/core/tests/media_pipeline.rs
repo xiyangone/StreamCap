@@ -620,10 +620,25 @@ async fn media_failed_input_preserves_original_and_removes_only_own_temporary_fi
 }
 
 #[tokio::test]
-#[ignore = "requires STREAMCAP_TEST_FFMPEG; verifies growing local preview and manual stop conversion"]
+#[ignore = "requires prepared bundled tools and STREAMCAP_TEST_FFMPEG; growing local preview and manual stop conversion"]
 async fn media_recording_preview_follows_growth_then_stop_converts_to_mp4() {
     let directory = tempfile::tempdir().unwrap();
+    let workspace = Workspace::from_repo_root(directory.path());
+    workspace.ensure_ready().unwrap();
+    let bundled = streamcap_core::tools::bundled_directory(&workspace);
+    let payload = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../build/ffmpeg-bundle")
+        .join(format!(
+            "{}.bundle.zip",
+            bundled.file_name().unwrap().to_str().unwrap()
+        ));
+    streamcap_core::tools::ensure_bundled_tools(&workspace, &std::fs::read(payload).unwrap())
+        .unwrap();
     let state = state(directory.path(), true).await;
+    assert_eq!(
+        streamcap_core::paths::find_ffmpeg(&workspace),
+        Some(bundled.join("ffmpeg.exe"))
+    );
     let source = source(sample_ts("12").await).await;
     add(&state, source.url.clone(), false).await;
     let server = Server::start(
@@ -651,6 +666,29 @@ async fn media_recording_preview_follows_growth_then_stop_converts_to_mp4() {
     .unwrap();
     let path = file.file_name().unwrap().to_string_lossy();
     let client = reqwest::Client::new();
+    let same_root = client
+        .put(format!("http://{}/api/settings", server.address()))
+        .json(&json!({"userConfig":{"live_save_path":"downloads"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        same_root.status(),
+        200,
+        "同一目录的相对写法不应被当成录制中的目录切换"
+    );
+    let settings_before = std::fs::read(workspace.user_settings_path()).unwrap();
+    let changed_root = client
+        .put(format!("http://{}/api/settings", server.address()))
+        .json(&json!({"userConfig":{"live_save_path":"other-recordings"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(changed_root.status(), 409, "录制中仍须拒绝真正的目录切换");
+    assert_eq!(
+        std::fs::read(workspace.user_settings_path()).unwrap(),
+        settings_before
+    );
     let info: serde_json::Value = client
         .get(format!("http://{}/api/media/info", server.address()))
         .query(&[("path", path.as_ref())])

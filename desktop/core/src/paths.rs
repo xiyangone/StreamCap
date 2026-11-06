@@ -15,14 +15,14 @@ pub const USER_OWNED_FILES: &[&str] = &[
 
 #[derive(Debug, Clone)]
 pub struct Workspace {
-    /// 程序资源根；默认配置已编译进 EXE。
+    /// 默认录制基准；界面资源与默认配置已编译进 EXE。
     pub resource_dir: PathBuf,
     /// 可写的用户数据目录
     pub user_data_dir: PathBuf,
 }
 
 impl Workspace {
-    /// 开发态：以当前工作目录（仓库根）为资源与数据目录，与 Python 非冻结模式一致。
+    /// 仓库或显式数据目录：默认与相对录像路径均以传入目录为基准。
     pub fn from_repo_root(root: impl AsRef<Path>) -> Self {
         let root = root.as_ref().to_path_buf();
         Self {
@@ -65,13 +65,25 @@ impl Workspace {
         self.config_dir().join("cookies.json")
     }
 
-    /// 默认录制输出目录，与 Python 的 default_recordings_dir 一致。
+    /// 默认输出随安装目录移动；显式数据目录保持隔离。
     pub fn default_recordings_dir(&self) -> PathBuf {
+        self.recordings_base_dir().join("downloads")
+    }
+
+    fn recordings_base_dir(&self) -> &Path {
         if self.is_installed_profile() {
-            self.resource_dir.join("downloads")
+            &self.resource_dir
         } else {
-            self.user_data_dir.join("downloads")
+            &self.user_data_dir
         }
+    }
+
+    /// 相对路径始终基于安装目录（或显式 profile），不依赖进程工作目录。
+    pub fn resolve_recordings_path(&self, configured: &str) -> PathBuf {
+        if configured.trim().is_empty() {
+            return self.default_recordings_dir();
+        }
+        self.recordings_base_dir().join(configured)
     }
 
     pub(crate) fn is_installed_profile(&self) -> bool {
@@ -117,26 +129,18 @@ impl Workspace {
     }
 }
 
-/// 启动时发现工具；后台工作使用已确定的路径，不隐式重新搜索 PATH。
+/// 桌面启动先校验释放内置工具；运行期不搜索当前目录或 PATH。
 pub fn find_ffmpeg(workspace: &Workspace) -> Option<PathBuf> {
-    let configured = which_in_path("ffmpeg.exe").or_else(|| which_in_path("ffmpeg"));
-    configured_ffmpeg(workspace, configured.as_deref())
+    configured_ffmpeg(workspace, None)
 }
 
-/// 新安装的应用内工具优先于启动路径；显式 None 保持不可用。
+/// 优先使用本版本工具；核心调用者可显式注入验证工具。
 pub fn configured_ffmpeg(workspace: &Workspace, configured: Option<&Path>) -> Option<PathBuf> {
-    let bundled = workspace.user_data_dir.join("ffmpeg").join("ffmpeg.exe");
-    if bundled.is_file() {
+    let bundled = crate::tools::bundled_directory(workspace).join("ffmpeg.exe");
+    if bundled.is_file() && adjacent_ffprobe(&bundled).is_some() {
         return Some(bundled);
     }
     configured.map(Path::to_path_buf)
-}
-
-fn which_in_path(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(name))
-        .find(|candidate| candidate.is_file())
 }
 
 #[cfg(test)]
@@ -144,7 +148,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn configured_tools_preserve_explicit_unavailability_and_allow_a_local_install() {
+    fn bundled_tools_require_a_pair_and_preserve_explicit_test_injection() {
         let directory = tempfile::tempdir().unwrap();
         let workspace = Workspace::from_repo_root(directory.path());
         assert_eq!(configured_ffmpeg(&workspace, None), None);
@@ -153,14 +157,44 @@ mod tests {
             configured_ffmpeg(&workspace, Some(&configured)),
             Some(configured.clone())
         );
-        let installed = workspace.user_data_dir.join("ffmpeg/ffmpeg.exe");
+        let installed = crate::tools::bundled_directory(&workspace).join("ffmpeg.exe");
         std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
         std::fs::write(&installed, b"fixture only").unwrap();
+        assert_eq!(find_ffmpeg(&workspace), None);
+        std::fs::write(installed.with_file_name("ffprobe.exe"), b"fixture only").unwrap();
         assert_eq!(
             configured_ffmpeg(&workspace, Some(&configured)),
             Some(installed.clone())
         );
         assert_eq!(configured_ffmpeg(&workspace, None), Some(installed));
+    }
+
+    #[test]
+    fn relative_recording_paths_follow_the_workspace_and_absolute_paths_stay_explicit() {
+        let first = Workspace::for_installed("H:/apps/StreamCap").unwrap();
+        let moved = Workspace::for_installed("E:/中文 目录/StreamCap").unwrap();
+        assert_eq!(
+            first.resolve_recordings_path("captures"),
+            first.resource_dir.join("captures")
+        );
+        assert_eq!(
+            moved.resolve_recordings_path("captures"),
+            moved.resource_dir.join("captures")
+        );
+        let selected = std::env::temp_dir().join("explicit-recordings");
+        assert_eq!(
+            moved.resolve_recordings_path(selected.to_str().unwrap()),
+            selected
+        );
+        let profile = Workspace::from_repo_root(std::env::temp_dir().join("isolated-profile"));
+        assert_eq!(
+            profile.resolve_recordings_path("相对 目录"),
+            profile.user_data_dir.join("相对 目录")
+        );
+        assert_eq!(
+            profile.resolve_recordings_path(""),
+            profile.default_recordings_dir()
+        );
     }
 
     #[test]
@@ -189,6 +223,20 @@ mod tests {
         assert_eq!(
             ws.default_recordings_dir(),
             PathBuf::from("E:/isolated-profile/downloads")
+        );
+    }
+
+    #[test]
+    fn explicitly_selecting_the_normal_profile_still_uses_it_as_the_recording_base() {
+        let directory = dirs::config_dir().unwrap().join(APP_NAME);
+        let workspace = Workspace::from_repo_root(&directory);
+        assert_eq!(
+            workspace.default_recordings_dir(),
+            directory.join("downloads")
+        );
+        assert_eq!(
+            workspace.resolve_recordings_path("captures"),
+            directory.join("captures")
         );
     }
 

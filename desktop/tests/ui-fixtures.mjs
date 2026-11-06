@@ -11,6 +11,7 @@ import { promisify } from 'node:util';
 
 const desktop = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const apiContracts = JSON.parse(await readFile(join(desktop, 'tests/api-contracts.json'), 'utf8'));
+const ffmpegBundle = JSON.parse(await readFile(join(desktop, 'ffmpeg-bundle.json'), 'utf8'));
 const dist = join(desktop, 'dist');
 const apiOrigin = 'http://127.0.0.1:6059';
 let mediaSequence = 0;
@@ -64,7 +65,8 @@ function initialState({ empty = false, offline = false } = {}) {
     recordings: empty ? [] : seedRecordings(), userConfig: {}, defaultConfig: structuredClone(defaults),
     cookies: { douyin: 'fixture-douyin-not-a-credential', bilibili: 'fixture-bilibili-not-a-credential' },
     offline, resolverReady: true, requests: [], unexpected: [], nextId: 7, mediaJobs: [], previewLive: false, activePreviews: 0, maxActivePreviews: 0, previewStarts: [],
-    failures: [], delays: [], qrPhase: 'waiting', qrCancelled: 0, accounts: {}, quickShutdown: null, installation: {state:'idle',message:'FFmpeg 与 ffprobe 已就绪',bytes:0},
+    failures: [], delays: [], qrPhase: 'waiting', qrCancelled: 0, accounts: {}, quickShutdown: null,
+    tools: { bundled: true, version: ffmpegBundle.version, ffmpegReady: true, ffprobeReady: true },
     native: { maximized: false, visible: true, closing: false, trayAvailable: true, pending: false, calls: [], failRemember: false, systemShutdown:false, shutdownSeconds:null },
     files: [
       { name: '云间电台', isDir: true, size: 734003200, path: '云间电台', modified: sampleDate },
@@ -310,8 +312,7 @@ export async function createHarness(label, options = {}) {
         await waitForResponseGate('accountRead');
         json(res, snapshot); return;
       }
-      if(path==='/api/tools/status'){json(res,{ffmpegReady:true,ffprobeReady:true,installation:state.installation});return;}
-      if(path==='/api/tools/install'){state.installation={state:'complete',message:'FFmpeg 与 ffprobe 已就绪',bytes:0};json(res,{ok:true});return;}
+      if(path==='/api/tools/status'){json(res,state.tools);return;}
       if(path==='/api/tools/update'){json(res,apiContracts.updateCheck);return;}
       if(path==='/api/automation/shutdown'){state.quickShutdown=body.hours??null;json(res,{ok:true});return;}
       if(path==='/api/media/screenshot'){assert.ok(Buffer.from(body.pngBase64,'base64').subarray(0,8).equals(Buffer.from([137,80,78,71,13,10,26,10])));json(res,{path:'fixture-screenshot.png'});return;}

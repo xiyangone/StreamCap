@@ -1,6 +1,6 @@
 # StreamCap 原生桌面版
 
-StreamCap 使用 **Rust + Tauri 2 + Leptos/WASM**，当前交付目标为 **Windows x64 noFF 单 EXE**。后端解析、任务管理、配置与调度均在 Rust 进程中运行，不安装或启动 Python/Flet/Node 服务。
+StreamCap 使用 **Rust + Tauri 2 + Leptos/WASM**，当前交付目标为 **Windows x64 单 EXE，内含 FFmpeg 与 ffprobe**。后端解析、任务管理、配置与调度均在 Rust 进程中运行，不安装或启动 Python/Flet/Node 服务。
 
 ## 当前能力
 
@@ -12,18 +12,18 @@ StreamCap 使用 **Rust + Tauri 2 + Leptos/WASM**，当前交付目标为 **Wind
 - 任务卡显示读取、转封装、音视频核对和完整性校验阶段，优先显示正在处理的分段。总览与媒体库采用无右侧信息栏的全宽布局；媒体库专注文件浏览，并提供始终保留源 TS 的手动转换。
 - 原生通知、钉钉、企业微信、飞书、Bark、ntfy、Server酱、Telegram、SMTP 邮件，以及有超时/退出保护的录后脚本。
 - 定时/倒计时关机，60 秒可取消提示；先停止录制并等待媒体收尾，不强制关闭其他应用。
-- 一体化标题栏、关闭确认/退出/托盘偏好、目录选择、中文/英文切换、快捷键与页面恢复；显式更新检查及 FFmpeg 安装引导。
+- 一体化标题栏、关闭确认/退出/托盘偏好、目录选择、中文/英文切换、快捷键与页面恢复；显式更新检查及内置录制工具状态。
 
 当前只维护 Rust 原生版。旧 Python/Flet、Docker Web 和旧 macOS 打包入口已退役。新增或恢复监控的直播间会先检测一次，后续各自按配置间隔检查，并遵守平台节流。浏览器刷新不触发直播检测，以免因反复刷新造成平台限流。
 
 ## 运行要求
 
 - Windows 10/11 x64，系统 Microsoft Edge WebView2 Runtime，以及 Microsoft Visual C++ v14 x64 运行库（VCRUNTIME140.dll / VCRUNTIME140_1.dll）。
-- noFF 不捆绑 FFmpeg；普通录制使用用户数据目录下的 FFmpeg，其次 PATH。转 MP4、时间字幕和兼容预览还需要 FFmpeg/同目录 ffprobe。FLV 直下不启动 FFmpeg，但必须选择 FLV 并关闭分段。
-- 设置中的安装工具会显式下载 Gyan Windows 包、验证 SHA-256，并仅提取 FFmpeg/ffprobe 到应用数据目录；不改 PATH、不覆盖已有工具。
+- EXE 内置固定版本的 Gyan FFmpeg 8.1.2 与 ffprobe，用于录制、转 MP4、时间字幕及兼容预览，无需另行安装或配置 PATH。FLV 直下不启动 FFmpeg，但必须选择 FLV 并关闭分段。
+- 启动时校验并释放两个工具、许可证和来源说明到用户数据目录的 `runtime/ffmpeg/<压缩包 SHA-256>/`。首次启动需要解压空间；后续启动校验并复用缓存，运行时不下载工具。缓存损坏会明确报错，不覆盖已有文件或使用其他来源的工具。
 - 运行发行 EXE 不需要 Python、Node、Rust 开发工具。WebView2 和录制时的 FFmpeg 子进程属于正常运行依赖。
 
-用户数据默认位于 %APPDATA%\StreamCap，已有任务、Cookie、账号与设置不会被发行文件覆盖。下载位置遵循用户设置。
+用户数据默认位于 %APPDATA%\StreamCap，已有任务、Cookie、账号与设置不会被发行文件覆盖。默认录像目录为 EXE 同目录的 `downloads`；自定义相对路径也以 EXE 目录为基准。使用绝对 `--data-dir` 时，默认和相对录像路径均以该数据目录为基准，不受启动工作目录影响。已保存的绝对录像路径保持原样；搬动旧录像后需在设置中选定新位置，不自动改写历史路径。
 
 ## 预览与转 MP4
 
@@ -67,8 +67,10 @@ npm run tauri:dev
 
 构建脚本检查项目本地 wasm-bindgen CLI 与前端锁文件一致；缺少工具或版本不符会明确报错，不静默切换运行方案。
 
+构建时由 `scripts/prepare-ffmpeg.ps1` 按 `ffmpeg-bundle.json` 下载固定 Gyan 压缩包，校验整个包及四个内嵌文件的 SHA-256，生成项目 `build/ffmpeg-bundle` 下的工具和压缩载荷。下载只发生在构建机；缓存完整时可用 `pwsh -NoProfile -File .\scripts\prepare-ffmpeg.ps1 -Offline` 离线复核。
+
 ```powershell
-# 完整验证并生成 noFF EXE（首次测试须先安装 Playwright Chromium）
+# 完整验证并生成带 FFmpeg 的 EXE（首次测试须先安装 Playwright Chromium）
 $env:PLAYWRIGHT_BROWSERS_PATH = Join-Path (Get-Location) 'build/playwright'
 npx playwright install chromium
 npm run verify
@@ -77,7 +79,7 @@ npm run verify
 pwsh -NoProfile -File .\scripts\build-release.ps1
 ```
 
-产物：desktop/src-tauri/target/native-noFF-*/StreamCap.exe 和 StreamCap.exe.sha256。不生成安装器，不打包用户配置、Cookie 或下载文件。验证包含三份 Cargo.lock 与 npm 的联网依赖审计，审计失败会阻断后续构建；报告保留已知漏洞与维护状态警告，不把两者混为一谈。CI 在同一个 Native validation 工作流中处理 push、PR 与手动运行，仅手动运行上传验证后的 EXE。详细说明见 [打包与验收](docs/packaging.md)。
+产物：desktop/src-tauri/target/native-withFF-*/StreamCap.exe 和 StreamCap.exe.sha256。不生成安装器，不打包用户配置、Cookie 或下载文件。验证包含三份 Cargo.lock 与 npm 的联网依赖审计，审计失败会阻断后续构建；报告保留已知漏洞与维护状态警告，不把两者混为一谈。CI 在同一个 Native validation 工作流中处理 push、PR 与手动运行，仅手动运行上传验证后的 `StreamCap-windows-x64-withFF` 产物。详细说明见 [打包与验收](docs/packaging.md)。
 
 ## 数据与安全
 
@@ -89,4 +91,4 @@ pwsh -NoProfile -File .\scripts\build-release.ps1
 
 ## 许可
 
-项目许可见 [LICENSE](LICENSE)，移植算法与依赖声明见 [第三方许可](desktop/THIRD_PARTY_NOTICES.md)。
+项目许可见 [LICENSE](LICENSE)，移植算法与依赖声明见 [第三方许可](desktop/THIRD_PARTY_NOTICES.md)。随包 FFmpeg/ffprobe 保留 GPL v3 许可；对应许可证、上游源码地址和构建配置随工具释放，固定来源及文件校验值见 [工具清单](desktop/ffmpeg-bundle.json)。

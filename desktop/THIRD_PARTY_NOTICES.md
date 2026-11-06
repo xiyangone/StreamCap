@@ -1,5 +1,24 @@
 # Third-party notices
 
+## Bundled FFmpeg and ffprobe 8.1.2
+
+The Windows EXE includes the unmodified `ffmpeg.exe` and `ffprobe.exe` from
+[Gyan's FFmpeg 8.1.2 essentials build](https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-8.1.2-essentials_build.zip).
+Copyright (c) the FFmpeg developers and the respective bundled-library authors.
+This distribution identifies its license as GPL v3. FFmpeg and ffprobe run as
+separate recording and media-processing programs.
+
+The original GPL license (`LICENSE`) and Gyan source/build notice (`README.txt`)
+are embedded in full and extracted alongside the executables under
+`runtime/ffmpeg/<archive SHA-256>/` in the selected user-data directory. The
+notice identifies [FFmpeg source revision 38b88335f9](https://github.com/FFmpeg/FFmpeg/commit/38b88335f9)
+and the enabled libraries/build configuration. Archive SHA-256:
+`db580001caa24ac104c8cb856cd113a87b0a443f7bdf47d8c12b1d740584a2ec`.
+Individual file hashes and the pinned download/source URLs are recorded in
+`ffmpeg-bundle.json`; preparation and startup verify the extracted file contents.
+Redistribution must retain these notices and satisfy the GPL corresponding-source
+requirements for FFmpeg and its included libraries.
+
 ## UI component system
 
 daisyUI 5.7.47, Copyright (c) 2020 Pouya Saadeghi, and Tailwind CSS 4.3.3,

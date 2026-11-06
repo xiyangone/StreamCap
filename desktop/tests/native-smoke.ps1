@@ -12,8 +12,18 @@ if($artifactRoot -ne $allowedArtifacts -and -not $artifactRoot.StartsWith($allow
 [IO.Directory]::CreateDirectory($artifactRoot)|Out-Null
 $run = Join-Path $artifactRoot ('native-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [Guid]::NewGuid().ToString('N').Substring(0,6))
 if (Test-Path -LiteralPath $run) {throw 'Smoke output collision'}
-$profile = Join-Path $run 'data'
+$profile = Join-Path $run '数据 data 中文'
 [IO.Directory]::CreateDirectory($profile) | Out-Null
+$working = Join-Path $run '启动目录 中文 # 空格'
+[IO.Directory]::CreateDirectory($working) | Out-Null
+$sourceExecutable = $Executable
+$candidateDirectory = [IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $Executable) ('迁移目录 中文 # ' + [Guid]::NewGuid().ToString('N'))))
+if (-not $candidateDirectory.StartsWith($targetRoot,[StringComparison]::OrdinalIgnoreCase) -or (Test-Path -LiteralPath $candidateDirectory)) {throw 'Use a fresh relocation directory inside the project target'}
+[IO.Directory]::CreateDirectory($candidateDirectory) | Out-Null
+$Executable = Join-Path $candidateDirectory 'StreamCap.exe'
+[IO.File]::Copy($sourceExecutable,$Executable,$false)
+$candidateHash = (Get-FileHash -LiteralPath $Executable -Algorithm SHA256).Hash
+if ($candidateHash -ne (Get-FileHash -LiteralPath $sourceExecutable -Algorithm SHA256).Hash) {throw 'Relocated executable differs from the candidate'}
 $temp = Join-Path $run 'tmp'; [IO.Directory]::CreateDirectory($temp) | Out-Null
 $testFfmpeg=if($env:STREAMCAP_TEST_FFMPEG){$env:STREAMCAP_TEST_FFMPEG}else{(Get-Command ffmpeg -ErrorAction Stop).Source}
 $mediaDirectory=Join-Path $profile 'downloads';[IO.Directory]::CreateDirectory($mediaDirectory)|Out-Null
@@ -22,9 +32,18 @@ if($LASTEXITCODE -ne 0){throw 'Synthetic native preview fixture failed'}
 $stdout = Join-Path $run 'app.stdout.log'; $stderr = Join-Path $run 'app.stderr.log'
 $debugListener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0)
 $debugListener.Start(); $debugPort = $debugListener.LocalEndpoint.Port; $debugListener.Stop()
-$arguments = @('--data-dir',('"' + $profile + '"'),'--api-port','0','--smoke-seconds','120')
-$environment = @{TEMP=$temp;TMP=$temp;WEBVIEW2_USER_DATA_FOLDER=(Join-Path $profile 'webview');PATH=([IO.Path]::GetDirectoryName($testFfmpeg)+';'+$env:PATH);WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS="--remote-debugging-port=$debugPort --remote-debugging-address=127.0.0.1"}
-$process = Start-Process -FilePath $Executable -ArgumentList $arguments -WorkingDirectory $run -PassThru -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -Environment $environment
+$arguments = @('--data-dir',$profile,'--api-port','0','--smoke-seconds','120')
+$environment = @{TEMP=$temp;TMP=$temp;WEBVIEW2_USER_DATA_FOLDER=(Join-Path $profile 'webview');PATH='';WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS="--remote-debugging-port=$debugPort --remote-debugging-address=127.0.0.1"}
+# ProcessStartInfo preserves an actually empty child PATH on Windows.
+$startInfo = [Diagnostics.ProcessStartInfo]::new()
+$startInfo.FileName=$Executable;$startInfo.WorkingDirectory=$working
+$startInfo.UseShellExecute=$false;$startInfo.CreateNoWindow=$true
+$startInfo.RedirectStandardOutput=$true;$startInfo.RedirectStandardError=$true
+foreach ($argument in $arguments) {$startInfo.ArgumentList.Add($argument)}
+foreach ($entry in $environment.GetEnumerator()) {$startInfo.Environment[$entry.Key]=[string]$entry.Value}
+$process = [Diagnostics.Process]::Start($startInfo)
+$stdoutRead = $process.StandardOutput.ReadToEndAsync()
+$stderrRead = $process.StandardError.ReadToEndAsync()
 $owned = @{}
 $probeProcess = $null
 $rootIdentity = $null
@@ -52,11 +71,20 @@ try {
     $base = 'http://' + $ready.address
     $status = Invoke-RestMethod -Uri "$base/api/status" -TimeoutSec 3
     if ($status.resolverMode -ne 'native' -or $status.totalRecordings -ne 0 -or -not $status.resolverReady) {throw 'Native status contract failed'}
+    $manifest = Get-Content -LiteralPath (Join-Path $desktop 'ffmpeg-bundle.json') -Raw | ConvertFrom-Json
+    $toolStatus = Invoke-RestMethod -Uri "$base/api/tools/status" -TimeoutSec 3
+    if (-not $toolStatus.bundled -or -not $toolStatus.ffmpegReady -or -not $toolStatus.ffprobeReady -or $toolStatus.version -ne $manifest.version) {throw 'Embedded recording tools are not ready without PATH'}
+    $runtimeTools = Join-Path $profile ('runtime/ffmpeg/' + $manifest.archiveSha256)
+    foreach ($spec in $manifest.files) {
+        $extracted = Get-Item -LiteralPath (Join-Path $runtimeTools $spec.name) -Force
+        if ($extracted.PSIsContainer -or ($extracted.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $extracted.Length -ne $spec.size -or
+            (Get-FileHash -LiteralPath $extracted.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -cne $spec.sha256) {throw "Embedded file verification failed: $($spec.name)"}
+    }
     $debugOwner = $null
     for ($i=0;$i -lt 40;$i++) {
         Update-OwnedProcesses
         $debugOwner=Get-NetTCPConnection -State Listen -LocalPort $debugPort -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($debugOwner) {break}
+        if ($debugOwner -and $owned.ContainsKey([int]$debugOwner.OwningProcess)) {break}
         Start-Sleep -Milliseconds 100
     }
     if (-not $debugOwner -or -not $owned.ContainsKey([int]$debugOwner.OwningProcess)) {throw 'Debug listener is not owned by this isolated application; refusing to attach'}
@@ -68,7 +96,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createServer } from 'node:http';
 import { setTimeout as sleep } from 'node:timers/promises';
-const [port,output,base,exitMode]=process.argv.slice(2);
+const [port,output,base,exitMode,profile]=process.argv.slice(2);
 const deleteOriginal=exitMode==='Tray';
 let page;const diagnostic=[];
 const eventually=async(read,predicate,label,timeout=15000)=>{
@@ -88,8 +116,7 @@ const openCardMenu=async card=>{
 };
 try {
   const browser=await chromium.connectOverCDP('http://127.0.0.1:'+port);
-  page=browser.contexts().flatMap(context=>context.pages()).find(page=>page.url().includes('tauri.localhost'));
-  if(!page)throw Error('The isolated native app webview was not found');
+  page=await eventually(()=>browser.contexts().flatMap(context=>context.pages()).find(page=>page.url().includes('tauri.localhost')),Boolean,'isolated native app webview');
   const targetSession=await browser.newBrowserCDPSession();
   const windowTargets=targets=>targets.filter(target=>['page','webview'].includes(target.type));
   const initialTargets=windowTargets((await targetSession.send('Target.getTargets')).targetInfos);
@@ -109,9 +136,18 @@ try {
   const errors=[];page.on('pageerror',error=>{errors.push(String(error));diagnostic.push(String(error));});
   page.on('console',message=>{if(message.type()==='error')diagnostic.push(message.text());});
   page.on('requestfailed',request=>diagnostic.push(request.url()+': '+request.failure()?.errorText));
+  const assetFailures=[];
+  page.on('response',response=>{
+    if(new URL(response.url()).hostname==='tauri.localhost'&&['script','stylesheet','image','font'].includes(response.request().resourceType())&&response.status()>=400)assetFailures.push(response.url()+': '+response.status());
+  });
   const navigation=await page.reload({waitUntil:'domcontentloaded'});
   const documentHeaders=await navigation.allHeaders();
   await page.waitForFunction(()=>document.body?.innerText.includes('StreamCap')&&window.__STREAMCAP_NATIVE_SMOKE__?.requests.some(r=>r.path==='/api/status'&&r.status===200),{},{timeout:15000});
+  await page.waitForFunction(()=>{const image=document.querySelector('.sidebar-brand img');return image?.complete&&image.naturalWidth>0&&image.naturalHeight>0;});
+  const logo=await page.locator('.sidebar-brand img').evaluate(image=>({source:image.currentSrc,width:image.naturalWidth,height:image.naturalHeight}));
+  assert.equal(new URL(logo.source).origin,new URL(page.url()).origin,'brand image must load from the executable assets');
+  assert.ok(await page.locator('.sidebar svg').count()>0,'navigation icons must render');
+  assert.ok(await page.evaluate(()=>document.styleSheets.length)>0,'bundled styles must load');
   const native=()=>page.evaluate(async()=>(await import('/tauri-api/core.js')).invoke('desktop_ready'));
   assert.equal((await native()).decorated,false,'the web UI and the window must share one title bar');
   assert.equal((await native()).trayAvailable,true);
@@ -139,7 +175,9 @@ try {
   const mediaSource=createServer((_req,res)=>{res.writeHead(200,{'Content-Type':'video/mp2t','Content-Length':fixture.length});res.end(fixture);});
   await new Promise(resolve=>mediaSource.listen(0,'127.0.0.1',resolve));
   const mediaUrl='http://127.0.0.1:'+mediaSource.address().port+'/live.ts';
-  const configured=await fetch(base+'/api/settings',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({userConfig:{convert_to_mp4:true,delete_original:deleteOriginal,video_format:'TS',folder_name_platform:false,folder_name_author:false,folder_name_time:false,segmented_recording_enabled:false}})});assert.equal(configured.status,200);
+  const relativeRoot='录制 captures';
+  await fs.mkdir(path.join(profile,relativeRoot));
+  const configured=await fetch(base+'/api/settings',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({userConfig:{live_save_path:relativeRoot,convert_to_mp4:true,delete_original:deleteOriginal,video_format:'TS',folder_name_platform:false,folder_name_author:false,folder_name_time:false,segmented_recording_enabled:false}})});assert.equal(configured.status,200);
   const created=await fetch(base+'/api/recordings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:mediaUrl,streamerName:'原生媒体验收'})});assert.equal(created.status,200);const mediaTask=(await created.json()).created[0];
   await page.getByRole('navigation',{name:'主导航'}).getByRole('link',{name:'录制任务',exact:true}).click();
   const mediaCard=page.locator('article[data-rec-id="'+mediaTask.recId+'"]');
@@ -192,7 +230,7 @@ try {
   await eventually(()=>page.evaluate(async()=> (await import('/media-player.js')).activePlayerCount()),count=>count===0,'disposed player');
   const mediaFiles=await(await fetch(base+'/api/recordings/'+mediaTask.recId+'/files')).json();
   assert.equal(mediaFiles.files.some(f=>f.name===path.basename(completedJob.source)),!deleteOriginal);assert.ok(mediaFiles.files.some(f=>f.name===path.basename(completedJob.output)));
-  const outputRoot=path.join(output,'data','downloads');
+  const outputRoot=path.join(profile,relativeRoot);
   const sourceExists=await fs.stat(path.join(outputRoot,completedJob.source)).then(()=>true,error=>{if(error.code==='ENOENT')return false;throw error;});
   assert.equal(sourceExists,!deleteOriginal);assert.ok((await fs.stat(path.join(outputRoot,completedJob.output))).size>0);
   await new Promise(resolve=>{mediaSource.closeAllConnections();mediaSource.close(resolve);});
@@ -236,8 +274,10 @@ try {
   }));
   assert.equal(security.inlineScriptBlocked,true);
   await assertNoVerificationWindow();
+  assert.deepEqual(assetFailures,[],'relocating the executable must not break local resources');
+  const relocationValidation={logo,stylesLoaded:true,iconsRendered:true,relativeRecordingRoot:outputRoot,assetFailures};
   const nativeSurfaceValidation={removedCommandRejected:true,rejectedActions:removedActions,noVerificationSubwindow:true};
-  const result={passed:true,security,mediaValidation,nativeSurfaceValidation,title:await page.title(),checks:['frameless-shell','maximize-restore','flush-layout','close-cancel','escape-cancel','tray-keeps-backend','remember-tray','close-preference-change',exitMode==='Tray'?'tray-menu-exit':'explicit-dialog-exit'],transport:stats,exitMode};
+  const result={passed:true,security,mediaValidation,nativeSurfaceValidation,relocationValidation,title:await page.title(),checks:['frameless-shell','maximize-restore','flush-layout','close-cancel','escape-cancel','tray-keeps-backend','remember-tray','close-preference-change',exitMode==='Tray'?'tray-menu-exit':'explicit-dialog-exit'],transport:stats,exitMode};
   await fs.writeFile(path.join(output,'ui-result.json'),JSON.stringify(result,null,2));
   if(exitMode==='Tray') {
     await requestClose();await modal.getByRole('button',{name:/最小化到托盘/}).click();await modal.waitFor({state:'hidden'});
@@ -264,7 +304,7 @@ try {
 '@
     $probePath=Join-Path $run 'native-probe.mjs'
     [IO.File]::WriteAllText($probePath,$probe,[Text.UTF8Encoding]::new($false))
-    $probeArguments=@(('"'+$probePath+'"'),"$debugPort",('"'+$run+'"'),"$base","$ExitMode")
+    $probeArguments=@(('"'+$probePath+'"'),"$debugPort",('"'+$run+'"'),"$base","$ExitMode",('"'+$profile+'"'))
     $probeProcess=Start-Process -FilePath (Get-Command node -ErrorAction Stop).Source -ArgumentList $probeArguments -WorkingDirectory $desktop -PassThru -WindowStyle Hidden -RedirectStandardOutput (Join-Path $run 'ui-probe.log') -RedirectStandardError (Join-Path $run 'ui-probe.error.log')
     $probeDeadline=[DateTime]::UtcNow.AddSeconds(110)
     while(-not $probeProcess.HasExited){
@@ -299,11 +339,19 @@ try {
     try {Invoke-RestMethod -Uri "$base/api/status" -TimeoutSec 1 | Out-Null; $listening=$true} catch {}
     if ($listening) {throw 'HTTP listener remained after application exit'}
     if (Get-NetTCPConnection -State Listen -LocalPort $debugPort -ErrorAction SilentlyContinue) {throw 'WebView2 debug listener remained after application exit'}
+    $recorders=@($owned.Values | Where-Object {$_.Name -eq 'ffmpeg.exe'})
+    $expectedRecorder=[IO.Path]::GetFullPath((Join-Path $runtimeTools 'ffmpeg.exe'))
+    if (-not $recorders.Count -or @($recorders | Where-Object {-not $_.ExecutablePath -or -not [string]::Equals([IO.Path]::GetFullPath($_.ExecutablePath),$expectedRecorder,[StringComparison]::OrdinalIgnoreCase)}).Count) {throw 'Recording must use the extracted executable only'}
+    if (Test-Path -LiteralPath (Join-Path $working '录制 captures')) {throw 'Recording incorrectly used the startup working directory'}
+    if (@(Get-ChildItem -LiteralPath $candidateDirectory -File).Count -ne 1 -or @(Get-ChildItem -LiteralPath $candidateDirectory -Directory).Count) {throw 'Runtime assets must not depend on sidecar files next to the relocated EXE'}
     $ui=Get-Content -LiteralPath (Join-Path $run 'ui-result.json') -Raw | ConvertFrom-Json
-    $result=[ordered]@{passed=$true;executable=$Executable;resolver='native';debugListenerOwnership=$debugIdentity;exitMode=$ExitMode;ownedChildNames=@($owned.Values.Name|Sort-Object -Unique);ownedProcessIdentities=@($owned.Values|Select-Object ProcessId,ParentProcessId,Name,CreationDate);ownedProcessesRemaining=$remaining.Count;apiListenerClosed=$true;webviewListenerClosed=$true;shutdown=$shutdown;ui=$ui;profile=$profile}
+    $result=[ordered]@{passed=$true;executable=$Executable;sourceExecutable=$sourceExecutable;sha256=$candidateHash.ToLowerInvariant();startupDirectory=$working;emptyPath=$true;bundledToolStatus=$toolStatus;resolver='native';debugListenerOwnership=$debugIdentity;exitMode=$ExitMode;ownedChildNames=@($owned.Values.Name|Sort-Object -Unique);ownedProcessIdentities=@($owned.Values|Select-Object ProcessId,ParentProcessId,Name,CreationDate);ownedProcessesRemaining=$remaining.Count;apiListenerClosed=$true;webviewListenerClosed=$true;shutdown=$shutdown;ui=$ui;profile=$profile}
     $result | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $run 'result.json') -Encoding utf8
     $result | ConvertTo-Json -Depth 8
 } finally {
     if ($null -ne $probeProcess -and -not $probeProcess.HasExited) {$probeProcess.Kill($true);$probeProcess.WaitForExit(10000)|Out-Null}
     if (-not $process.HasExited) {$process.Kill($true);$process.WaitForExit(10000)|Out-Null}
+    foreach ($capture in @(@($stdoutRead,$stdout),@($stderrRead,$stderr))) {
+        if ($capture[0].Wait(5000)) {[IO.File]::WriteAllText($capture[1],$capture[0].GetAwaiter().GetResult(),[Text.UTF8Encoding]::new($false))}
+    }
 }
