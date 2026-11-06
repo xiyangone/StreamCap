@@ -12,6 +12,8 @@ npm run verify
 
 统一验收脚本执行 Rust 格式/Clippy/测试、依赖审计、WASM 构建、UI 与布局回归、原生 EXE 的关闭和托盘 smoke，并写入新的测试证据目录。任一必要检查失败会返回非零，不发布成功报告。
 
+原生 Tauri 测试和 Clippy 在本轮前端与候选构建完成后执行，确保全新检出也有可嵌入的 frontendDist，不依赖开发机已有 dist。候选仍须通过后续全部门禁才会作为已验证产物上传。
+
 ```powershell
 pwsh -NoProfile -File .\scripts\build-release.ps1
 ```
