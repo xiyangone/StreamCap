@@ -9,6 +9,15 @@ permissions:
   contents: read
 env:
   PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/desktop/build/playwright
+  STREAMCAP_CACHE_PATHS: |
+    ~/.cargo/registry
+    ~/.cargo/git
+    desktop/target
+    desktop/core/target
+    desktop/src-tauri/target
+    desktop/build/npm-cache
+    desktop/build/playwright
+    desktop/build/ffmpeg-bundle
 jobs:
   native:
     runs-on: windows-latest
@@ -18,20 +27,16 @@ jobs:
     - uses: actions/setup-node@v7.0.0
       with:
         node-version: "24"
-    - uses: actions/cache@v6.1.0
+    - uses: actions/cache/restore@v6.1.0
+      id: cache
       with:
-        path: |
-          ~/.cargo/registry
-          ~/.cargo/git
-          desktop/target
-          desktop/core/target
-          desktop/src-tauri/target
-          desktop/build/npm-cache
-          desktop/build/playwright
-          desktop/build/ffmpeg-bundle
-        key: native-${{ runner.os }}-rust195-${{ hashFiles('desktop/**/Cargo.lock', 'desktop/package-lock.json', 'desktop/ffmpeg-bundle.json') }}
-        restore-keys: native-${{ runner.os }}-rust195-
+        path: ${{ env.STREAMCAP_CACHE_PATHS }}
+        key: native-${{ runner.os }}-rust195-${{ hashFiles('desktop/**/Cargo.lock', 'desktop/package-lock.json', 'desktop/ffmpeg-bundle.json') }}-${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: |
+          native-${{ runner.os }}-rust195-${{ hashFiles('desktop/**/Cargo.lock', 'desktop/package-lock.json', 'desktop/ffmpeg-bundle.json') }}-
+          native-${{ runner.os }}-rust195-
     - name: Install Rust toolchain and project tools
+      id: toolchain
       shell: pwsh
       working-directory: desktop
       run: |
@@ -46,6 +51,7 @@ jobs:
         cargo install cargo-audit --version 0.22.2 --locked --root target/tools
         if ($LASTEXITCODE) { exit $LASTEXITCODE }
     - name: Restore locked dependencies
+      id: dependencies
       shell: pwsh
       working-directory: desktop
       run: |
@@ -76,6 +82,12 @@ jobs:
           desktop/tests/artifacts/**/*.png
         retention-days: 14
         if-no-files-found: warn
+    - name: Preserve prepared build cache
+      if: ${{ !cancelled() && steps.toolchain.outcome == 'success' && steps.dependencies.outcome == 'success' }}
+      uses: actions/cache/save@v6.1.0
+      with:
+        path: ${{ env.STREAMCAP_CACHE_PATHS }}
+        key: ${{ steps.cache.outputs.cache-primary-key }}
     - name: Upload verified executable
       if: github.event_name == 'workflow_dispatch'
       uses: actions/upload-artifact@v7.0.1

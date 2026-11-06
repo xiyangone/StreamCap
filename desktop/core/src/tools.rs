@@ -130,7 +130,12 @@ fn checked_copy(
         hash.update(&buffer[..count]);
         output.write_all(&buffer[..count])?;
     }
-    if total != spec.size || format!("{:x}", hash.finalize()) != spec.sha256 {
+    let actual = hash
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    if total != spec.size || actual != spec.sha256 {
         return Err(invalid(format!("内置工具校验失败：{}", spec.name)));
     }
     Ok(())
@@ -195,10 +200,11 @@ fn ensure_bundle(root: &Path, bytes: &[u8], manifest: &BundleManifest) -> io::Re
     let mut seen = std::collections::HashSet::new();
     for index in 0..archive.len() {
         let entry = archive.by_index(index).map_err(io::Error::other)?;
+        let name = entry.name().map_err(io::Error::other)?;
         let spec = manifest
             .files
             .iter()
-            .find(|file| file.name == entry.name())
+            .find(|file| file.name == name.as_ref())
             .ok_or_else(|| invalid("内置工具包包含未声明文件"))?;
         if entry.is_dir()
             || entry.enclosed_name().as_deref() != Some(Path::new(&spec.name))
@@ -302,7 +308,10 @@ mod tests {
                 .map(|(name, bytes)| BundleFile {
                     name: (*name).into(),
                     size: bytes.len() as u64,
-                    sha256: format!("{:x}", Sha256::digest(bytes)),
+                    sha256: Sha256::digest(bytes)
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect(),
                 })
                 .collect(),
         };
