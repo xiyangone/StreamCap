@@ -14,7 +14,7 @@ npm run verify
 
 原生 Tauri 测试和 Clippy 在本轮前端与候选构建完成后执行，确保全新检出也有可嵌入的 frontendDist，不依赖开发机已有 dist。候选仍须通过后续全部门禁才会作为已验证产物上传。
 
-隔离 smoke 模式通过 WebView2 API 申请动态回环调试端口，脚本读取新 profile 的 DevToolsActivePort 后核验监听进程及启动身份。它不依赖提升权限环境中的 WEBVIEW2 调试覆盖；正常启动不启用该入口，诊断失败会保留端口与所属进程记录。
+WebView2 数据目录通过窗口 builder 显式固定在当前 profile 的 webview 子目录，避免窗口配置转换时丢失目录设置。隔离 smoke 模式通过 WebView2 API 申请动态回环调试端口，脚本先核对浏览器进程的实际数据目录，再读取该目录的 DevToolsActivePort 并核验监听进程及启动身份。它不依赖提升权限环境中的 WEBVIEW2 调试覆盖；正常启动不启用该入口，诊断失败保留目录、调试参数、端口与所属进程记录。旧系统默认 WebView2 缓存不自动搬迁。
 
 ```powershell
 pwsh -NoProfile -File .\scripts\build-release.ps1

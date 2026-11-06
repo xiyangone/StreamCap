@@ -58,7 +58,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     context.config_mut().app.security.csp = Some(tauri::utils::config::Csp::Policy(csp.clone()));
     context.config_mut().app.security.dev_csp = Some(tauri::utils::config::Csp::Policy(csp));
     for window in &mut context.config_mut().app.windows {
-        window.data_directory = Some(workspace.user_data_dir.join("webview"));
         if options.smoke_seconds.is_some() {
             window.visible = false;
         }
@@ -73,7 +72,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             log::info!("原生后端已启动：{}；无需 Python/Node",setup_server.address());
             app.manage(lifecycle::Lifecycle::new(setup_server,smoke.then(||workspace.user_data_dir.join("shutdown.json"))));
             for window_config in &window_configs{
-                let mut window=tauri::WebviewWindowBuilder::from_config(app,window_config)?.theme(Some(window_theme(&theme)));
+                // Tauri's config conversion does not propagate data_directory to the webview.
+                let mut window=tauri::WebviewWindowBuilder::from_config(app,window_config)?
+                    .data_directory(workspace.user_data_dir.join("webview"))
+                    .theme(Some(window_theme(&theme)));
                 window=window.initialization_script(lifecycle::runtime_script(address));
                 if smoke{
                     // Keep wry 0.57 defaults and opt into CDP through the API for this isolated profile.

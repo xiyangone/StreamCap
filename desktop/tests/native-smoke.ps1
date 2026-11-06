@@ -31,7 +31,8 @@ $mediaDirectory=Join-Path $profile 'downloads';[IO.Directory]::CreateDirectory($
 if($LASTEXITCODE -ne 0){throw 'Synthetic native preview fixture failed'}
 $stdout = Join-Path $run 'app.stdout.log'; $stderr = Join-Path $run 'app.stderr.log'
 $debugPort = 0
-$debugPortFile = Join-Path $profile 'webview/EBWebView/DevToolsActivePort'
+$webviewDataDirectory = Join-Path $profile 'webview/EBWebView'
+$debugPortFile = Join-Path $webviewDataDirectory 'DevToolsActivePort'
 $arguments = @('--data-dir',$profile,'--api-port','0','--smoke-seconds','120')
 $environment = @{TEMP=$temp;TMP=$temp;PATH=''}
 # ProcessStartInfo preserves an actually empty child PATH on Windows.
@@ -40,6 +41,7 @@ $startInfo.FileName=$Executable;$startInfo.WorkingDirectory=$working
 $startInfo.UseShellExecute=$false;$startInfo.CreateNoWindow=$true
 $startInfo.RedirectStandardOutput=$true;$startInfo.RedirectStandardError=$true
 foreach ($argument in $arguments) {$startInfo.ArgumentList.Add($argument)}
+foreach ($name in @('WEBVIEW2_USER_DATA_FOLDER','WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS')) {$startInfo.Environment.Remove($name)|Out-Null}
 foreach ($entry in $environment.GetEnumerator()) {$startInfo.Environment[$entry.Key]=[string]$entry.Value}
 $process = [Diagnostics.Process]::Start($startInfo)
 $stdoutRead = $process.StandardOutput.ReadToEndAsync()
@@ -47,10 +49,18 @@ $stderrRead = $process.StandardError.ReadToEndAsync()
 $owned = @{}
 $probeProcess = $null
 $rootIdentity = $null
+$webviewConfiguration = @()
 function Update-OwnedProcesses {
-    $all = @(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CreationDate)
+    $all = @(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CreationDate,CommandLine)
     Add-OwnedProcessSnapshot $all $rootIdentity $owned
     if (@($owned.Values | Where-Object {$_.Name -match '^(python|pythonw|node|streamcap-resolver)(\.exe)?$'}).Count -gt 0) {throw 'External interpreter or resolver was started'}
+}
+function Get-OwnedWebViewConfiguration {
+    foreach ($browser in @($owned.Values | Where-Object {$_.Name -eq 'msedgewebview2.exe' -and $_.ParentProcessId -eq $rootIdentity.ProcessId})) {
+        $directoryMatch=[regex]::Match([string]$browser.CommandLine,'(?:^|\s)--user-data-dir=(?:"(?<quoted>[^"]+)"|(?<plain>\S+))')
+        $directory=if($directoryMatch.Success){$directoryMatch.Groups['quoted'].Value+$directoryMatch.Groups['plain'].Value}else{$null}
+        [pscustomobject]@{processId=$browser.ProcessId;executable=$browser.ExecutablePath;dataDirectory=$directory;debugFlags=@([regex]::Matches([string]$browser.CommandLine,'--remote-debugging-(?:port|address)=[^\s"]+') | ForEach-Object Value)}
+    }
 }
 try {
     $rootIdentity = Get-CimInstance Win32_Process -Filter "ProcessId=$($process.Id)" | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CreationDate
@@ -83,6 +93,10 @@ try {
     $debugOwner = $null
     for ($i=0;$i -lt 40;$i++) {
         Update-OwnedProcesses
+        $webviewConfiguration=@(Get-OwnedWebViewConfiguration)
+        if (@($webviewConfiguration | Where-Object {-not $_.dataDirectory -or -not [string]::Equals([IO.Path]::GetFullPath($_.dataDirectory),[IO.Path]::GetFullPath($webviewDataDirectory),[StringComparison]::OrdinalIgnoreCase)}).Count) {
+            throw 'WebView2 is not using this isolated profile; refusing to attach'
+        }
         if (Test-Path -LiteralPath $debugPortFile) {
             $portText=Get-Content -LiteralPath $debugPortFile -TotalCount 1 -ErrorAction SilentlyContinue
             $publishedPort=0
@@ -92,6 +106,7 @@ try {
         if ($debugOwner -and $owned.ContainsKey([int]$debugOwner.OwningProcess)) {break}
         Start-Sleep -Milliseconds 100
     }
+    if (-not $webviewConfiguration.Count) {throw 'The isolated WebView2 browser configuration is unavailable'}
     if ($debugPort -eq 0) {throw 'The isolated WebView2 profile did not publish a valid debug port'}
     if (-not $debugOwner -or -not $owned.ContainsKey([int]$debugOwner.OwningProcess)) {throw 'Debug listener is not owned by this isolated application; refusing to attach'}
     $debugIdentity=Get-OwnedWebViewListener $rootIdentity $debugPort
@@ -351,13 +366,13 @@ try {
     if (Test-Path -LiteralPath (Join-Path $working '录制 captures')) {throw 'Recording incorrectly used the startup working directory'}
     if (@(Get-ChildItem -LiteralPath $candidateDirectory -File).Count -ne 1 -or @(Get-ChildItem -LiteralPath $candidateDirectory -Directory).Count) {throw 'Runtime assets must not depend on sidecar files next to the relocated EXE'}
     $ui=Get-Content -LiteralPath (Join-Path $run 'ui-result.json') -Raw | ConvertFrom-Json
-    $result=[ordered]@{passed=$true;executable=$Executable;sourceExecutable=$sourceExecutable;sha256=$candidateHash.ToLowerInvariant();startupDirectory=$working;emptyPath=$true;bundledToolStatus=$toolStatus;resolver='native';debugListenerOwnership=$debugIdentity;exitMode=$ExitMode;ownedChildNames=@($owned.Values.Name|Sort-Object -Unique);ownedProcessIdentities=@($owned.Values|Select-Object ProcessId,ParentProcessId,Name,CreationDate);ownedProcessesRemaining=$remaining.Count;apiListenerClosed=$true;webviewListenerClosed=$true;shutdown=$shutdown;ui=$ui;profile=$profile}
+    $result=[ordered]@{passed=$true;executable=$Executable;sourceExecutable=$sourceExecutable;sha256=$candidateHash.ToLowerInvariant();startupDirectory=$working;emptyPath=$true;bundledToolStatus=$toolStatus;resolver='native';webviewConfiguration=$webviewConfiguration;debugListenerOwnership=$debugIdentity;exitMode=$ExitMode;ownedChildNames=@($owned.Values.Name|Sort-Object -Unique);ownedProcessIdentities=@($owned.Values|Select-Object ProcessId,ParentProcessId,Name,CreationDate);ownedProcessesRemaining=$remaining.Count;apiListenerClosed=$true;webviewListenerClosed=$true;shutdown=$shutdown;ui=$ui;profile=$profile}
     $result | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $run 'result.json') -Encoding utf8
     $result | ConvertTo-Json -Depth 8
 } catch {
     $failureMessage=$_.Exception.Message
     $connections=if($debugPort -gt 0){@(Get-NetTCPConnection -LocalPort $debugPort -ErrorAction SilentlyContinue | Select-Object LocalAddress,LocalPort,State,OwningProcess)}else{@()}
-    [ordered]@{passed=$false;error=$failureMessage;executable=$Executable;root=$rootIdentity;debugPort=$debugPort;debugPortFilePresent=(Test-Path -LiteralPath $debugPortFile);connections=$connections;ownedProcesses=@($owned.Values|Select-Object ProcessId,ParentProcessId,Name,CreationDate)} |
+    [ordered]@{passed=$false;error=$failureMessage;executable=$Executable;root=$rootIdentity;webviewConfiguration=@(Get-OwnedWebViewConfiguration);debugPort=$debugPort;debugPortFilePresent=(Test-Path -LiteralPath $debugPortFile);connections=$connections;ownedProcesses=@($owned.Values|Select-Object ProcessId,ParentProcessId,Name,CreationDate)} |
         ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $run 'result.json') -Encoding utf8
     throw
 } finally {
