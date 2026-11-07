@@ -50,9 +50,41 @@ $owned = @{}
 $probeProcess = $null
 $rootIdentity = $null
 $webviewConfiguration = @()
+function Complete-OwnedProcessMetadata([object[]]$Snapshot,[hashtable]$Owned) {
+    foreach ($current in $Snapshot) {
+        $saved=$Owned[[int]$current.ProcessId]
+        if (-not (Test-ProcessInstance $saved $current)) {continue}
+        foreach ($field in @('ExecutablePath','CommandLine')) {
+            if (-not $saved.$field -and $current.$field) {$saved.$field=$current.$field}
+        }
+        if ($saved.ExecutablePath -and -not $saved.PSObject.Properties['ExecutablePathSource']) {
+            $saved | Add-Member -NotePropertyName ExecutablePathSource -NotePropertyValue 'CIM'
+        }
+    }
+}
 function Update-OwnedProcesses {
     $all = @(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CreationDate,CommandLine)
     Add-OwnedProcessSnapshot $all $rootIdentity $owned
+    Complete-OwnedProcessMetadata $all $owned
+    foreach ($current in @($all | Where-Object {$_.Name -eq 'ffmpeg.exe'})) {
+        $saved=$owned[[int]$current.ProcessId]
+        if (-not (Test-ProcessInstance $saved $current) -or $saved.ExecutablePath) {continue}
+        $nativeProcess=$null
+        try {
+            $nativeProcess=Get-Process -Id ([int]$current.ProcessId) -ErrorAction Stop
+            # CIM timestamps have microsecond precision. Never accept a recycled PID.
+            if ([Math]::Abs(($nativeProcess.StartTime.ToUniversalTime()-$current.CreationDate.ToUniversalTime()).Ticks) -ge 10) {continue}
+            $actualPath=$nativeProcess.Path
+            if ($actualPath) {
+                $saved.ExecutablePath=$actualPath
+                $saved | Add-Member -NotePropertyName ExecutablePathSource -NotePropertyValue 'process-module' -Force
+            }
+        } catch {
+            # A process can exit during sampling. Keep it unverified until a later observation.
+        } finally {
+            if ($null -ne $nativeProcess) {$nativeProcess.Dispose()}
+        }
+    }
     if (@($owned.Values | Where-Object {$_.Name -match '^(python|pythonw|node|streamcap-resolver)(\.exe)?$'}).Count -gt 0) {throw 'External interpreter or resolver was started'}
 }
 function Get-OwnedWebViewConfiguration {
@@ -410,17 +442,19 @@ try {
     if (Get-NetTCPConnection -State Listen -LocalPort $debugPort -ErrorAction SilentlyContinue) {throw 'WebView2 debug listener remained after application exit'}
     $recorders=@($owned.Values | Where-Object {$_.Name -eq 'ffmpeg.exe'})
     $expectedRecorder=[IO.Path]::GetFullPath((Join-Path $runtimeTools 'ffmpeg.exe'))
+    [ordered]@{expectedExecutable=$expectedRecorder;observations=@($recorders|Select-Object ProcessId,ParentProcessId,Name,CreationDate,ExecutablePath,ExecutablePathSource)} |
+        ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $run 'recorder-paths.log') -Encoding utf8
     if (-not $recorders.Count -or @($recorders | Where-Object {-not $_.ExecutablePath -or -not [string]::Equals([IO.Path]::GetFullPath($_.ExecutablePath),$expectedRecorder,[StringComparison]::OrdinalIgnoreCase)}).Count) {throw 'Recording must use the extracted executable only'}
     if (Test-Path -LiteralPath (Join-Path $working '录制 captures')) {throw 'Recording incorrectly used the startup working directory'}
     if (@(Get-ChildItem -LiteralPath $candidateDirectory -File).Count -ne 1 -or @(Get-ChildItem -LiteralPath $candidateDirectory -Directory).Count) {throw 'Runtime assets must not depend on sidecar files next to the relocated EXE'}
     $ui=Get-Content -LiteralPath (Join-Path $run 'ui-result.json') -Raw | ConvertFrom-Json
-    $result=[ordered]@{passed=$true;executable=$Executable;sourceExecutable=$sourceExecutable;sha256=$candidateHash.ToLowerInvariant();startupDirectory=$working;emptyPath=$true;bundledToolStatus=$toolStatus;resolver='native';webviewConfiguration=$webviewConfiguration;debugListenerOwnership=$debugIdentity;exitMode=$ExitMode;ownedChildNames=@($owned.Values.Name|Sort-Object -Unique);ownedProcessIdentities=@($owned.Values|Select-Object ProcessId,ParentProcessId,Name,CreationDate);ownedProcessesRemaining=$remaining.Count;apiListenerClosed=$true;webviewListenerClosed=$true;shutdown=$shutdown;ui=$ui;profile=$profile}
+    $result=[ordered]@{passed=$true;executable=$Executable;sourceExecutable=$sourceExecutable;sha256=$candidateHash.ToLowerInvariant();startupDirectory=$working;emptyPath=$true;bundledToolStatus=$toolStatus;resolver='native';webviewConfiguration=$webviewConfiguration;debugListenerOwnership=$debugIdentity;exitMode=$ExitMode;ownedChildNames=@($owned.Values.Name|Sort-Object -Unique);ownedProcessIdentities=@($owned.Values|Select-Object ProcessId,ParentProcessId,Name,CreationDate,ExecutablePath,ExecutablePathSource);ownedProcessesRemaining=$remaining.Count;apiListenerClosed=$true;webviewListenerClosed=$true;shutdown=$shutdown;ui=$ui;profile=$profile}
     $result | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $run 'result.json') -Encoding utf8
     $result | ConvertTo-Json -Depth 8
 } catch {
     $failureMessage=$_.Exception.Message
     $connections=if($debugPort -gt 0){@(Get-NetTCPConnection -LocalPort $debugPort -ErrorAction SilentlyContinue | Select-Object LocalAddress,LocalPort,State,OwningProcess)}else{@()}
-    [ordered]@{passed=$false;error=$failureMessage;executable=$Executable;root=$rootIdentity;webviewConfiguration=@(Get-OwnedWebViewConfiguration);debugPort=$debugPort;debugPortFilePresent=(Test-Path -LiteralPath $debugPortFile);connections=$connections;ownedProcesses=@($owned.Values|Select-Object ProcessId,ParentProcessId,Name,CreationDate)} |
+    [ordered]@{passed=$false;error=$failureMessage;executable=$Executable;root=$rootIdentity;webviewConfiguration=@(Get-OwnedWebViewConfiguration);debugPort=$debugPort;debugPortFilePresent=(Test-Path -LiteralPath $debugPortFile);connections=$connections;ownedProcesses=@($owned.Values|Select-Object ProcessId,ParentProcessId,Name,CreationDate,ExecutablePath,ExecutablePathSource)} |
         ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $run 'result.json') -Encoding utf8
     throw
 } finally {
