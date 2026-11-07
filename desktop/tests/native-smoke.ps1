@@ -50,6 +50,117 @@ $owned = @{}
 $probeProcess = $null
 $rootIdentity = $null
 $webviewConfiguration = @()
+$imageObserver = $null
+function Start-SmokeProcessImageObserver([int]$RootProcessId,[datetime]$RootCreatedAt) {
+    if (-not ('StreamCap.NativeSmoke.ProcessImageObserver' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Concurrent;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+namespace StreamCap.NativeSmoke {
+    public sealed class ProcessImageObserver : IDisposable {
+        private sealed class Sample { public int Id; public DateTime Created; public string Path; }
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct ProcessEntry {
+            public uint Size, Usage, Id;
+            public IntPtr Heap;
+            public uint ModuleId, Threads, ParentId;
+            public int Priority;
+            public uint Flags;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string Name;
+        }
+        [DllImport("kernel32.dll", SetLastError = true)] private static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint id);
+        [DllImport("kernel32.dll", EntryPoint = "Process32FirstW", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)] private static extern bool ProcessFirst(IntPtr snapshot, ref ProcessEntry entry);
+        [DllImport("kernel32.dll", EntryPoint = "Process32NextW", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)] private static extern bool ProcessNext(IntPtr snapshot, ref ProcessEntry entry);
+        [DllImport("kernel32.dll", SetLastError = true)] private static extern IntPtr OpenProcess(uint access, bool inherit, uint id);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)] private static extern bool GetProcessTimes(IntPtr process, out long created, out long exited, out long kernel, out long user);
+        [DllImport("kernel32.dll", EntryPoint = "QueryFullProcessImageNameW", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)] private static extern bool QueryImage(IntPtr process, uint flags, StringBuilder path, ref int length);
+        [DllImport("kernel32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)] private static extern bool CloseHandle(IntPtr handle);
+        private readonly ConcurrentDictionary<string, Sample> images = new ConcurrentDictionary<string, Sample>();
+        private readonly DateTime earliest;
+        private readonly Process root;
+        private readonly int rootId;
+        private readonly Thread worker;
+        private volatile bool stop;
+        private volatile Exception failure;
+        public ProcessImageObserver(int rootProcessId, DateTime rootCreatedAt) {
+            earliest = rootCreatedAt.ToUniversalTime();
+            rootId = rootProcessId;
+            root = Process.GetProcessById(rootId);
+            if (Math.Abs(root.StartTime.ToUniversalTime().Ticks - earliest.Ticks) >= 10) {
+                root.Dispose();
+                throw new InvalidOperationException("Image observer root identity changed");
+            }
+            worker = new Thread(Observe) { IsBackground = true, Name = "StreamCap smoke image observer" };
+            worker.Start();
+        }
+        private void ReadImage(uint id) {
+            // QUERY_LIMITED_INFORMATION only; hold the handle while reading creation and image data.
+            var process = OpenProcess(0x1000, false, id);
+            if (process == IntPtr.Zero) return;
+            try {
+                long created, exited, kernel, user;
+                if (!GetProcessTimes(process, out created, out exited, out kernel, out user)) return;
+                var started = DateTime.FromFileTimeUtc(created);
+                if (started < earliest) return;
+                var key = id + ":" + started.Ticks;
+                if (images.ContainsKey(key)) return;
+                var path = new StringBuilder(32768);
+                var length = path.Capacity;
+                if (QueryImage(process, 0, path, ref length))
+                    images.TryAdd(key, new Sample { Id = (int)id, Created = started, Path = path.ToString() });
+            } finally { CloseHandle(process); }
+        }
+        private void Observe() {
+            try {
+                var watch = Stopwatch.StartNew();
+                while (!stop && !root.HasExited && watch.Elapsed < TimeSpan.FromSeconds(120)) {
+                    if (images.Count >= 512) throw new InvalidOperationException("Image observation limit exceeded");
+                    var snapshot = CreateToolhelp32Snapshot(2, 0);
+                    if (snapshot == new IntPtr(-1)) throw new Win32Exception(Marshal.GetLastWin32Error());
+                    try {
+                        var entry = new ProcessEntry { Size = (uint)Marshal.SizeOf<ProcessEntry>() };
+                        if (ProcessFirst(snapshot, ref entry)) {
+                            do {
+                                if (entry.ParentId == rootId && String.Equals(entry.Name, "ffmpeg.exe", StringComparison.OrdinalIgnoreCase))
+                                    ReadImage(entry.Id);
+                            } while (ProcessNext(snapshot, ref entry));
+                        }
+                    } finally { CloseHandle(snapshot); }
+                    Thread.Sleep(1);
+                }
+            } catch (Exception error) { failure = error; }
+        }
+        public string FindImage(int id, DateTime createdAt) {
+            if (failure != null) throw new InvalidOperationException("Image observer failed", failure);
+            foreach (var sample in images.Values) {
+                // CIM creation timestamps have microsecond precision; PID alone is insufficient.
+                if (sample.Id == id && Math.Abs(sample.Created.Ticks - createdAt.ToUniversalTime().Ticks) < 10)
+                    return sample.Path;
+            }
+            return null;
+        }
+        public void Dispose() {
+            stop = true;
+            if (!worker.Join(2000)) throw new InvalidOperationException("Image observer did not stop");
+            root.Dispose();
+            if (failure != null) throw new InvalidOperationException("Image observer failed", failure);
+        }
+    }
+}
+'@
+    }
+    return [StreamCap.NativeSmoke.ProcessImageObserver]::new($RootProcessId,$RootCreatedAt)
+}
 function Complete-OwnedProcessMetadata([object[]]$Snapshot,[hashtable]$Owned) {
     foreach ($current in $Snapshot) {
         $saved=$Owned[[int]$current.ProcessId]
@@ -66,23 +177,11 @@ function Update-OwnedProcesses {
     $all = @(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CreationDate,CommandLine)
     Add-OwnedProcessSnapshot $all $rootIdentity $owned
     Complete-OwnedProcessMetadata $all $owned
-    foreach ($current in @($all | Where-Object {$_.Name -eq 'ffmpeg.exe'})) {
-        $saved=$owned[[int]$current.ProcessId]
-        if (-not (Test-ProcessInstance $saved $current) -or $saved.ExecutablePath) {continue}
-        $nativeProcess=$null
-        try {
-            $nativeProcess=Get-Process -Id ([int]$current.ProcessId) -ErrorAction Stop
-            # CIM timestamps have microsecond precision. Never accept a recycled PID.
-            if ([Math]::Abs(($nativeProcess.StartTime.ToUniversalTime()-$current.CreationDate.ToUniversalTime()).Ticks) -ge 10) {continue}
-            $actualPath=$nativeProcess.Path
-            if ($actualPath) {
-                $saved.ExecutablePath=$actualPath
-                $saved | Add-Member -NotePropertyName ExecutablePathSource -NotePropertyValue 'process-module' -Force
-            }
-        } catch {
-            # A process can exit during sampling. Keep it unverified until a later observation.
-        } finally {
-            if ($null -ne $nativeProcess) {$nativeProcess.Dispose()}
+    foreach ($saved in @($owned.Values | Where-Object {$_.Name -eq 'ffmpeg.exe' -and -not $_.ExecutablePath})) {
+        $actualPath=$imageObserver.FindImage([int]$saved.ProcessId,$saved.CreationDate)
+        if ($actualPath) {
+            $saved.ExecutablePath=$actualPath
+            $saved | Add-Member -NotePropertyName ExecutablePathSource -NotePropertyValue 'process-module-observer' -Force
         }
     }
     if (@($owned.Values | Where-Object {$_.Name -match '^(python|pythonw|node|streamcap-resolver)(\.exe)?$'}).Count -gt 0) {throw 'External interpreter or resolver was started'}
@@ -100,6 +199,7 @@ try {
         [Math]::Abs(($rootIdentity.CreationDate.ToUniversalTime() - $process.StartTime.ToUniversalTime()).TotalSeconds) -gt 1) {
         throw 'Cannot establish the candidate process identity'
     }
+    $imageObserver=Start-SmokeProcessImageObserver ([int]$rootIdentity.ProcessId) $rootIdentity.CreationDate
     $readyFile = Join-Path $profile 'ready.json'
     $deadline = [DateTime]::UtcNow.AddSeconds(25)
     while (-not (Test-Path -LiteralPath $readyFile)) {
@@ -463,4 +563,5 @@ try {
     foreach ($capture in @(@($stdoutRead,$stdout),@($stderrRead,$stderr))) {
         if ($capture[0].Wait(5000)) {[IO.File]::WriteAllText($capture[1],$capture[0].GetAwaiter().GetResult(),[Text.UTF8Encoding]::new($false))}
     }
+    if ($null -ne $imageObserver) {$imageObserver.Dispose()}
 }
