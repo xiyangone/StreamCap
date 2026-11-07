@@ -27,6 +27,26 @@ const DETAIL_PATH: &str = "/live_api/liveroom/livedetail";
 const FIXTURE_PATH: &str = "/kuaishou-fixture";
 const MAX_REPLY: usize = 4 * 1024 * 1024;
 
+fn set_browser_cookie_domain(cookie: &mut Cookie<'_>, domain: &str) {
+    // Wry 0.57 passes Cookie::domain() to WebView2, where a leading dot means
+    // subdomains. cookie 0.18 strips one dot, so preserve it at this API boundary.
+    #[cfg(windows)]
+    cookie.set_domain(if domain.starts_with('.') {
+        format!(".{domain}")
+    } else {
+        domain.to_owned()
+    });
+    #[cfg(not(windows))]
+    cookie.set_domain(domain.to_owned());
+}
+
+fn is_site_cookie(cookie: &Cookie<'_>) -> bool {
+    cookie.domain().is_some_and(|domain| {
+        let domain = domain.trim_start_matches('.');
+        domain == "kuaishou.com" || domain.ends_with(".kuaishou.com")
+    })
+}
+
 struct Session {
     proxy: Option<Url>,
     directory: PathBuf,
@@ -322,7 +342,47 @@ impl Host {
             .ok_or_else(|| kuaishou::BROWSER_UNAVAILABLE.into())
     }
 
-    fn synchronize_cookie(session: &Session, cookie: Option<&str>) -> Result<(), String> {
+    async fn clear_site_cookies(window: &WebviewWindow) -> Result<(), String> {
+        for mut cookie in window
+            .cookies()
+            .map_err(|_| "无法读取快手网页登录状态")?
+            .into_iter()
+            .filter(is_site_cookie)
+        {
+            let domain = cookie
+                .domain()
+                .expect("site cookie domain")
+                .trim_start_matches('.')
+                .to_owned();
+            // Cookie::domain() normalizes the readback too. Clear both native
+            // scopes for this name/path instead of leaving a stale domain cookie.
+            set_browser_cookie_domain(&mut cookie, &domain);
+            window
+                .delete_cookie(cookie.clone())
+                .map_err(|_| "无法更新快手网页登录状态")?;
+            set_browser_cookie_domain(&mut cookie, &format!(".{domain}"));
+            window
+                .delete_cookie(cookie)
+                .map_err(|_| "无法更新快手网页登录状态")?;
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if !window
+                .cookies()
+                .map_err(|_| "无法核对快手网页登录状态")?
+                .iter()
+                .any(is_site_cookie)
+            {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("快手网页旧登录信息尚未清除，请关闭快手网页后重试".into());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn synchronize_cookie(session: &Session, cookie: Option<&str>) -> Result<(), String> {
         let cookie = kuaishou::canonical_cookie_header(cookie.unwrap_or_default())?;
         let key = kuaishou::session_key(&format!("cookie:{cookie}"));
         let marker = session.directory.join("source-cookie.sha256");
@@ -335,37 +395,47 @@ impl Host {
         if previous.as_deref() == Some(key.as_str()) {
             return Ok(());
         }
-        if previous.as_deref() != Some(&key) {
-            for existing in session
-                .worker
-                .cookies()
-                .map_err(|_| "无法读取快手网页登录状态")?
-            {
-                if existing.domain().is_some_and(|domain| {
-                    let domain = domain.trim_start_matches('.');
-                    domain == "kuaishou.com" || domain.ends_with(".kuaishou.com")
-                }) {
-                    session
-                        .worker
-                        .delete_cookie(existing)
-                        .map_err(|_| "无法更新快手网页登录状态")?;
-                }
-            }
-        }
-        for pair in cookie
+        let pairs = cookie
             .split(';')
             .map(str::trim)
             .filter(|pair| !pair.is_empty())
-        {
-            let (name, value) = pair.split_once('=').ok_or("快手 Cookie 格式无效")?;
+            .map(|pair| pair.split_once('=').ok_or("快手 Cookie 格式无效"))
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::clear_site_cookies(&session.worker).await?;
+        for &(name, value) in &pairs {
             let mut item = Cookie::new(name.to_owned(), value.to_owned());
-            item.set_domain(".kuaishou.com");
+            set_browser_cookie_domain(&mut item, ".kuaishou.com");
             item.set_path("/");
             item.set_secure(true);
             session
                 .worker
                 .set_cookie(item)
                 .map_err(|_| "无法应用快手网页登录信息")?;
+        }
+        // Tauri's setter only acknowledges queueing. Read from the actual API
+        // host before persisting the input marker or attempting a room request.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let saved = session
+                .worker
+                .cookies_for_url(Url::parse(LIVE).expect("live URL"))
+                .map_err(|_| "无法核对快手网页登录信息")?;
+            if pairs.iter().all(|&(name, value)| {
+                saved.iter().any(|cookie| {
+                    cookie.name() == name
+                        && cookie.value() == value
+                        && cookie.path() == Some("/")
+                        && cookie
+                            .domain()
+                            .is_some_and(|domain| domain.trim_start_matches('.') == "kuaishou.com")
+                })
+            }) {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("快手网页登录信息未能生效，请关闭快手网页后重试".into());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
         std::fs::write(marker, key).map_err(|_| "无法保存快手网页会话标识")?;
         Ok(())
@@ -429,7 +499,7 @@ impl Host {
         let session = self
             .ensure_session(&mut slot, proxy_url(request.proxy.as_deref())?)
             .await?;
-        Self::synchronize_cookie(session, request.cookie.as_deref())?;
+        Self::synchronize_cookie(session, request.cookie.as_deref()).await?;
         session.last_room = Some(Url::parse(&request.room_url).map_err(|_| "快手房间地址无效")?);
         self.read_json(&session.worker, kuaishou::detail_url(&id)?)
             .await
@@ -465,7 +535,7 @@ impl Host {
         let session = self
             .ensure_session(&mut slot, proxy_url(proxy.as_deref())?)
             .await?;
-        Self::synchronize_cookie(session, cookie.as_deref())?;
+        Self::synchronize_cookie(session, cookie.as_deref()).await?;
         let recovery_room = waiting_room
             .or_else(|| session.recovery_room.clone())
             .or_else(|| session.last_room.clone());
@@ -540,15 +610,21 @@ impl Host {
     async fn fixture_cookie_matches(
         &self,
         window: &WebviewWindow,
-        value: &str,
+        value: Option<&str>,
     ) -> Result<bool, String> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
-            let matches = window
+            let cookies = window
                 .cookies_for_url(Url::parse(LIVE).expect("live URL"))
-                .map_err(|_| "隔离会话 Cookie 读取失败")?
-                .iter()
-                .any(|cookie| cookie.name() == "streamcap_fixture" && cookie.value() == value);
+                .map_err(|_| "隔离会话 Cookie 读取失败")?;
+            let matches = match value {
+                Some(value) => cookies
+                    .iter()
+                    .any(|cookie| cookie.name() == "streamcap_fixture" && cookie.value() == value),
+                None => cookies
+                    .iter()
+                    .all(|cookie| cookie.name() != "streamcap_fixture"),
+            };
             if matches || tokio::time::Instant::now() >= deadline {
                 return Ok(matches);
             }
@@ -566,23 +642,32 @@ impl Host {
         }
         let mut slot = self.session.lock().await;
         let session = self.ensure_session(&mut slot, None).await?;
-        Self::synchronize_cookie(session, Some("streamcap_fixture=original"))?;
+        Self::synchronize_cookie(session, Some("streamcap_fixture=original")).await?;
         let portal = self
             .create_window(false, session.directory.clone(), None, url.clone())
             .await?;
         self.read_json(&portal, url).await?;
-        let shared = self.fixture_cookie_matches(&portal, "original").await?;
+        let shared = self
+            .fixture_cookie_matches(&portal, Some("original"))
+            .await?;
         let mut updated = Cookie::new("streamcap_fixture", "updated-by-portal");
-        updated.set_domain(".kuaishou.com");
+        set_browser_cookie_domain(&mut updated, ".kuaishou.com");
         updated.set_path("/");
         updated.set_secure(true);
         portal
             .set_cookie(updated)
             .map_err(|_| "隔离会话 Cookie 更新失败")?;
-        Self::synchronize_cookie(session, Some("streamcap_fixture=original"))?;
+        Self::synchronize_cookie(session, Some("streamcap_fixture=original")).await?;
         let preserved = self
-            .fixture_cookie_matches(&session.worker, "updated-by-portal")
+            .fixture_cookie_matches(&session.worker, Some("updated-by-portal"))
             .await?;
+        Self::synchronize_cookie(session, Some("streamcap_fixture=replaced")).await?;
+        let replaced = self
+            .fixture_cookie_matches(&portal, Some("replaced"))
+            .await?;
+        Self::synchronize_cookie(session, None).await?;
+        let cleared = self.fixture_cookie_matches(&portal, None).await?
+            && self.fixture_cookie_matches(&session.worker, None).await?;
         self.evaluate(&portal, r#"(()=>{
           window.__streamcapIpcProbe='pending';
           const bridge=window.__TAURI_INTERNALS__;
@@ -604,6 +689,7 @@ impl Host {
         }
         Ok(
             json!({"sharedCookie":shared,"websiteChangePreserved":preserved,
+            "sourceCookieReplaced":replaced,"sourceCookieCleared":cleared,
             "remoteIpcBlocked":matches!(ipc.as_str(),"blocked"|"unavailable")}),
         )
     }
@@ -623,6 +709,20 @@ impl Host {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn webview2_cookie_domains_preserve_host_and_subdomain_scopes() {
+        let mut cookie = Cookie::new("fixture", "synthetic");
+        set_browser_cookie_domain(&mut cookie, ".kuaishou.com");
+        assert_eq!(cookie.domain(), Some(".kuaishou.com"));
+        assert!(is_site_cookie(&cookie));
+        set_browser_cookie_domain(&mut cookie, "live.kuaishou.com");
+        assert_eq!(cookie.domain(), Some("live.kuaishou.com"));
+        assert!(is_site_cookie(&cookie));
+        set_browser_cookie_domain(&mut cookie, ".kuaishou.com.invalid");
+        assert!(!is_site_cookie(&cookie));
+    }
 
     #[test]
     fn portal_and_worker_navigation_have_distinct_boundaries() {

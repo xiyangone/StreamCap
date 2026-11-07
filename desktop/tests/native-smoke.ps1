@@ -119,7 +119,7 @@ import { createServer } from 'node:http';
 import { setTimeout as sleep } from 'node:timers/promises';
 const [port,output,base,exitMode,profile]=process.argv.slice(2);
 const deleteOriginal=exitMode==='Tray';
-let page;const diagnostic=[];
+let page;let kuaishouSessionValidation=null;const diagnostic=[];
 const eventually=async(read,predicate,label,timeout=15000)=>{
   const deadline=Date.now()+timeout;
   while(Date.now()<deadline){const value=await read();if(predicate(value))return value;await sleep(100);}
@@ -226,8 +226,11 @@ try {
     assert.equal(repeatedKuaishouRequests,2);
     assert.equal((await kuaishouInvoke({action:'smoke-status'})).portalExists,false,'background checks must not open a login window');
     const shared=await kuaishouInvoke({action:'smoke-session',fixtureUrl:fixtureUrl+'?case=live'});
+    kuaishouSessionValidation=shared;
     assert.equal(shared.sharedCookie,true,'portal and worker must share their isolated website session');
     assert.equal(shared.websiteChangePreserved,true,'unchanged saved input must not overwrite website cookie updates');
+    assert.equal(shared.sourceCookieReplaced,true,'changed saved input must replace the previous native domain cookie');
+    assert.equal(shared.sourceCookieCleared,true,'clearing saved input must remove both host and domain cookies');
     assert.equal(shared.remoteIpcBlocked,true,'the website window must not invoke main-window commands');
   }finally{
     await kuaishouInvoke({action:'smoke-close'});
@@ -343,7 +346,7 @@ try {
   assert.deepEqual(assetFailures,[],'relocating the executable must not break local resources');
   const relocationValidation={logo,stylesLoaded:true,iconsRendered:true,relativeRecordingRoot:outputRoot,assetFailures};
   const nativeSurfaceValidation={removedCommandRejected:true,rejectedActions:removedActions,noVerificationSubwindow:true};
-  const result={passed:true,security,mediaValidation,nativeSurfaceValidation,relocationValidation,title:await page.title(),checks:['frameless-shell','maximize-restore','flush-layout','close-cancel','escape-cancel','tray-keeps-backend','remember-tray','close-preference-change',exitMode==='Tray'?'tray-menu-exit':'explicit-dialog-exit'],transport:stats,exitMode};
+  const result={passed:true,security,mediaValidation,nativeSurfaceValidation,kuaishouSessionValidation,relocationValidation,title:await page.title(),checks:['frameless-shell','maximize-restore','flush-layout','close-cancel','escape-cancel','tray-keeps-backend','remember-tray','close-preference-change',exitMode==='Tray'?'tray-menu-exit':'explicit-dialog-exit'],transport:stats,exitMode};
   await fs.writeFile(path.join(output,'ui-result.json'),JSON.stringify(result,null,2));
   if(exitMode==='Tray') {
     await requestClose();await modal.getByRole('button',{name:/最小化到托盘/}).click();await modal.waitFor({state:'hidden'});
@@ -364,7 +367,7 @@ try {
   }).catch(()=>null);
   const transport = await page?.evaluate(()=>window.__STREAMCAP_NATIVE_SMOKE__).catch(()=>null);
   await page?.screenshot({path:path.join(output,'failure.png'),animations:'disabled'}).catch(()=>{});
-  await fs.writeFile(path.join(output,'ui-result.json'),JSON.stringify({passed:false,error:String(error),stack:error.stack,diagnostic,player,transport,url:page?.url(),body:page?await page.locator('body').innerText().catch(()=>null):null},null,2));
+  await fs.writeFile(path.join(output,'ui-result.json'),JSON.stringify({passed:false,error:String(error),stack:error.stack,diagnostic,kuaishouSessionValidation,player,transport,url:page?.url(),body:page?await page.locator('body').innerText().catch(()=>null):null},null,2));
   console.error(String(error));process.exit(1);
 }
 '@
