@@ -182,7 +182,9 @@ async fn browser_verification_recovery_requires_success_and_preserves_task_ident
         if outcome == "changed" {
             state
                 .store
-                .update("fixture", |record| record.schedule_revision += 1)
+                .update("fixture", |record| {
+                    record.url = "https://live.kuaishou.com/u/replaced".into();
+                })
                 .await;
         }
         request.respond(Ok(reply));
