@@ -306,6 +306,14 @@ pub fn session_key(value: &str) -> String {
         .collect()
 }
 
+fn valid_principal_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+}
+
 pub fn principal_id(raw: &str) -> Result<String, String> {
     let url = validate_url(raw)?;
     let id = url
@@ -316,18 +324,16 @@ pub fn principal_id(raw: &str) -> Result<String, String> {
     if url.scheme() != "https"
         || url.host_str() != Some("live.kuaishou.com")
         || url.port_or_known_default() != Some(443)
-        || id.is_empty()
-        || id.len() > 128
-        || !id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+        || !valid_principal_id(id)
     {
         return Err("请使用快手直播间的 HTTPS 地址".into());
     }
     Ok(id.to_owned())
 }
 pub fn detail_url(id: &str) -> Result<reqwest::Url, String> {
-    principal_id(&format!("https://live.kuaishou.com/u/{id}"))?;
+    if !valid_principal_id(id) {
+        return Err("快手房间标识无效".into());
+    }
     let mut url = reqwest::Url::parse("https://live.kuaishou.com/live_api/liveroom/livedetail")
         .expect("static Kuaishou endpoint");
     url.query_pairs_mut()
@@ -379,16 +385,21 @@ pub fn parse_browser_response(
     if !matches || text(&author["name"]).is_empty() {
         return Err("快手网页未确认目标主播，本次检测已停止".into());
     }
-    if code == Some(1)
-        && (data["isLiving"].as_bool() == Some(false)
-            || data["liveStream"]["living"].as_bool() == Some(false))
+    let expected_live = code == Some(1);
+    if [
+        data["isLiving"].as_bool(),
+        data["liveStream"]["living"].as_bool(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|living| living != expected_live)
     {
         return Err(PAGE_UNAVAILABLE.into());
     }
     let room = serde_json::json!({
         "author": author,
         "liveStream": data["liveStream"],
-        "isLiving": code == Some(1),
+        "isLiving": expected_live,
     });
     parse_room(&room, quality)
 }

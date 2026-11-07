@@ -53,6 +53,8 @@ fn browser_detail_separates_offline_captcha_rate_limits_and_missing_business_dat
         offline.record_url.is_empty(),
         "offline replies cannot reuse stale sources"
     );
+    reply.payload["data"]["liveStream"]["living"] = json!(true);
+    assert!(kuaishou::parse_browser_response(&reply, "fixture", None).is_err());
     reply.payload["data"]["result"] = json!(400002);
     reply.payload["data"]["author"] = json!({});
     assert_eq!(
@@ -98,7 +100,10 @@ fn browser_room_urls_are_canonical_and_cannot_escape_the_official_endpoint() {
     ] {
         assert!(kuaishou::principal_id(invalid).is_err(), "{invalid}");
     }
-    assert!(kuaishou::detail_url("a?principalId=b").is_err());
+    for id in ["a?principalId=b", "a#b", "a/b", "a/", "a%2Fb", "", " a"] {
+        assert!(kuaishou::detail_url(id).is_err(), "{id}");
+    }
+    assert!(kuaishou::detail_url(&"a".repeat(129)).is_err());
     let key = kuaishou::session_key("cookie:fixture-not-a-credential");
     assert_eq!(key.len(), 64);
     assert!(key.bytes().all(|byte| byte.is_ascii_hexdigit()));
