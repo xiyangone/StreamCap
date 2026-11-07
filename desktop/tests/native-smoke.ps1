@@ -191,6 +191,47 @@ try {
     await assertNoVerificationWindow();
   }
   assert.equal((await native()).closing,false);
+  const kuaishouInvoke=args=>page.evaluate(async args=>(await import('/tauri-api/core.js')).invoke('desktop_kuaishou_session',args),args);
+  const deniedKuaishou=await kuaishouInvoke({action:'open'}).then(()=>'',error=>String(error));
+  assert.match(deniedKuaishou,/隔离验收/,'smoke mode must reject real platform navigation');
+  const badFixture=await kuaishouInvoke({action:'smoke-probe',fixtureUrl:'https://live.kuaishou.com/'}).then(()=>'',error=>String(error));
+  assert.match(badFixture,/本机|夹具/,'smoke callbacks cannot become an external request proxy');
+  assert.equal((await kuaishouInvoke({action:'smoke-status'})).workerExists,false);
+  let repeatedKuaishouRequests=0;
+  const kuaishouFixture=createServer((request,response)=>{
+    const url=new URL(request.url,'http://127.0.0.1');
+    if(url.pathname!=='/kuaishou-fixture'){response.writeHead(404);response.end();return;}
+    let sample=url.searchParams.get('case');
+    if(sample==='repeated')sample=++repeatedKuaishouRequests===1?'live':'offline';
+    const data={result:sample==='offline'?671:sample==='captcha'?400002:1,
+      author:{id:sample==='wrong'?'other':'fixture',name:'Fixture'},
+      liveStream:{playUrls:[{url:'https://media.invalid/native-fixture.flv'}]}};
+    response.writeHead(200,{'Content-Type':'application/json','Cache-Control':'no-store'});
+    response.end(JSON.stringify({data}));
+  });
+  await new Promise(resolve=>kuaishouFixture.listen(0,'127.0.0.1',resolve));
+  try{
+    const fixtureUrl='http://127.0.0.1:'+kuaishouFixture.address().port+'/kuaishou-fixture';
+    const live=await kuaishouInvoke({action:'smoke-probe',fixtureUrl:fixtureUrl+'?case=live'});
+    assert.equal(live.isLive,true);assert.equal(live.anchorMatches,true);assert.equal(live.hasSource,true);
+    const offline=await kuaishouInvoke({action:'smoke-probe',fixtureUrl:fixtureUrl+'?case=offline'});
+    assert.equal(offline.isLive,false);assert.equal(offline.hasSource,false);
+    const captcha=await kuaishouInvoke({action:'smoke-probe',fixtureUrl:fixtureUrl+'?case=captcha'});
+    assert.equal(captcha.accessState,'captcha');assert.equal(captcha.hasSource,false);
+    const wrong=await kuaishouInvoke({action:'smoke-probe',fixtureUrl:fixtureUrl+'?case=wrong'});
+    assert.equal(wrong.hasSource,false);assert.match(wrong.error,/目标主播/);
+    const repeatedUrl=fixtureUrl+'?case=repeated';
+    assert.equal((await kuaishouInvoke({action:'smoke-probe',fixtureUrl:repeatedUrl})).isLive,true);
+    assert.equal((await kuaishouInvoke({action:'smoke-probe',fixtureUrl:repeatedUrl})).isLive,false,'same-URL recheck must read the new document');
+    assert.equal(repeatedKuaishouRequests,2);
+    assert.equal((await kuaishouInvoke({action:'smoke-status'})).portalExists,false,'background checks must not open a login window');
+  }finally{
+    await kuaishouInvoke({action:'smoke-close'});
+    await eventually(()=>kuaishouInvoke({action:'smoke-status'}),value=>!value.workerExists&&!value.portalExists,'Kuaishou helper window cleanup');
+    kuaishouFixture.closeAllConnections();
+    await new Promise(resolve=>kuaishouFixture.close(resolve));
+  }
+  await assertNoVerificationWindow();
   // Actual WebView2 decoding and automatic conversion; only generated, loopback media is used.
   const fixture=await fs.readFile(path.join(output,'native-preview.ts'));
   const mediaSource=createServer((_req,res)=>{res.writeHead(200,{'Content-Type':'video/mp2t','Content-Length':fixture.length});res.end(fixture);});

@@ -95,6 +95,9 @@ impl Resolver {
     pub fn cancellation(&self) -> CancellationToken {
         self.stop.clone()
     }
+    pub fn attach_kuaishou_browser(&self) -> Result<platforms::kuaishou::BrowserRequests, String> {
+        self.kuaishou.attach_browser()
+    }
     pub fn begin_shutdown(&self) {
         self.stop.cancel();
     }
@@ -105,6 +108,86 @@ impl Resolver {
     }
     pub async fn kuaishou_session_changed(&self) {
         self.kuaishou.reset_session().await;
+    }
+    /// A user-requested probe unlocks only unchanged tasks for the verified room.
+    pub async fn restore_kuaishou_access(
+        &self,
+        store: &crate::store::Store,
+        config: &tokio::sync::RwLock<crate::config::ConfigStore>,
+        room_url: &str,
+    ) -> Result<usize, String> {
+        let id = platforms::kuaishou::principal_id(room_url)?;
+        let expected: Vec<_> = store
+            .all()
+            .await
+            .into_iter()
+            .filter(|record| {
+                record.verification_required
+                    && platforms::kuaishou::principal_id(&record.url)
+                        .ok()
+                        .as_deref()
+                        == Some(id.as_str())
+            })
+            .collect();
+        if expected.is_empty() {
+            return Err("此直播间没有等待恢复的验证暂停任务".into());
+        }
+        let input = |config: &crate::config::ConfigStore| -> Result<_, String> {
+            Ok((
+                config
+                    .cookies_for_resolver()
+                    .map_err(|_| "无法读取平台登录信息")?
+                    .remove("kuaishou"),
+                crate::scheduler::recording_proxy(config, Some("kuaishou"))?,
+            ))
+        };
+        let (cookie, proxy) = {
+            let config = config.read().await;
+            input(&config)?
+        };
+        self.kuaishou.reset_session().await;
+        self.resolve(ResolveRequest {
+            account: None,
+            url: room_url.into(),
+            quality: None,
+            proxy: proxy.clone(),
+            cookie: cookie.clone(),
+            platform: Some("kuaishou".into()),
+        })
+        .await?;
+        let _lifecycle = store.lifecycle_guard().await;
+        let current_config = config.read().await;
+        if self.stop.is_cancelled() || input(&current_config)? != (cookie, proxy) {
+            return Err("登录或代理配置已变化，请重新核验".into());
+        }
+        let mut restored = 0;
+        for expected in expected {
+            if store
+                .update_when(
+                    &expected.rec_id,
+                    |current| {
+                        !self.stop.is_cancelled()
+                            && current.verification_required
+                            && !current.is_recording
+                            && current.url == expected.url
+                            && current.schedule_revision == expected.schedule_revision
+                            && current.recording_run == expected.recording_run
+                            && current.last_check_at == expected.last_check_at
+                            && current.check_error == expected.check_error
+                    },
+                    |current| {
+                        current.verification_required = false;
+                        current.access_state.clear();
+                        current.check_error = None;
+                    },
+                )
+                .await
+                .is_some()
+            {
+                restored += 1;
+            }
+        }
+        Ok(restored)
     }
     pub async fn healthy(&self) -> bool {
         !self.stop.is_cancelled()

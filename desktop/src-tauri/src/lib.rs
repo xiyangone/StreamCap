@@ -7,6 +7,7 @@ use streamcap_core::{
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Manager, RunEvent, WindowEvent};
+mod kuaishou;
 mod lifecycle;
 mod logging;
 include!("../../build/ffmpeg-bundle/embedded.rs");
@@ -39,6 +40,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .try_init();
     streamcap_core::tools::ensure_bundled_tools(&workspace, FFMPEG_BUNDLE)?;
     let state = tauri::async_runtime::block_on(streamcap_core::api::bootstrap(workspace.clone()))?;
+    let browser_requests = state.resolver.attach_kuaishou_browser()?;
+    let kuaishou_host = kuaishou::Host::new(
+        workspace.user_data_dir.clone(),
+        state.config.clone(),
+        state.resolver.clone(),
+        state.store.clone(),
+        options.smoke_seconds.is_some(),
+    );
     let theme = tauri::async_runtime::block_on(async {
         state.config.read().await.get_str("theme_mode", "light")
     });
@@ -64,11 +73,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     }
     let window_configs = std::mem::take(&mut context.config_mut().app.windows);
     let setup_server = server.clone();
+    let setup_kuaishou = kuaishou_host.clone();
     let app=tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
-        .invoke_handler(tauri::generate_handler![desktop_ready,desktop_window_action,desktop_close_choice,desktop_theme,desktop_smoke_tray_quit])
+        .invoke_handler(tauri::generate_handler![desktop_ready,desktop_window_action,desktop_close_choice,desktop_theme,desktop_smoke_tray_quit,desktop_kuaishou_session])
         .setup(move |app|{
+            setup_kuaishou.start(app.handle().clone(), browser_requests)?;
+            app.manage(setup_kuaishou);
             log::info!("原生后端已启动：{}；无需 Python/Node",setup_server.address());
             app.manage(lifecycle::Lifecycle::new(setup_server,smoke.then(||workspace.user_data_dir.join("shutdown.json"))));
             for window_config in &window_configs{
@@ -133,6 +145,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         _ => {}
     });
     tauri::async_runtime::block_on(server.shutdown())?;
+    tauri::async_runtime::block_on(kuaishou_host.wait_stopped());
     Ok(())
 }
 fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
@@ -267,4 +280,38 @@ fn desktop_smoke_tray_quit(window: tauri::WebviewWindow) -> Result<(), String> {
     // Same exit path as the tray menu. No global process or window operations.
     lifecycle::request_exit(window.app_handle());
     Ok(())
+}
+
+#[tauri::command]
+async fn desktop_kuaishou_session(
+    window: tauri::WebviewWindow,
+    action: String,
+    fixture_url: Option<String>,
+) -> Result<serde_json::Value, String> {
+    require_main(&window)?;
+    let host = window.state::<Arc<kuaishou::Host>>().inner().clone();
+    if action == "open" {
+        return host.open().await;
+    }
+    if action == "retry" {
+        return host.retry().await;
+    }
+    if !window.state::<lifecycle::Lifecycle>().is_smoke() {
+        return Err("快手网页操作无效".into());
+    }
+    match action.as_str() {
+        "smoke-probe" => {
+            host.smoke_probe(fixture_url.as_deref().ok_or("缺少隔离夹具地址")?)
+                .await
+        }
+        "smoke-close" => {
+            host.close().await;
+            Ok(serde_json::json!({"closed":true}))
+        }
+        "smoke-status" => Ok(serde_json::json!({
+            "workerExists":window.app_handle().get_webview_window("kuaishou-worker").is_some(),
+            "portalExists":window.app_handle().get_webview_window("kuaishou-session").is_some(),
+        })),
+        _ => Err("快手网页操作无效".into()),
+    }
 }

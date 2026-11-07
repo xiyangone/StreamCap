@@ -102,6 +102,54 @@ pub fn SettingsView() -> impl IntoView {
     let directory_busy = RwSignal::new(false);
     let qr_account = RwSignal::new(None::<String>);
     let desktop = desktop::state();
+    let kuaishou_busy = RwSignal::new(false);
+    let kuaishou_restoring = RwSignal::new(false);
+    let kuaishou_note = RwSignal::new(None::<String>);
+    let open_kuaishou = Callback::new(move |_| {
+        if kuaishou_busy.get_untracked() || !desktop.available {
+            return;
+        }
+        kuaishou_busy.set(true);
+        kuaishou_restoring.set(false);
+        kuaishou_note.set(None);
+        cookie_error.set(None);
+        leptos::task::spawn_local(async move {
+            let result = desktop::open_kuaishou_session().await;
+            let _ = kuaishou_busy.try_set(false);
+            match result {
+                Ok(()) => {
+                    let _ = kuaishou_note
+                        .try_set(Some(t("快手网页已打开，完成后返回应用恢复检测。").into()));
+                }
+                Err(error) => {
+                    let _ = cookie_error.try_set(Some(error));
+                }
+            }
+        });
+    });
+
+    let restore_kuaishou = Callback::new(move |_| {
+        if kuaishou_busy.get_untracked() || !desktop.available {
+            return;
+        }
+        kuaishou_busy.set(true);
+        kuaishou_restoring.set(true);
+        kuaishou_note.set(None);
+        cookie_error.set(None);
+        leptos::task::spawn_local(async move {
+            let result = desktop::restore_kuaishou_access().await;
+            let _ = kuaishou_busy.try_set(false);
+            match result {
+                Ok(count) => {
+                    let _ = kuaishou_note
+                        .try_set(Some(crate::tr_format!("{} 个任务已解除验证暂停", count)));
+                }
+                Err(error) => {
+                    let _ = cookie_error.try_set(Some(error));
+                }
+            }
+        });
+    });
 
     Effect::new(move |_| {
         let mut values = state.settings.get();
@@ -488,6 +536,19 @@ pub fn SettingsView() -> impl IntoView {
                                         <ActionButton label=t("清空此平台") class="small" variant="ghost-danger" disabled=busy on_click=Callback::new(move |_| set_cookie.run(String::new())) />
                                     </div>
                                     <Show when=move||cookie_platform.get()=="kuaishou"&&qr_account.get().is_some()><div class="account-status" role="status"><Icon name="check" size=17/><span>{move||qr_account.get().unwrap_or_default()}{t(" · 已保存")}</span></div></Show>
+                                    <Show when=move || cookie_platform.get()=="kuaishou">
+                                        <div class="cookie-tools"><ActionButton label=t("打开快手网页") class="small" variant="ghost"
+                                            busy=Signal::derive(move || kuaishou_busy.get() && !kuaishou_restoring.get()) busy_label=t("正在打开…")
+                                            disabled=Signal::derive(move || busy.get() || kuaishou_busy.get() || !desktop.available || cookie_changes.with(|changes| changes.contains_key("kuaishou")))
+                                            on_click=open_kuaishou /></div>
+                                        <div class="cookie-tools"><ActionButton label=t("验证后恢复检测") class="small" variant="ghost"
+                                            busy=Signal::derive(move || kuaishou_busy.get() && kuaishou_restoring.get()) busy_label=t("核验中…")
+                                            disabled=Signal::derive(move || busy.get() || kuaishou_busy.get() || !desktop.available || cookie_changes.with(|changes| changes.contains_key("kuaishou")))
+                                            on_click=restore_kuaishou /></div>
+                                        <p class="field-hint">{t("网页验证完成后恢复检测；已开启自动检测的任务会继续检测并录制。退出网页账号请在快手网页中操作。")}</p>
+                                        <Show when=move || cookie_changes.with(|changes| changes.contains_key("kuaishou"))><p class="field-hint">{t("请先保存登录信息，再打开快手网页。")}</p></Show>
+                                        <Show when=move || kuaishou_note.get().is_some()><p class="field-hint" role="status">{move || kuaishou_note.get().unwrap_or_default()}</p></Show>
+                                    </Show>
                                     <p class="field-hint">{t("清空后需要保存才会移除登录信息。其他平台不受影响。")}</p>
                                     <div class="cookie-save"><span>{move || crate::tr_format!("{} 个平台待保存", cookie_changes.get().len())}</span><ActionButton label=t("保存登录信息") icon="check" variant="primary"
                                         busy=busy busy_label=t("保存中…") disabled=Signal::derive(move || cookie_changes.get().is_empty() || !state.status.get().ok) on_click=save_cookies /></div>

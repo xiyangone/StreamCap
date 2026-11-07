@@ -405,6 +405,14 @@ export async function createHarness(label, options = {}) {
     const native=state.native;native.calls.push({command,args:structuredClone(args)});let closeRequest;
     if(command==='desktop_ready')return {value:nativeStatus(),closeRequest:native.pending?{activeRecordings:state.recordings.filter(r=>r.isRecording).length,trayAvailable:native.trayAvailable}:undefined};
     if(command==='desktop_theme'){native.theme=args.theme;return {value:null};}
+    if(command==='desktop_kuaishou_session'){
+      if(!['open','retry'].includes(args.action)||Object.hasOwn(args,'fixtureUrl'))throw Error('Unexpected Kuaishou session action');
+      if(native.kuaishouDelay)await new Promise(resolve=>setTimeout(resolve,native.kuaishouDelay));
+      if(native.kuaishouFailure){const message=native.kuaishouFailure;native.kuaishouFailure=null;throw Error(message);}
+      if(args.action==='retry')return {value:{restored:native.kuaishouRestored??1}};
+      native.kuaishouOpened=(native.kuaishouOpened??0)+1;
+      return {value:{opened:true}};
+    }
     if(command==='desktop_window_action'){
       if(args.action==='pick-directory')return {value:'X:/Fixture/Picked'};
       if(args.action==='cancel-shutdown'){native.systemShutdown=false;native.shutdownSeconds=null;state.quickShutdown=null;return {value:null,windowState:nativeStatus()};}

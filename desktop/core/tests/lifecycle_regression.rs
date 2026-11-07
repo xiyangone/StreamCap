@@ -23,6 +23,195 @@ struct Fixture {
     requests: Arc<AtomicUsize>,
 }
 
+fn browser_request(id: &str) -> streamcap_core::resolver::ResolveRequest {
+    streamcap_core::resolver::ResolveRequest {
+        account: None,
+        url: format!("https://live.kuaishou.com/u/{id}?utm_source=fixture"),
+        quality: None,
+        proxy: None,
+        cookie: Some("did=fixture; did=ignored".into()),
+        platform: Some("kuaishou".into()),
+    }
+}
+
+fn browser_success(id: &str) -> streamcap_core::platforms::kuaishou::BrowserResponse {
+    streamcap_core::platforms::kuaishou::BrowserResponse {
+        url: streamcap_core::platforms::kuaishou::detail_url(id)
+            .unwrap()
+            .to_string(),
+        http_status: 200,
+        payload: json!({"data":{"result":1,"author":{"id":id,"name":id},
+            "liveStream":{"playUrls":[{"url":"https://media.invalid/fixture.flv"}]}}}),
+    }
+}
+
+#[tokio::test]
+async fn kuaishou_browser_shutdown_cancels_pending_work_without_retrying() {
+    let resolver = streamcap_core::Resolver::new();
+    let mut browser = resolver.attach_kuaishou_browser().unwrap();
+    let running = resolver.clone();
+    let task = tokio::spawn(async move { running.resolve(browser_request("fixture")).await });
+    let request = browser.recv().await.unwrap();
+    assert_eq!(request.room_url, "https://live.kuaishou.com/u/fixture");
+    assert_eq!(request.cookie.as_deref(), Some("did=fixture"));
+    let cancelled = request.cancellation();
+    resolver.begin_shutdown();
+    assert!(task.await.unwrap().unwrap_err().contains("退出"));
+    tokio::time::timeout(Duration::from_secs(1), cancelled.cancelled())
+        .await
+        .unwrap();
+    request.respond(Ok(browser_success("fixture")));
+    assert!(browser.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn cancelled_browser_reply_cannot_complete_the_next_room_request() {
+    let resolver = streamcap_core::Resolver::new();
+    let mut browser = resolver.attach_kuaishou_browser().unwrap();
+    let first = resolver.clone();
+    let old_task = tokio::spawn(async move { first.resolve(browser_request("old")).await });
+    let old = browser.recv().await.unwrap();
+    let cancelled = old.cancellation();
+    old_task.abort();
+    assert!(old_task.await.unwrap_err().is_cancelled());
+    cancelled.cancelled().await;
+    let second = resolver.clone();
+    let new_task = tokio::spawn(async move { second.resolve(browser_request("new")).await });
+    let new = browser.recv().await.unwrap();
+    old.respond(Ok(browser_success("old")));
+    assert!(!new_task.is_finished());
+    new.respond(Ok(browser_success("new")));
+    assert_eq!(new_task.await.unwrap().unwrap().anchor_name, "new");
+}
+
+#[tokio::test(start_paused = true)]
+async fn kuaishou_browser_timeout_cancels_the_native_request_and_preserves_cooldown() {
+    use streamcap_core::platforms::kuaishou;
+    let resolver = streamcap_core::Resolver::new();
+    let mut browser = resolver.attach_kuaishou_browser().unwrap();
+    let running = resolver.clone();
+    let task = tokio::spawn(async move { running.resolve(browser_request("fixture")).await });
+    let request = browser.recv().await.unwrap();
+    let cancelled = request.cancellation();
+    tokio::time::advance(Duration::from_secs(31)).await;
+    assert_eq!(task.await.unwrap().unwrap_err(), kuaishou::BROWSER_TIMEOUT);
+    assert!(cancelled.is_cancelled());
+    request.respond(Ok(browser_success("fixture")));
+    let running = resolver.clone();
+    let task = tokio::spawn(async move { running.resolve(browser_request("fixture")).await });
+    let request = browser.recv().await.unwrap();
+    let mut response = browser_success("fixture");
+    response.http_status = 429;
+    request.respond(Ok(response));
+    assert_eq!(task.await.unwrap().unwrap_err(), kuaishou::RATE_LIMITED);
+    resolver.kuaishou_session_changed().await;
+    assert_eq!(
+        resolver
+            .resolve(browser_request("fixture"))
+            .await
+            .unwrap_err(),
+        kuaishou::RATE_LIMITED
+    );
+    assert!(browser.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn missing_browser_host_is_explicit_and_does_not_use_http() {
+    use streamcap_core::platforms::kuaishou;
+    let resolver = streamcap_core::Resolver::new();
+    assert_eq!(
+        resolver
+            .resolve(browser_request("fixture"))
+            .await
+            .unwrap_err(),
+        kuaishou::BROWSER_UNAVAILABLE
+    );
+    let browser = resolver.attach_kuaishou_browser().unwrap();
+    assert!(resolver.attach_kuaishou_browser().is_err());
+    drop(browser);
+    assert_eq!(
+        resolver
+            .resolve(browser_request("fixture"))
+            .await
+            .unwrap_err(),
+        kuaishou::BROWSER_UNAVAILABLE
+    );
+}
+
+#[tokio::test]
+async fn browser_verification_recovery_requires_success_and_preserves_task_identity() {
+    use streamcap_core::platforms::kuaishou;
+    for outcome in ["captcha", "changed", "success"] {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = Workspace::from_repo_root(directory.path());
+        workspace.ensure_ready().unwrap();
+        let resolver = streamcap_core::Resolver::new();
+        let mut browser = resolver.attach_kuaishou_browser().unwrap();
+        let state = api::bootstrap_with_resolver(workspace.clone(), resolver.clone())
+            .await
+            .unwrap();
+        for id in ["fixture", "other"] {
+            let mut record = Recording::new(
+                id.into(),
+                format!("https://live.kuaishou.com/u/{id}"),
+                id.into(),
+            );
+            record.verification_required = true;
+            record.access_state = "captcha".into();
+            record.check_error = Some(kuaishou::VERIFICATION_REQUIRED.into());
+            record.monitor_status = false;
+            state.store.insert(vec![record]).await.unwrap();
+        }
+        let before = std::fs::read(workspace.recordings_path()).unwrap();
+        let task_state = state.clone();
+        let task = tokio::spawn(async move {
+            task_state
+                .resolver
+                .restore_kuaishou_access(
+                    &task_state.store,
+                    &task_state.config,
+                    "https://live.kuaishou.com/u/fixture",
+                )
+                .await
+        });
+        let request = browser.recv().await.unwrap();
+        let mut reply = browser_success("fixture");
+        if outcome == "captcha" {
+            reply.payload["data"]["result"] = json!(400002);
+        }
+        if outcome == "changed" {
+            state
+                .store
+                .update("fixture", |record| record.schedule_revision += 1)
+                .await;
+        }
+        request.respond(Ok(reply));
+        let result = task.await.unwrap();
+        match outcome {
+            "captcha" => assert_eq!(result.unwrap_err(), kuaishou::VERIFICATION_REQUIRED),
+            "changed" => assert_eq!(result.unwrap(), 0),
+            _ => assert_eq!(result.unwrap(), 1),
+        }
+        let current = state.store.get("fixture").await.unwrap();
+        assert_eq!(current.verification_required, outcome != "success");
+        assert!(
+            !current.monitor_status,
+            "verification must not enable paused monitors"
+        );
+        assert!(!current.is_recording);
+        assert!(
+            state
+                .store
+                .get("other")
+                .await
+                .unwrap()
+                .verification_required
+        );
+        assert_eq!(std::fs::read(workspace.recordings_path()).unwrap(), before);
+        state.resolver.shutdown().await;
+    }
+}
+
 #[tokio::test]
 async fn flv_redirect_follows_cdn_without_forwarding_custom_credentials() {
     use axum::http::HeaderMap;

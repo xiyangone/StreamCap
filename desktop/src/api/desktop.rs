@@ -192,3 +192,21 @@ pub async fn pick_directory() -> Result<Option<String>, String> {
 pub async fn cancel_shutdown() -> Result<(), String> {
     call("desktop_window_action", json!({"action":"cancel-shutdown"})).await
 }
+
+pub async fn open_kuaishou_session() -> Result<(), String> {
+    let result: serde_json::Value =
+        call("desktop_kuaishou_session", json!({"action":"open"})).await?;
+    if result["opened"] == true {
+        Ok(())
+    } else {
+        Err(crate::app::i18n::t("快手网页未打开，请重试").into())
+    }
+}
+
+pub async fn restore_kuaishou_access() -> Result<u64, String> {
+    let result: serde_json::Value =
+        call("desktop_kuaishou_session", json!({"action":"retry"})).await?;
+    result["restored"]
+        .as_u64()
+        .ok_or_else(|| crate::app::i18n::t("窗口返回内容无效").into())
+}

@@ -1,17 +1,25 @@
-//! Authenticated website resolution with paced HTTP access; no browser verification or anonymous retries.
-use super::{
-    http::{validate_url, PlatformHttp},
-    quality_index, quality_name, text,
-};
+//! Browser-owned Kuaishou access, strict target parsing and preserved platform cooldowns.
+use super::{http::validate_url, quality_index, quality_name, text};
 use crate::resolver::{ResolveRequest, StreamInfo};
 use serde_json::Value;
-use std::{sync::Arc, time::Duration};
-use tokio::{sync::Mutex, time::Instant};
+use std::{
+    sync::{Arc, Mutex as StdMutex},
+    time::Duration,
+};
+use tokio::{
+    sync::{mpsc, oneshot, Mutex},
+    time::Instant,
+};
+use tokio_util::sync::CancellationToken;
 
 pub const ACCESS_UNAVAILABLE: &str = "快手接口暂不可读（400002），直播状态未确认，本次检测已停止";
 pub const LIVE_ACCESS_UNAVAILABLE: &str =
     "快手主播正在直播，但播放信息受平台验证限制（400002），本次未取得录制地址";
-pub const VERIFICATION_REQUIRED: &str = "快手出现验证码，自动检测已暂停";
+pub const VERIFICATION_REQUIRED: &str =
+    "快手需要完成官方验证（400002），请在设置中打开快手网页，完成后恢复检测";
+pub const BROWSER_UNAVAILABLE: &str = "快手浏览器会话不可用，请使用桌面应用";
+pub const BROWSER_TIMEOUT: &str = "快手网页请求超时，请稍后重新检测";
+pub const BROWSER_CANCELLED: &str = "快手网页请求已取消";
 pub const RATE_LIMITED: &str = "快手请求过快，已暂停请求并进入冷却；请勿反复刷新或重新登录";
 pub const LOGIN_REQUIRED: &str = "快手目标页面明确要求登录，请在设置中检查登录状态";
 pub const LOGIN_PROMPT: &str = "快手页面出现登录提示，但未确认登录失效；已停止本次检查";
@@ -81,57 +89,6 @@ pub fn parse_user_info(data: &Value, principal_id: &str) -> Result<(String, bool
     let living = user["living"].as_bool().ok_or(UNVERIFIED)?;
     let name = user["name"].as_str().unwrap_or_default().trim().to_owned();
     Ok((name, living))
-}
-
-async fn resolve_page(
-    http: &PlatformHttp,
-    url: reqwest::Url,
-    quality: Option<&str>,
-    has_saved_cookie: bool,
-) -> Result<StreamInfo, String> {
-    let page = http.get(url.clone(), "https://live.kuaishou.com/").await?;
-    let result = parse_page(&page, quality);
-    if !has_saved_cookie
-        || !result
-            .as_ref()
-            .is_err_and(|error| error == ACCESS_UNAVAILABLE)
-    {
-        return result;
-    }
-    // Preserve the existing one-request path. Only a blocked room needs one
-    // additional status lookup; failures never cause retries or anonymous access.
-    let Some(principal_id) = url
-        .path()
-        .strip_prefix("/u/")
-        .map(|path| path.trim_end_matches('/'))
-        .filter(|id| !id.is_empty() && !id.contains('/'))
-    else {
-        return result;
-    };
-    let mut status_url = url
-        .join("/live_api/baseuser/userinfo/byid")
-        .map_err(|_| "快手用户信息地址无效")?;
-    status_url
-        .query_pairs_mut()
-        .append_pair("__NS_hxfalcon", "")
-        .append_pair("caver", "2")
-        .append_pair("principalId", principal_id);
-    let status = match http.get(status_url, "https://live.kuaishou.com/").await {
-        Ok(body) => serde_json::from_str::<Value>(&body)
-            .ok()
-            .and_then(|data| parse_user_info(&data, principal_id).ok()),
-        Err(error) if error.contains("HTTP 429") => return Err(RATE_LIMITED.into()),
-        Err(_) => None,
-    };
-    match status {
-        Some((_, true)) => Err(LIVE_ACCESS_UNAVAILABLE.into()),
-        Some((anchor_name, false)) => Ok(StreamInfo {
-            platform: "快手直播".into(),
-            anchor_name,
-            ..Default::default()
-        }),
-        None => result,
-    }
 }
 
 /// Cookie headers are ordered from the most specific scope to the least specific.
@@ -314,6 +271,128 @@ fn collect_urls(value: &Value, out: &mut Vec<(u64, String)>, depth: usize) {
     }
 }
 
+/// A bounded native request. Credentials never appear in Debug or serialized replies.
+pub struct BrowserRequest {
+    pub room_url: String,
+    pub cookie: Option<String>,
+    pub proxy: Option<String>,
+    cancellation: CancellationToken,
+    response: oneshot::Sender<Result<BrowserResponse, String>>,
+}
+impl BrowserRequest {
+    pub fn cancellation(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+    pub fn respond(self, result: Result<BrowserResponse, String>) {
+        let _ = self.response.send(result);
+    }
+}
+#[derive(Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserResponse {
+    pub url: String,
+    #[serde(default)]
+    pub http_status: u16,
+    pub payload: Value,
+}
+pub type BrowserRequests = mpsc::Receiver<BrowserRequest>;
+
+/// Opaque keys keep proxy URLs and credential material out of profile paths and markers.
+pub fn session_key(value: &str) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(value.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+pub fn principal_id(raw: &str) -> Result<String, String> {
+    let url = validate_url(raw)?;
+    let id = url
+        .path()
+        .strip_prefix("/u/")
+        .unwrap_or("")
+        .trim_end_matches('/');
+    if url.scheme() != "https"
+        || url.host_str() != Some("live.kuaishou.com")
+        || url.port_or_known_default() != Some(443)
+        || id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+    {
+        return Err("请使用快手直播间的 HTTPS 地址".into());
+    }
+    Ok(id.to_owned())
+}
+pub fn detail_url(id: &str) -> Result<reqwest::Url, String> {
+    principal_id(&format!("https://live.kuaishou.com/u/{id}"))?;
+    let mut url = reqwest::Url::parse("https://live.kuaishou.com/live_api/liveroom/livedetail")
+        .expect("static Kuaishou endpoint");
+    url.query_pairs_mut()
+        .append_pair("principalId", id)
+        .append_pair("authToken", "");
+    Ok(url)
+}
+
+/// Consume only the primary author's detail, never recommendation entries or stale navigations.
+pub fn parse_browser_response(
+    response: &BrowserResponse,
+    id: &str,
+    quality: Option<&str>,
+) -> Result<StreamInfo, String> {
+    if response.url != detail_url(id)?.as_str() {
+        return Err("快手网页返回了其他房间，本次检测已停止".into());
+    }
+    if response.http_status == 429 {
+        return Err(RATE_LIMITED.into());
+    }
+    if response.http_status >= 400 {
+        return Err(PAGE_UNAVAILABLE.into());
+    }
+    let data = &response.payload["data"];
+    let code = data["result"]
+        .as_i64()
+        .or_else(|| data["result"].as_str()?.parse().ok());
+    if code == Some(400002) {
+        return Err(VERIFICATION_REQUIRED.into());
+    }
+    let message = ["error_msg", "message", "errorMessage"]
+        .iter()
+        .filter_map(|key| data[*key].as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if limited_text(&message) {
+        return Err(RATE_LIMITED.into());
+    }
+    if login_required_text(&message) {
+        return Err(LOGIN_REQUIRED.into());
+    }
+    if !matches!(code, Some(1 | 671)) {
+        return Err("快手网页未返回播放信息，请在设置中打开快手网页检查登录或验证状态".into());
+    }
+    let author = &data["author"];
+    let matches = ["id", "principalId", "kwaiId", "kwai_id"]
+        .iter()
+        .any(|key| author[*key].as_str() == Some(id));
+    if !matches || text(&author["name"]).is_empty() {
+        return Err("快手网页未确认目标主播，本次检测已停止".into());
+    }
+    if code == Some(1)
+        && (data["isLiving"].as_bool() == Some(false)
+            || data["liveStream"]["living"].as_bool() == Some(false))
+    {
+        return Err(PAGE_UNAVAILABLE.into());
+    }
+    let room = serde_json::json!({
+        "author": author,
+        "liveStream": data["liveStream"],
+        "isLiving": code == Some(1),
+    });
+    parse_room(&room, quality)
+}
+
 struct AccessState {
     cookie: Option<String>,
     login_required: bool,
@@ -358,8 +437,18 @@ impl AccessState {
 #[derive(Clone, Default)]
 pub struct KuaishouResolver {
     access: Arc<Mutex<AccessState>>,
+    browser: Arc<StdMutex<Option<mpsc::Sender<BrowserRequest>>>>,
 }
 impl KuaishouResolver {
+    pub fn attach_browser(&self) -> Result<BrowserRequests, String> {
+        let mut browser = self.browser.lock().map_err(|_| BROWSER_UNAVAILABLE)?;
+        if browser.is_some() {
+            return Err("快手浏览器会话已连接".into());
+        }
+        let (send, receive) = mpsc::channel(1);
+        *browser = Some(send);
+        Ok(receive)
+    }
     pub async fn reset_session(&self) {
         crate::network::prune_idle_clients();
         let mut state = self.access.lock().await;
@@ -367,13 +456,7 @@ impl KuaishouResolver {
         state.login_required = false;
     }
     pub async fn resolve(&self, request: &ResolveRequest) -> Result<StreamInfo, String> {
-        let url = validate_url(&request.url)?;
-        if url.scheme() != "https"
-            || url.host_str() != Some("live.kuaishou.com")
-            || !url.path().starts_with("/u/")
-        {
-            return Err("请使用快手直播间的 HTTPS 地址".into());
-        }
+        let id = principal_id(&request.url)?;
         let cookie = request
             .cookie
             .as_deref()
@@ -389,29 +472,34 @@ impl KuaishouResolver {
         if state.login_required {
             return Err(LOGIN_REQUIRED.into());
         }
-        let http = PlatformHttp::new(
-            "kuaishou.com",
-            request.proxy.as_deref(),
-            state.cookie.as_deref(),
-            Duration::from_secs(20),
-        )?;
-        let result = resolve_page(
-            &http,
-            url,
-            request.quality.as_deref(),
-            state
-                .cookie
-                .as_deref()
-                .is_some_and(|cookie| !cookie.is_empty()),
-        )
+        let sender = self
+            .browser
+            .lock()
+            .map_err(|_| BROWSER_UNAVAILABLE)?
+            .clone()
+            .ok_or(BROWSER_UNAVAILABLE)?;
+        let cancellation = CancellationToken::new();
+        let _cancel_on_drop = cancellation.clone().drop_guard();
+        let (response, receive) = oneshot::channel();
+        let message = BrowserRequest {
+            room_url: format!("https://live.kuaishou.com/u/{id}"),
+            cookie: state.cookie.clone(),
+            proxy: request.proxy.clone(),
+            cancellation,
+            response,
+        };
+        let result = tokio::time::timeout(Duration::from_secs(30), async {
+            sender
+                .send(message)
+                .await
+                .map_err(|_| BROWSER_UNAVAILABLE.to_owned())?;
+            let response = receive
+                .await
+                .map_err(|_| BROWSER_UNAVAILABLE.to_owned())??;
+            parse_browser_response(&response, &id, request.quality.as_deref())
+        })
         .await
-        .map_err(|error| {
-            if error.contains("HTTP 429") {
-                RATE_LIMITED.into()
-            } else {
-                error
-            }
-        });
+        .unwrap_or_else(|_| Err(BROWSER_TIMEOUT.into()));
         state.observe(&result);
         result
     }
@@ -419,172 +507,6 @@ impl KuaishouResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    async fn resolve_fixture(
-        page: String,
-        status_code: axum::http::StatusCode,
-        status_body: String,
-        has_saved_cookie: bool,
-    ) -> (Result<StreamInfo, String>, Vec<(String, bool)>) {
-        use axum::{extract::OriginalUri, http::HeaderMap, routing::get, Router};
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let page_requests = requests.clone();
-        let status_requests = requests.clone();
-        let app = Router::new()
-            .route(
-                "/u/fixture",
-                get(move |OriginalUri(uri): OriginalUri, headers: HeaderMap| {
-                    let page = page.clone();
-                    let requests = page_requests.clone();
-                    async move {
-                        requests.lock().await.push((
-                            uri.to_string(),
-                            headers.get("cookie").and_then(|value| value.to_str().ok())
-                                == Some("fixture=retained"),
-                        ));
-                        page
-                    }
-                }),
-            )
-            .route(
-                "/live_api/baseuser/userinfo/byid",
-                get(move |OriginalUri(uri): OriginalUri, headers: HeaderMap| {
-                    let body = status_body.clone();
-                    let requests = status_requests.clone();
-                    async move {
-                        requests.lock().await.push((
-                            uri.to_string(),
-                            headers.get("cookie").and_then(|value| value.to_str().ok())
-                                == Some("fixture=retained"),
-                        ));
-                        (status_code, body)
-                    }
-                }),
-            );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = reqwest::Url::parse(&format!(
-            "http://{}/u/fixture",
-            listener.local_addr().unwrap()
-        ))
-        .unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let http = PlatformHttp::for_loopback().unwrap();
-        if has_saved_cookie {
-            http.jar.add_cookie_str("fixture=retained; Path=/", &url);
-        }
-        let result = resolve_page(&http, url, None, has_saved_cookie).await;
-        server.abort();
-        let observed = requests.lock().await.clone();
-        (result, observed)
-    }
-
-    #[tokio::test]
-    async fn status_lookup_does_not_replace_existing_page_resolution() {
-        use axum::http::StatusCode;
-        for room in [
-            serde_json::json!({"author":{"name":"Fixture"},"isLiving":false}),
-            serde_json::json!({"author":{"name":"Fixture"},"isLiving":true,"liveStream":{"playUrls":[{"url":"https://media.invalid/live.flv"}]}}),
-            serde_json::json!({"author":{"name":"Fixture"},"isLiving":true,"liveStream":{}}),
-            serde_json::json!({"errorType":{"title":"请先登录后观看"}}),
-            serde_json::json!({"errorType":{"title":"HTTP 429 too many requests"}}),
-        ] {
-            let page = format!(
-                "<script>window.__INITIAL_STATE__={};</script>",
-                serde_json::json!({"room":room})
-            );
-            let expected = parse_page(&page, None);
-            let (result, requests) =
-                resolve_fixture(page, StatusCode::SERVICE_UNAVAILABLE, String::new(), true).await;
-            assert_eq!(result, expected);
-            assert_eq!(requests, vec![("/u/fixture".into(), true)]);
-        }
-    }
-
-    #[tokio::test]
-    async fn restricted_page_gets_at_most_one_authenticated_status_lookup() {
-        use axum::http::StatusCode;
-        let valid = |living| {
-            serde_json::json!({"data":{"result":1,"userInfo":{"id":"fixture","name":"Fixture","living":living}}}).to_string()
-        };
-        for (status_code, body, expected) in [
-            (StatusCode::OK, valid(false), Ok(false)),
-            (StatusCode::OK, valid(true), Err(LIVE_ACCESS_UNAVAILABLE)),
-            (
-                StatusCode::OK,
-                valid(false).replace("fixture", "other"),
-                Err(ACCESS_UNAVAILABLE),
-            ),
-            (
-                StatusCode::OK,
-                valid(false).replace("\"result\":1", "\"result\":2"),
-                Err(ACCESS_UNAVAILABLE),
-            ),
-            (
-                StatusCode::OK,
-                valid(false).replace("\"living\":false", "\"living\":\"false\""),
-                Err(ACCESS_UNAVAILABLE),
-            ),
-            (
-                StatusCode::OK,
-                "invalid json".into(),
-                Err(ACCESS_UNAVAILABLE),
-            ),
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                String::new(),
-                Err(ACCESS_UNAVAILABLE),
-            ),
-            (
-                StatusCode::TOO_MANY_REQUESTS,
-                String::new(),
-                Err(RATE_LIMITED),
-            ),
-        ] {
-            let page = format!(
-                "<script>window.__INITIAL_STATE__={};</script>",
-                serde_json::json!({"liveroom":{"playList":[{"author":{},"isLiving":false,"liveStream":{},"errorType":{"type":400002,"title":"请完成滑块验证"}}]}})
-            );
-            let (result, requests) = resolve_fixture(page, status_code, body, true).await;
-            match expected {
-                Ok(living) => {
-                    let info = result.unwrap();
-                    assert_eq!(info.is_live, living);
-                    assert_eq!(info.anchor_name, "Fixture");
-                    assert!(info.record_url.is_empty());
-                }
-                Err(error) => assert_eq!(result.unwrap_err(), error),
-            }
-            assert_eq!(requests.len(), 2);
-            assert!(requests.iter().all(|(_, authenticated)| *authenticated));
-            assert_eq!(requests[0].0, "/u/fixture");
-            let status_url =
-                reqwest::Url::parse(&format!("http://localhost{}", requests[1].0)).unwrap();
-            assert_eq!(status_url.path(), "/live_api/baseuser/userinfo/byid");
-            assert_eq!(
-                status_url
-                    .query_pairs()
-                    .map(|(name, value)| (name.into_owned(), value.into_owned()))
-                    .collect::<Vec<_>>(),
-                vec![
-                    ("__NS_hxfalcon".to_owned(), String::new()),
-                    ("caver".to_owned(), "2".to_owned()),
-                    ("principalId".to_owned(), "fixture".to_owned())
-                ]
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn restricted_page_without_saved_cookie_does_not_add_an_anonymous_lookup() {
-        let page = format!(
-            "<script>window.__INITIAL_STATE__={};</script>",
-            serde_json::json!({"room":{"errorType":{"type":400002}}})
-        );
-        let (result, requests) =
-            resolve_fixture(page, axum::http::StatusCode::OK, String::new(), false).await;
-        assert_eq!(result.unwrap_err(), ACCESS_UNAVAILABLE);
-        assert_eq!(requests, vec![("/u/fixture".into(), false)]);
-    }
 
     #[tokio::test]
     #[ignore = "explicit STREAMCAP_PROBE_CONFIG required; one saved monitored Kuaishou page, no login or recording"]

@@ -1,4 +1,13 @@
 {
+  "打开快手网页": "Open Kuaishou website",
+  "快手网页未打开，请重试": "The Kuaishou website did not open. Try again.",
+  "网页验证完成后恢复检测；已开启自动检测的任务会继续检测并录制。退出网页账号请在快手网页中操作。": "Resume checks after website verification. Enabled monitors will continue checking and recording. Sign out on the Kuaishou website.",
+  "请先保存登录信息，再打开快手网页。": "Save your login information before opening the Kuaishou website.",
+  "快手网页已打开，完成后返回应用恢复检测。": "The Kuaishou website is open. Return here to resume checks when finished.",
+  "验证后恢复检测": "Resume checks after verification",
+  "核验中…": "Verifying…",
+  "{} 个任务已解除验证暂停": "Verification pause cleared for {} tasks",
+  "快手需要完成官方验证（400002），请在设置中打开快手网页，完成后恢复检测": "Kuaishou requires verification (400002). Open its website in Settings, complete verification, then resume checks.",
   "最小化预览": "Minimize preview",
   "恢复预览": "Restore preview",
   " · 已保存": " · Saved",

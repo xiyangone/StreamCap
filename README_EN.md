@@ -4,7 +4,7 @@ StreamCap uses **Rust, Tauri 2 and Leptos/WASM**. The supported release target i
 
 ## Supported features
 
-- Native protocols for 51 registered platforms and direct-media URLs; Kuaishou QR login verifies the account before explicitly saving credentials. Offline protocol fixtures do not certify every platform is currently reachable: API changes, account permissions, regions and rate limits still apply.
+- Native protocols for 51 registered platforms and direct-media URLs; Kuaishou reads stream details through a dedicated WebView2 session with official website sign-in and verification. QR login still verifies the account before explicitly saving credentials. Offline protocol fixtures do not certify every platform is currently reachable: API changes, account permissions, regions and rate limits still apply.
 - Individual/batch editing, automatic streamer names, inherited settings, multi-window schedules and notify-only mode. Per-platform pacing also applies to manual requests.
 - TS, FLV, MKV, MOV, MP4, NUT, WAV, MP3, WMA, M4A and AAC recording/segmentation; native FLV downloading, naming templates, duration/rate reporting and free-space protection.
 - In-progress/completed TS preview, common web media, FFmpeg compatibility previews, cached live-source previews and PNG screenshots. Player assets are bundled.
@@ -23,6 +23,12 @@ Windows 10/11 x64, the system Microsoft Edge WebView2 Runtime, and the Microsoft
 Startup verifies and extracts the tools, license and source notice to `runtime/ffmpeg/<archive SHA-256>/` inside the user-data directory. First launch needs space for extraction; subsequent launches verify and reuse the cache. Tools are never downloaded at runtime. An invalid existing cache produces an error rather than overwriting files or selecting another installation.
 
 User data defaults to %APPDATA%\StreamCap. Builds never overwrite tasks, cookies, account metadata, settings or downloaded recordings. The default recording directory is `downloads` beside the EXE; custom relative paths are also based on the EXE directory. An absolute `--data-dir` makes that profile the base for default and relative recording paths. The launch working directory has no effect. Saved absolute paths remain unchanged; select a new location in Preferences after moving existing recordings.
+
+## Kuaishou sign-in and verification
+
+For Kuaishou `400002`, open Settings → Platform login, select Kuaishou, and choose “Open Kuaishou website”. Complete sign-in or verification on the official page, then return and choose “Resume checks after verification”. A fresh successful response for that room is required before clearing its verification pause. Enabled monitors resume checking and recording; disabled monitors remain disabled.
+
+Website authentication is stored in a dedicated session under the current user-data directory. Sign out on the Kuaishou website. Explicitly save edited application cookies before opening the website; website cookie changes are never written back into the cookie editor or configuration. This session is separate from everyday Edge and may require its own initial sign-in or verification.
 
 ## Media lifecycle and automation
 

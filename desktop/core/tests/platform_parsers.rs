@@ -13,6 +13,96 @@ use tokio_util::sync::CancellationToken;
 fn room() -> Value {
     json!({"data":{"user":{"nickname":"Fixture"},"data":[{"status":2,"title":"Live","owner":{"nickname":"Fixture"},"stream_url":{"flv_pull_url":{"FULL_HD1":"https://media.invalid/a.flv","SD1":"https://media.invalid/b.flv"},"hls_pull_url_map":{"FULL_HD1":"https://media.invalid/a.m3u8"}}}]}})
 }
+
+fn browser_detail(id: &str, result: i64) -> kuaishou::BrowserResponse {
+    kuaishou::BrowserResponse {
+        url: kuaishou::detail_url(id).unwrap().to_string(),
+        http_status: 200,
+        payload: json!({"data":{"result":result,"author":{"id":id,"name":"Fixture"},
+        "liveStream":{"playUrls":[
+            {"bitrate":2000,"url":"https://media.invalid/high.flv"},
+            {"bitrate":800,"url":"https://media.invalid/low.flv"}
+        ]}}}),
+    }
+}
+
+#[test]
+fn browser_detail_requires_the_requested_primary_author_and_current_navigation() {
+    let reply = browser_detail("fixture", 1);
+    let info = kuaishou::parse_browser_response(&reply, "fixture", Some("HD")).unwrap();
+    assert!(info.is_live);
+    assert!(info.record_url.ends_with("low.flv"));
+    let mut wrong = reply.clone();
+    wrong.payload["data"]["author"]["id"] = json!("other");
+    wrong.payload["data"]["recommendList"] = json!([reply.payload["data"].clone()]);
+    assert!(kuaishou::parse_browser_response(&wrong, "fixture", None).is_err());
+    wrong = reply.clone();
+    wrong.url = kuaishou::detail_url("old-room").unwrap().to_string();
+    assert!(kuaishou::parse_browser_response(&wrong, "fixture", None).is_err());
+    wrong = reply;
+    wrong.payload["data"]["author"] = json!({"name":"No verified identity"});
+    assert!(kuaishou::parse_browser_response(&wrong, "fixture", None).is_err());
+}
+
+#[test]
+fn browser_detail_separates_offline_captcha_rate_limits_and_missing_business_data() {
+    let mut reply = browser_detail("fixture", 671);
+    let offline = kuaishou::parse_browser_response(&reply, "fixture", None).unwrap();
+    assert!(!offline.is_live);
+    assert!(
+        offline.record_url.is_empty(),
+        "offline replies cannot reuse stale sources"
+    );
+    reply.payload["data"]["result"] = json!(400002);
+    reply.payload["data"]["author"] = json!({});
+    assert_eq!(
+        kuaishou::parse_browser_response(&reply, "fixture", None).unwrap_err(),
+        kuaishou::VERIFICATION_REQUIRED
+    );
+    reply.http_status = 429;
+    assert_eq!(
+        kuaishou::parse_browser_response(&reply, "fixture", None).unwrap_err(),
+        kuaishou::RATE_LIMITED
+    );
+    reply = browser_detail("fixture", 1);
+    reply.payload["data"]["liveStream"]["living"] = json!(false);
+    assert!(kuaishou::parse_browser_response(&reply, "fixture", None).is_err());
+    reply.payload["data"]["liveStream"] = Value::Null;
+    assert!(kuaishou::parse_browser_response(&reply, "fixture", None).is_err());
+    for invalid in [
+        Value::Null,
+        json!("not-json"),
+        json!({"result":1}),
+        json!({"data":{"result":2}}),
+    ] {
+        reply.payload = invalid;
+        assert!(kuaishou::parse_browser_response(&reply, "fixture", None).is_err());
+    }
+}
+
+#[test]
+fn browser_room_urls_are_canonical_and_cannot_escape_the_official_endpoint() {
+    assert_eq!(
+        kuaishou::principal_id("https://live.kuaishou.com/u/fixture/?utm_source=test#ignored")
+            .unwrap(),
+        "fixture"
+    );
+    for invalid in [
+        "http://live.kuaishou.com/u/fixture",
+        "https://live.kuaishou.com.evil.invalid/u/fixture",
+        "https://user:pass@live.kuaishou.com/u/fixture",
+        "https://live.kuaishou.com:444/u/fixture",
+        "https://live.kuaishou.com/u/",
+        "https://live.kuaishou.com/u/a/b",
+        "https://live.kuaishou.com/u/a%2Fb",
+    ] {
+        assert!(kuaishou::principal_id(invalid).is_err(), "{invalid}");
+    }
+    assert!(kuaishou::detail_url("a?principalId=b").is_err());
+    let key = kuaishou::session_key("cookie:fixture-not-a-credential");
+    assert_eq!(key.len(), 64);
+    assert!(key.bytes().all(|byte| byte.is_ascii_hexdigit()));
+}
 #[test]
 fn douyin_live_quality_and_offline() {
     let value = room();
