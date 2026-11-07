@@ -225,6 +225,10 @@ try {
     assert.equal((await kuaishouInvoke({action:'smoke-probe',fixtureUrl:repeatedUrl})).isLive,false,'same-URL recheck must read the new document');
     assert.equal(repeatedKuaishouRequests,2);
     assert.equal((await kuaishouInvoke({action:'smoke-status'})).portalExists,false,'background checks must not open a login window');
+    const shared=await kuaishouInvoke({action:'smoke-session',fixtureUrl:fixtureUrl+'?case=live'});
+    assert.equal(shared.sharedCookie,true,'portal and worker must share their isolated website session');
+    assert.equal(shared.websiteChangePreserved,true,'unchanged saved input must not overwrite website cookie updates');
+    assert.equal(shared.remoteIpcBlocked,true,'the website window must not invoke main-window commands');
   }finally{
     await kuaishouInvoke({action:'smoke-close'});
     await eventually(()=>kuaishouInvoke({action:'smoke-status'}),value=>!value.workerExists&&!value.portalExists,'Kuaishou helper window cleanup');

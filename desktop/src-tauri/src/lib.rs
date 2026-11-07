@@ -300,6 +300,10 @@ async fn desktop_kuaishou_session(
         return Err("快手网页操作无效".into());
     }
     match action.as_str() {
+        "smoke-session" => {
+            host.smoke_shared_session(fixture_url.as_deref().ok_or("缺少隔离夹具地址")?)
+                .await
+        }
         "smoke-probe" => {
             host.smoke_probe(fixture_url.as_deref().ok_or("缺少隔离夹具地址")?)
                 .await

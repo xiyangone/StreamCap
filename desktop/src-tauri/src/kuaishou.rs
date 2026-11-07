@@ -234,7 +234,7 @@ impl Host {
             if send.is_closed() {
                 return;
             }
-            let result = (|| {
+            let result = {
                 let mut builder = tauri::WebviewWindowBuilder::new(
                     &create_app,
                     if worker { WORKER } else { PORTAL },
@@ -259,7 +259,7 @@ impl Host {
                 builder
                     .build()
                     .map_err(|_| "无法创建快手网页，请检查 WebView2 运行环境".to_owned())
-            })();
+            };
             if let Err(Ok(window)) = send.send(result) {
                 let _ = window.destroy();
             }
@@ -535,6 +535,77 @@ impl Host {
                 json!({"isLive":false,"hasSource":false,"accessState":kuaishou::access_state(&error),"error":error}),
             ),
         }
+    }
+
+    async fn fixture_cookie_matches(
+        &self,
+        window: &WebviewWindow,
+        value: &str,
+    ) -> Result<bool, String> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let matches = window
+                .cookies_for_url(Url::parse(LIVE).expect("live URL"))
+                .map_err(|_| "隔离会话 Cookie 读取失败")?
+                .iter()
+                .any(|cookie| cookie.name() == "streamcap_fixture" && cookie.value() == value);
+            if matches || tokio::time::Instant::now() >= deadline {
+                return Ok(matches);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    pub async fn smoke_shared_session(&self, raw: &str) -> Result<Value, String> {
+        if !self.smoke {
+            return Err("仅隔离验收可调用".into());
+        }
+        let url = Url::parse(raw).map_err(|_| "隔离夹具地址无效")?;
+        if !fixture(&url) {
+            return Err("仅允许指定的本机快手夹具路径".into());
+        }
+        let mut slot = self.session.lock().await;
+        let session = self.ensure_session(&mut slot, None).await?;
+        Self::synchronize_cookie(session, Some("streamcap_fixture=original"))?;
+        let portal = self
+            .create_window(false, session.directory.clone(), None, url.clone())
+            .await?;
+        self.read_json(&portal, url).await?;
+        let shared = self.fixture_cookie_matches(&portal, "original").await?;
+        let mut updated = Cookie::new("streamcap_fixture", "updated-by-portal");
+        updated.set_domain(".kuaishou.com");
+        updated.set_path("/");
+        updated.set_secure(true);
+        portal
+            .set_cookie(updated)
+            .map_err(|_| "隔离会话 Cookie 更新失败")?;
+        Self::synchronize_cookie(session, Some("streamcap_fixture=original"))?;
+        let preserved = self
+            .fixture_cookie_matches(&session.worker, "updated-by-portal")
+            .await?;
+        self.evaluate(&portal, r#"(()=>{
+          window.__streamcapIpcProbe='pending';
+          const bridge=window.__TAURI_INTERNALS__;
+          if(!bridge||typeof bridge.invoke!=='function'){window.__streamcapIpcProbe='unavailable';return true;}
+          try{Promise.resolve(bridge.invoke('desktop_ready')).then(
+            ()=>window.__streamcapIpcProbe='allowed',()=>window.__streamcapIpcProbe='blocked');}
+          catch{window.__streamcapIpcProbe='blocked';}return true;
+        })()"#.into()).await?;
+        let mut ipc = String::new();
+        for _ in 0..20 {
+            let reply = self
+                .evaluate(&portal, "window.__streamcapIpcProbe".into())
+                .await?;
+            ipc = serde_json::from_str(&reply).map_err(|_| "隔离 IPC 验证响应无效")?;
+            if ipc != "pending" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Ok(
+            json!({"sharedCookie":shared,"websiteChangePreserved":preserved,
+            "remoteIpcBlocked":matches!(ipc.as_str(),"blocked"|"unavailable")}),
+        )
     }
 
     pub async fn close(&self) {
